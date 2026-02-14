@@ -1,4 +1,4 @@
-# EMG-flow
+# EMG-SCS-flow
 
 Pipeline for processing EMG data in spinal cord stimulation and other protocols: preprocessing, event detection, epoching, and extraction of response metrics.
 
