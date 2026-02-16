@@ -719,6 +719,7 @@ def _run_startstop_analysis(
     startstop_dir: Path,
     art_chans: list[str],
 ) -> None:
+    print("[STARTSTOP] Extracting start/stop segments...", flush=True)
     segments = extract_start_stop_segments(raw)
     if not segments:
         return
@@ -763,7 +764,12 @@ def _run_startstop_analysis(
     template_discard_rows: list[dict[str, object]] = []
     channel_template_rows: list[dict[str, object]] = []
 
-    for condition, side_segments in segments.items():
+    print("[STARTSTOP] Matching templates and detecting responses...", flush=True)
+    for condition, side_segments in tqdm(
+        segments.items(),
+        desc="STARTSTOP: detect by condition",
+        total=len(segments),
+    ):
         safe_condition = re.sub(r"[^\w\-\+\. ]", "_", str(condition))
         start_segments = side_segments.get("start", [])
         if not start_segments:
@@ -1191,7 +1197,6 @@ def _run_startstop_analysis(
                         ref_std = np.std(ref_seg)
                         if ref_std > 0:
                             leak_count = 0
-                            corr_samples: list[tuple[str, float]] = []
                             for other_idx, other_name in enumerate(epochs.ch_names):
                                 if other_name == ch_name or other_name in art_set:
                                     continue
@@ -1203,16 +1208,8 @@ def _run_startstop_analysis(
                                 corr = float(np.corrcoef(ref_seg, other_seg)[0, 1])
                                 if np.isnan(corr):
                                     continue
-                                corr_samples.append((other_name, corr))
                                 if corr > leak_corr_thr:
                                     leak_count += 1
-                            if corr_samples:
-                                corr_str = ", ".join(f"{name}:{val:.3f}" for name, val in corr_samples)
-                                print(
-                                    "[STARTSTOP corr] "
-                                    f"condition={condition} ep={ep} ref_ch={ch_name} corrs={corr_str}",
-                                    flush=True,
-                                )
                             if leak_count > leak_min_channels:
                                 onset_latency = np.nan
                                 peak1_latency = np.nan
@@ -1415,6 +1412,7 @@ def _run_startstop_analysis(
             ch_names,
         )
 
+    print("[STARTSTOP] Writing outputs...", flush=True)
     if template_match_rows:
         pd.DataFrame(template_match_rows).to_csv(
             excel_dir / "STARTSTOP_template_anchor_matches.csv", index=False
@@ -1574,6 +1572,12 @@ def run_pipeline(
         output_root = Path(output_dir)
 
     use_startstop = startstop_mode if startstop_mode is not None else STARTSTOP_MODE
+    # Keep both flows quiet except explicit stage messages and tqdm.
+    old_mne_log_level = mne.set_log_level("ERROR", return_old_level=True)
+    if use_startstop:
+        print("[STARTSTOP] Preparing data...", flush=True)
+    else:
+        print("[SIR] Preparing data...", flush=True)
     paths = build_output_dirs(output_root, startstop_mode=use_startstop)
     crops_dir = paths["crops_dir"]
     epochs_dir = paths["epochs_dir"]
@@ -1610,14 +1614,19 @@ def run_pipeline(
 
     if use_startstop:
         _run_startstop_analysis(raw, startstop_dir, default_art_chans)
+        if old_mne_log_level is not None:
+            mne.set_log_level(old_mne_log_level)
         return output_root
 
+    print("[SIR] Creating annotation crops...", flush=True)
     create_annotation_crops(raw, crops_dir, overwrite=True)
 
     file_list = list_crop_files(crops_dir)
 
     valid_modes = {"per_file_mean", "config_grand_avg", "max_amp_only"}
     if template_mode not in valid_modes:
+        if old_mne_log_level is not None:
+            mne.set_log_level(old_mne_log_level)
         raise ValueError(f"template_mode must be one of {sorted(valid_modes)}")
 
     config_max_amp = {}
@@ -1637,7 +1646,8 @@ def run_pipeline(
     config_templates = defaultdict(dict)
     config_template_markers = defaultdict(dict)
 
-    for file_name in tqdm(file_list, desc="PASS 1: build config templates"):
+    print("[SIR] Finding templates...", flush=True)
+    for file_name in file_list:
         file_path = crops_dir / file_name
         if template_mode == "max_amp_only":
             configuration = file_name.split("-")[0]
@@ -1768,6 +1778,7 @@ def run_pipeline(
         "Time series",
     ]}
 
+    print("[SIR] Detecting epochs...", flush=True)
     for file_name in tqdm(file_list, desc="PASS 2: detect epochs"):
         file_path = crops_dir / file_name
         raw_file = mne.io.read_raw_fif(file_path)
@@ -2139,6 +2150,7 @@ def run_pipeline(
             show_markers=False,
         )
 
+    print("[SIR] Writing outputs...", flush=True)
     df_results = pd.DataFrame(results)
     df_results.to_csv(excel_dir / "Large_dataset_emg_response_metrics.csv", index=False)
 
@@ -2233,5 +2245,7 @@ def run_pipeline(
             dfc.to_excel(writer, sheet_name=sheet_name, index=False)
 
     plot_boxplots(df, boxplot_dir)
+    if old_mne_log_level is not None:
+        mne.set_log_level(old_mne_log_level)
 
     return output_root

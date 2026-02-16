@@ -159,29 +159,6 @@ def extract_start_stop_segments(raw) -> dict[str, dict[str, list[tuple[float, fl
     end_time = float(raw.times[-1]) if getattr(raw, "times", None) is not None else None
     _close_open_segment(end_time)
 
-    for condition, parts in segments.items():
-        starts = parts.get("start", [])
-        if not starts:
-            print(f"[STARTSTOP segments] condition={condition}: no start segments", flush=True)
-            continue
-        meta = segment_meta.get(
-            condition, {"has_explicit_markers": False, "used_fallback_full_segment": False}
-        )
-        if meta.get("used_fallback_full_segment", False) and not meta.get("has_explicit_markers", False):
-            for tmin, tmax in starts:
-                print(
-                    "[STARTSTOP segments] "
-                    f"condition={condition}: full segment {tmin:.3f}s -> {tmax:.3f}s",
-                    flush=True,
-                )
-            continue
-        for tmin, tmax in starts:
-            print(
-                "[STARTSTOP segments] "
-                f"condition={condition}: start interval {tmin:.3f}s -> {tmax:.3f}s",
-                flush=True,
-            )
-
     return segments
 
 
