@@ -225,6 +225,15 @@ def detect_template_peaks(
     peaks.sort(key=lambda x: x[0])
     peak_by_idx = {p[0]: p for p in peaks}
 
+    # Drop non-prominent micro-peaks relative to the strongest candidate.
+    if len(peaks) > 0:
+        max_prom = max(float(prom_by_idx.get(int(p[0]), 0.0)) for p in peaks)
+        if max_prom > 0:
+            rel_prom_thr = 0.08 * max_prom
+            peaks = [p for p in peaks if float(prom_by_idx.get(int(p[0]), 0.0)) >= rel_prom_thr]
+            peaks.sort(key=lambda x: x[0])
+            peak_by_idx = {p[0]: p for p in peaks}
+
     if len(peaks) < 2:
         return (np.nan, np.nan, np.nan, np.nan)
 
