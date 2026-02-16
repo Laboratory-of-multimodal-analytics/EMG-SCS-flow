@@ -88,7 +88,7 @@ from .plotting import (
 
 
 GIB_CHARS = set(":>=;@<#")
-MAX_AMP_TEMPLATE_MULTI_P1_GAP_S = 0.006  # 6 ms: treat as distinct latency class
+MAX_AMP_TEMPLATE_MULTI_P1_GAP_S = 0.003  # 3 ms: treat as distinct latency class
 
 
 def _cyrillic_score(text: str) -> int:
@@ -1866,12 +1866,13 @@ def run_pipeline(
                 prestim_mask=prestim_prom_mask,
                 poststim_mask=poststim_prom_mask,
             )
+            onset_for_peaks = float(onset_t) if np.isfinite(onset_t) else float(RESP_TMIN)
             p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
                 tmpl_global,
                 times,
                 sfreq,
                 baseline_mask=prom_baseline_mask,
-                onset_latency=onset_t,
+                onset_latency=onset_for_peaks,
                 resp_tmax=RESP_TMAX,
                 min_prom_k=0,
                 peak2_max_gap_ms=20.0,
@@ -1888,6 +1889,8 @@ def run_pipeline(
                 )
                 if not np.isnan(onset_t_ref):
                     onset_t = float(onset_t_ref)
+            if np.isfinite(onset_t) and (onset_t < 0.0):
+                onset_t = 0.0
 
             config_templates[configuration][ch_name] = tmpl_global
             config_template_markers[configuration][ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
@@ -1976,12 +1979,13 @@ def run_pipeline(
                         prestim_mask=prestim_prom_mask,
                         poststim_mask=poststim_prom_mask,
                     )
+                    onset_for_peaks = float(onset_t) if np.isfinite(onset_t) else float(RESP_TMIN)
                     p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
                         tmpl,
                         times,
                         sfreq,
                         baseline_mask=prom_baseline_mask,
-                        onset_latency=onset_t,
+                        onset_latency=onset_for_peaks,
                         resp_tmax=RESP_TMAX,
                         min_prom_k=0,
                         peak2_max_gap_ms=20.0,
@@ -1998,6 +2002,8 @@ def run_pipeline(
                         )
                         if not np.isnan(onset_t_ref):
                             onset_t = float(onset_t_ref)
+                    if np.isfinite(onset_t) and (onset_t < 0.0):
+                        onset_t = 0.0
 
                     markers = dict(onset=onset_t, p1=p1_t, p2=p2_t)
                     if not _max_template_markers_are_valid_for_transfer(markers):
@@ -2128,7 +2134,8 @@ def run_pipeline(
                 continue
 
             # In max-amp mode, choose a transferred template from the
-            # per-channel template bank based on nearest source amplitude.
+            # per-channel template bank in descending-cascade mode:
+            # choose the nearest source amplitude from above (>= current amp).
             if template_mode == "max_amp_only":
                 bank = config_template_banks.get(configuration, {}).get(ch_name, [])
                 if len(bank) == 0:
@@ -2136,13 +2143,13 @@ def run_pipeline(
                 if np.isnan(stim_amp_num):
                     chosen = bank[0]
                 else:
-                    chosen = min(
-                        bank,
-                        key=lambda c: (
-                            abs(float(c["amp"]) - float(stim_amp_num)),
-                            -float(c["amp"]),
-                        ),
-                    )
+                    higher_or_equal = [c for c in bank if float(c["amp"]) >= float(stim_amp_num)]
+                    if len(higher_or_equal) > 0:
+                        # Closest template from above (descending transfer).
+                        chosen = min(higher_or_equal, key=lambda c: float(c["amp"]))
+                    else:
+                        # If no source is above this amplitude, keep the highest available.
+                        chosen = bank[0]
                 tmpl_cfg[ch_name] = chosen["template"]
                 markers_cfg[ch_name] = dict(chosen["markers"])
                 continue
@@ -2165,12 +2172,13 @@ def run_pipeline(
                 prestim_mask=prestim_prom_mask,
                 poststim_mask=poststim_prom_mask,
             )
+            onset_for_peaks = float(onset_t) if np.isfinite(onset_t) else float(RESP_TMIN)
             p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
                 tmpl,
                 times,
                 sfreq,
                 baseline_mask=prom_baseline_mask,
-                onset_latency=onset_t,
+                onset_latency=onset_for_peaks,
                 resp_tmax=RESP_TMAX,
                 min_prom_k=prom_k,
                 peak2_max_gap_ms=20.0,
@@ -2187,6 +2195,8 @@ def run_pipeline(
                 )
                 if not np.isnan(onset_t_ref):
                     onset_t = float(onset_t_ref)
+            if np.isfinite(onset_t) and (onset_t < 0.0):
+                onset_t = 0.0
 
             tmpl_cfg[ch_name] = tmpl
             markers_cfg[ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
