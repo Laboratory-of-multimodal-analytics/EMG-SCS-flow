@@ -1825,7 +1825,7 @@ def run_pipeline(
         for ch_idx, ch_name in enumerate(epochs.ch_names):
             if ch_name in art_set:
                 continue
-            tmpl_file = np.median(data_filt[:, ch_idx, :], axis=0)
+            tmpl_file = np.mean(data_filt[:, ch_idx, :], axis=0)
             config_waveforms[configuration][ch_name].append(tmpl_file)
 
     for configuration, ch_dict in config_waveforms.items():
@@ -1844,7 +1844,7 @@ def run_pipeline(
                 config_template_markers[configuration][ch_name] = dict(onset=np.nan, p1=np.nan, p2=np.nan)
                 continue
 
-            tmpl_global = np.median(np.stack(waves, axis=0), axis=0)
+            tmpl_global = np.mean(np.stack(waves, axis=0), axis=0)
 
             onset_t = detect_onset_rectified(
                 tmpl_global,
@@ -1982,8 +1982,10 @@ def run_pipeline(
             prestim_prom_mask = baseline_mask
         poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
 
-        tmpl_cfg = config_templates[configuration]
-        markers_cfg = config_template_markers[configuration]
+        # Work on per-file copies: fallback templates/markers should remain local
+        # to the current file and must not leak into other amplitudes/files.
+        tmpl_cfg = dict(config_templates[configuration])
+        markers_cfg = dict(config_template_markers[configuration])
 
         data_filt = data_epoched
 
@@ -2242,37 +2244,6 @@ def run_pipeline(
                     peak2_value = np.nan
                     ptp_amp = np.nan
 
-                # Reject likely artifact-driven detections: if the full epoch
-                # on this channel is highly correlated (including opposite
-                # polarity) with any artifact channel in the same epoch.
-                if STIM_EPOCH_ARTIFACT_CORR_REJECTION and (not np.isnan(peak1_latency)):
-                    sig_centered = sig_f - np.mean(sig_f)
-                    sig_std = float(np.std(sig_centered))
-                    if sig_std > 0:
-                        artifact_like = False
-                        for art_ch in art_chans:
-                            if art_ch not in epochs.ch_names:
-                                continue
-                            art_idx = epochs.ch_names.index(art_ch)
-                            art_sig = np.asarray(data_filt[ep, art_idx, :], dtype=float)
-                            art_centered = art_sig - np.mean(art_sig)
-                            art_std = float(np.std(art_centered))
-                            if art_std <= 0:
-                                continue
-                            corr = float(np.corrcoef(sig_centered, art_centered)[0, 1])
-                            if np.isnan(corr):
-                                continue
-                            if abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
-                                artifact_like = True
-                                break
-                        if artifact_like:
-                            onset_latency = np.nan
-                            peak1_latency = np.nan
-                            peak2_latency = np.nan
-                            peak1_value = np.nan
-                            peak2_value = np.nan
-                            ptp_amp = np.nan
-
                 channel_epoch_results[ch_name].append(
                     {
                         "ep": ep,
@@ -2288,6 +2259,14 @@ def run_pipeline(
 
         corr_min_median = 0.5
         min_valid_frac = 0.4
+
+        # File-wise artifact reference means (one mean waveform per artifact channel).
+        artifact_mean_by_ch: dict[str, np.ndarray] = {}
+        for art_ch in art_chans:
+            if art_ch not in epochs.ch_names:
+                continue
+            art_idx = epochs.ch_names.index(art_ch)
+            artifact_mean_by_ch[art_ch] = np.asarray(np.mean(data_filt[:, art_idx, :], axis=0), dtype=float)
 
         for ch in raw_file.info["ch_names"]:
             if ch in art_set:
@@ -2321,7 +2300,30 @@ def run_pipeline(
             valid_fraction = np.mean(valid_flags) if len(valid_flags) else 0.0
             median_corr = float(np.median(corrs)) if len(corrs) else 0.0
 
-            if (valid_fraction < min_valid_frac) and (median_corr < corr_min_median):
+            # Reject likely artifact-driven detections using file-wise channel mean
+            # (requested behavior: channel-level, not per-epoch subset).
+            artifact_like_channel = False
+            if STIM_EPOCH_ARTIFACT_CORR_REJECTION:
+                ch_idx = epochs.ch_names.index(ch)
+                ch_mean = np.asarray(np.mean(data_filt[:, ch_idx, :], axis=0), dtype=float)
+                ch_centered = ch_mean - np.mean(ch_mean)
+                ch_std = float(np.std(ch_centered))
+                if ch_std > 0:
+                    for _art_ch, art_mean in artifact_mean_by_ch.items():
+                        art_centered = art_mean - np.mean(art_mean)
+                        art_std = float(np.std(art_centered))
+                        if art_std <= 0:
+                            continue
+                        corr = float(np.corrcoef(ch_centered, art_centered)[0, 1])
+                        if np.isnan(corr):
+                            continue
+                        if abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
+                            artifact_like_channel = True
+                            break
+
+            low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
+            borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
+            if artifact_like_channel or low_valid_low_corr or borderline_valid_very_low_corr:
                 for e in entries:
                     e["onset"] = np.nan
                     e["p1"] = np.nan
