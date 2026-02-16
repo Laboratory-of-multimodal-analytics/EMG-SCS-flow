@@ -357,6 +357,26 @@ def _concat_segments(raw: mne.io.BaseRaw, segments: list[tuple[float, float]]) -
     return mne.concatenate_raws(raws, preload=True)
 
 
+def _resolve_startstop_template_dir() -> Path:
+    """
+    Resolve STARTSTOP template directory across repository layouts.
+
+    Preferred location for this project:
+      <repo>/src/EMG-SCS-flow/templates
+    """
+    here = Path(__file__).resolve()
+    candidates = [
+        # templates as sibling of src/
+        here.parent.parent / "templates",
+        # templates next to pipeline.py (legacy/fallback)
+        here.parent / "templates",
+    ]
+    for cand in candidates:
+        if cand.exists() and cand.is_dir():
+            return cand
+    return candidates[0]
+
+
 def _load_startstop_template_bank(
     template_dir: Path,
     template_native_sfreq: float,
@@ -708,7 +728,13 @@ def _run_startstop_analysis(
     if not ch_names:
         return
 
-    template_dir = Path(__file__).resolve().parent / "templates"
+    # Template bank lives as a sibling of src/ in this project.
+    template_dir = _resolve_startstop_template_dir()
+    if not template_dir.exists():
+        print(
+            f"[STARTSTOP] Template directory not found: {template_dir}",
+            flush=True,
+        )
     template_bank = _load_startstop_template_bank(
         template_dir=template_dir,
         template_native_sfreq=float(STARTSTOP_TM_TEMPLATE_SFREQ),
