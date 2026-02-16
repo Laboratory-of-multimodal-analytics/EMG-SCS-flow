@@ -1896,8 +1896,10 @@ def run_pipeline(
                 continue
 
             # In max-amp mode, keep config-level templates/markers from PASS 1
-            # (built on the strongest amplitude) and do not overwrite per file.
-            if template_mode == "max_amp_only":
+            # (built on the strongest amplitude) and do not overwrite per file
+            # when they exist. If a channel has no template from PASS 1, fall
+            # back to per-file template so downstream code still has markers.
+            if template_mode == "max_amp_only" and (ch_name in tmpl_cfg):
                 continue
 
             tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
