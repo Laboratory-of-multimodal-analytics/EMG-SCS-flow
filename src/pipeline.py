@@ -88,6 +88,7 @@ from .plotting import (
 
 
 GIB_CHARS = set(":>=;@<#")
+MAX_AMP_TEMPLATE_MULTI_P1_GAP_S = 0.006  # 6 ms: treat as distinct latency class
 
 
 def _cyrillic_score(text: str) -> int:
@@ -1740,6 +1741,7 @@ def run_pipeline(
         raise ValueError(f"template_mode must be one of {sorted(valid_modes)}")
 
     config_max_amp = {}
+    config_amp_files_sorted: dict[str, list[tuple[float, str]]] = {}
     if template_mode == "max_amp_only":
         # For each configuration, use the highest available amplitude that also
         # has enough detected stimulus epochs to build a stable template.
@@ -1754,6 +1756,7 @@ def run_pipeline(
 
         for configuration, amp_files in config_candidates.items():
             amp_files_sorted = sorted(amp_files, key=lambda x: x[0], reverse=True)
+            config_amp_files_sorted[configuration] = amp_files_sorted
             for amp_num, file_name in amp_files_sorted:
                 file_path = crops_dir / file_name
                 raw_file = mne.io.read_raw_fif(file_path, preload=False)
@@ -1770,6 +1773,7 @@ def run_pipeline(
     config_meta: dict[str, dict[str, np.ndarray | float]] = {}
     config_templates = defaultdict(dict)
     config_template_markers = defaultdict(dict)
+    config_template_banks: dict[str, dict[str, list[dict[str, object]]]] = defaultdict(dict)
 
     print("[SIR] Finding templates...", flush=True)
     for file_name in file_list:
@@ -1888,6 +1892,136 @@ def run_pipeline(
             config_templates[configuration][ch_name] = tmpl_global
             config_template_markers[configuration][ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
 
+    if template_mode == "max_amp_only":
+        # Build multi-template banks per channel. Start from top valid amplitude,
+        # then add lower-amplitude templates only when latency class is distinct.
+        for configuration, ch_dict in config_templates.items():
+            cfg_bank = config_template_banks[configuration]
+            max_amp = config_max_amp.get(configuration, np.nan)
+            for ch_name, template in ch_dict.items():
+                markers = config_template_markers[configuration].get(
+                    ch_name, {"onset": np.nan, "p1": np.nan, "p2": np.nan}
+                )
+                cfg_bank[ch_name] = []
+                if (template is None) or (not _max_template_markers_are_valid_for_transfer(markers)):
+                    continue
+                cfg_bank[ch_name].append(
+                    {"amp": float(max_amp), "template": template, "markers": dict(markers)}
+                )
+
+        for configuration, amp_files_sorted in config_amp_files_sorted.items():
+            if configuration not in config_meta:
+                continue
+
+            times = np.asarray(config_meta[configuration]["times"])
+            sfreq = float(config_meta[configuration]["sfreq"])
+            baseline_mask = (times >= BASELINE_TMIN) & (times <= BASELINE_TMAX)
+            prestim_prom_mask = (times >= STIM_PROM_PRESTIM_TMIN) & (times <= STIM_PROM_PRESTIM_TMAX)
+            if np.sum(prestim_prom_mask) < 5:
+                prestim_prom_mask = baseline_mask
+            poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
+
+            cfg_bank = config_template_banks[configuration]
+            max_amp = config_max_amp.get(configuration)
+            for amp_num, file_name in amp_files_sorted:
+                if max_amp is not None and np.isclose(amp_num, max_amp):
+                    continue
+
+                file_path = crops_dir / file_name
+                raw_file = mne.io.read_raw_fif(file_path, preload=False)
+                art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
+                art_set = set(art_chans)
+                art = _get_art_signal(raw_file, art_chans)
+                threshold = THRESH * np.std(art)
+                peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
+                if len(peaks) <= MIN_VALID_EPOCHS:
+                    continue
+
+                events = np.column_stack(
+                    [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
+                )
+                epochs = mne.Epochs(
+                    raw_file,
+                    events,
+                    event_id=1,
+                    tmin=EPOCH_TMIN,
+                    tmax=EPOCH_TMAX,
+                    baseline=None,
+                    preload=True,
+                )
+
+                if (epochs.info["sfreq"] != sfreq) or (len(epochs.times) != len(times)):
+                    continue
+
+                data_epoched = epochs.get_data()
+                data_filt = data_epoched
+                for ch_name in epochs.ch_names:
+                    if ch_name in art_set:
+                        continue
+
+                    ch_idx = epochs.ch_names.index(ch_name)
+                    tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
+                    onset_t = detect_onset_rectified(
+                        tmpl,
+                        times,
+                        sfreq,
+                        baseline_mask=baseline_mask,
+                        onset_tmin=0.003,
+                        onset_tmax=0.035,
+                        k=4,
+                        sustain_ms=5,
+                    )
+                    prom_baseline_mask = _choose_silent_prominence_baseline_mask(
+                        sig=tmpl,
+                        prestim_mask=prestim_prom_mask,
+                        poststim_mask=poststim_prom_mask,
+                    )
+                    p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
+                        tmpl,
+                        times,
+                        sfreq,
+                        baseline_mask=prom_baseline_mask,
+                        onset_latency=onset_t,
+                        resp_tmax=RESP_TMAX,
+                        min_prom_k=0,
+                        peak2_max_gap_ms=20.0,
+                        min_width_ms=0.6,
+                        amp_min_uV=10,
+                    )
+                    if (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
+                        onset_t_ref = _refine_onset_before_p1(
+                            sig_f=tmpl,
+                            times=times,
+                            sfreq=sfreq,
+                            baseline_mask=baseline_mask,
+                            p1_latency=float(p1_t),
+                        )
+                        if not np.isnan(onset_t_ref):
+                            onset_t = float(onset_t_ref)
+
+                    markers = dict(onset=onset_t, p1=p1_t, p2=p2_t)
+                    if not _max_template_markers_are_valid_for_transfer(markers):
+                        continue
+
+                    existing = cfg_bank.setdefault(ch_name, [])
+                    p1_cur = float(markers["p1"])
+                    if len(existing) > 0:
+                        p1_existing = [float(c["markers"]["p1"]) for c in existing]
+                        if np.min(np.abs(np.asarray(p1_existing) - p1_cur)) < MAX_AMP_TEMPLATE_MULTI_P1_GAP_S:
+                            continue
+                    existing.append({"amp": float(amp_num), "template": tmpl, "markers": markers})
+                    # Keep deterministic order by amplitude (high to low).
+                    existing.sort(key=lambda c: float(c["amp"]), reverse=True)
+
+        # Keep config-level template as highest-amplitude candidate for legacy outputs.
+        for configuration, ch_bank in config_template_banks.items():
+            for ch_name, candidates in ch_bank.items():
+                if len(candidates) == 0:
+                    continue
+                lead = candidates[0]
+                config_templates[configuration][ch_name] = lead["template"]
+                config_template_markers[configuration][ch_name] = dict(lead["markers"])
+
     for configuration, ch_dict in config_templates.items():
         times = config_meta[configuration]["times"]
         for ch_name, template in ch_dict.items():
@@ -1982,28 +2116,36 @@ def run_pipeline(
             prestim_prom_mask = baseline_mask
         poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
 
-        # Work on per-file copies: fallback templates/markers should remain local
-        # to the current file and must not leak into other amplitudes/files.
+        # Work on per-file copies to avoid mutating config-level templates.
         tmpl_cfg = dict(config_templates[configuration])
         markers_cfg = dict(config_template_markers[configuration])
 
         data_filt = data_epoched
 
+        stim_amp_num = amp_to_number(stim_amp_raw)
         for ch_idx, ch_name in enumerate(epochs.ch_names):
             if ch_name in art_set:
                 continue
 
-            use_filewise_fallback = False
-            # In max-amp mode, keep config-level templates/markers from PASS 1
-            # (built on the strongest amplitude) when valid. If markers are
-            # missing/invalid, fall back to per-file estimation for this channel.
-            if template_mode == "max_amp_only" and (ch_name in tmpl_cfg):
-                markers_existing = markers_cfg.get(ch_name, {})
-                if _max_template_markers_are_valid_for_transfer(markers_existing):
+            # In max-amp mode, choose a transferred template from the
+            # per-channel template bank based on nearest source amplitude.
+            if template_mode == "max_amp_only":
+                bank = config_template_banks.get(configuration, {}).get(ch_name, [])
+                if len(bank) == 0:
                     continue
-                use_filewise_fallback = True
-            elif template_mode == "max_amp_only":
-                use_filewise_fallback = True
+                if np.isnan(stim_amp_num):
+                    chosen = bank[0]
+                else:
+                    chosen = min(
+                        bank,
+                        key=lambda c: (
+                            abs(float(c["amp"]) - float(stim_amp_num)),
+                            -float(c["amp"]),
+                        ),
+                    )
+                tmpl_cfg[ch_name] = chosen["template"]
+                markers_cfg[ch_name] = dict(chosen["markers"])
+                continue
 
             tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
             onset_t = detect_onset_rectified(
@@ -2018,11 +2160,6 @@ def run_pipeline(
             )
 
             prom_k = get_prominence_k(file_name, ch_name)
-            if use_filewise_fallback:
-                # User-requested behavior: when max-amp template is unavailable/
-                # invalid and we fall back to file-wise template, tighten peak
-                # selection by increasing prominence requirement.
-                prom_k = float(prom_k) * 1.0
             prom_baseline_mask = _choose_silent_prominence_baseline_mask(
                 sig=tmpl,
                 prestim_mask=prestim_prom_mask,
@@ -2054,12 +2191,26 @@ def run_pipeline(
             tmpl_cfg[ch_name] = tmpl
             markers_cfg[ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
 
-        channel_epoch_results = {ch: [] for ch in epochs.ch_names if ch not in art_set}
+        if template_mode == "max_amp_only":
+            eligible_channels = [
+                ch
+                for ch in epochs.ch_names
+                if (
+                    (ch not in art_set)
+                    and (tmpl_cfg.get(ch) is not None)
+                    and _max_template_markers_are_valid_for_transfer(markers_cfg.get(ch, {}))
+                )
+            ]
+        else:
+            eligible_channels = [ch for ch in epochs.ch_names if ch not in art_set]
+        eligible_set = set(eligible_channels)
+
+        channel_epoch_results = {ch: [] for ch in eligible_channels}
         latency_markers = {ch: [] for ch in epochs.ch_names if ch not in art_set}
 
         for ep in range(len(epochs)):
             for ch_idx, ch_name in enumerate(epochs.ch_names):
-                if ch_name in art_set:
+                if (ch_name in art_set) or (ch_name not in eligible_set):
                     continue
 
                 sig = data_epoched[ep, ch_idx, :]
@@ -2268,9 +2419,7 @@ def run_pipeline(
             art_idx = epochs.ch_names.index(art_ch)
             artifact_mean_by_ch[art_ch] = np.asarray(np.mean(data_filt[:, art_idx, :], axis=0), dtype=float)
 
-        for ch in raw_file.info["ch_names"]:
-            if ch in art_set:
-                continue
+        for ch in eligible_channels:
 
             entries = channel_epoch_results[ch]
             tmpl = tmpl_cfg[ch]
