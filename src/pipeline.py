@@ -31,6 +31,8 @@ from .constants import (
     RAW_BANDPASS_L_FREQ,
     RESP_TMAX,
     RESP_TMIN,
+    STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
+    STIM_EPOCH_ARTIFACT_CORR_REJECTION,
     STARTSTOP_MIN_DIST_MS,
     STARTSTOP_MODE,
     STARTSTOP_LEAKAGE_CORR_REJECTION,
@@ -2047,6 +2049,37 @@ def run_pipeline(
                     peak1_value = np.nan
                     peak2_value = np.nan
                     ptp_amp = np.nan
+
+                # Reject likely artifact-driven detections: if the full epoch
+                # on this channel is highly correlated (including opposite
+                # polarity) with any artifact channel in the same epoch.
+                if STIM_EPOCH_ARTIFACT_CORR_REJECTION and (not np.isnan(peak1_latency)):
+                    sig_centered = sig_f - np.mean(sig_f)
+                    sig_std = float(np.std(sig_centered))
+                    if sig_std > 0:
+                        artifact_like = False
+                        for art_ch in art_chans:
+                            if art_ch not in epochs.ch_names:
+                                continue
+                            art_idx = epochs.ch_names.index(art_ch)
+                            art_sig = np.asarray(data_filt[ep, art_idx, :], dtype=float)
+                            art_centered = art_sig - np.mean(art_sig)
+                            art_std = float(np.std(art_centered))
+                            if art_std <= 0:
+                                continue
+                            corr = float(np.corrcoef(sig_centered, art_centered)[0, 1])
+                            if np.isnan(corr):
+                                continue
+                            if abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
+                                artifact_like = True
+                                break
+                        if artifact_like:
+                            onset_latency = np.nan
+                            peak1_latency = np.nan
+                            peak2_latency = np.nan
+                            peak1_value = np.nan
+                            peak2_value = np.nan
+                            ptp_amp = np.nan
 
                 channel_epoch_results[ch_name].append(
                     {

@@ -55,6 +55,11 @@ BASELINE_TMAX = 0.0
 RESP_TMIN = 0.01
 RESP_TMAX = 0.04
 
+# Stimulation-induced: reject detections if full-epoch waveform
+# is highly correlated with any artifact channel (abs correlation).
+STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
+STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.7
+
 MIN_VALID_EPOCHS = 5 #very conservative
 
 
