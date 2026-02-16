@@ -95,10 +95,12 @@ print(out)  # output root path
 
 ## Outputs
 
-- **StartStop:** `results/StartStop analysis/` — Excel (metrics, template matches), plots, templates, and (if enabled) raw epochs.
-- **Stimulation-induced:** `results/Stimulation-induced responses/` — stimulus-centered epochs, Excel, boxplots, and plots.
-
-Preprocessed raw is saved under `data/` in the corresponding output tree.
+- **Data segments** (original FIF, preprocessed FIF, and stimulation annotation crops) are saved under:
+  - `data/StartStop analysis/`
+  - `data/Stimulation-induced responses/`
+- **Analysis results** (Excel/plots/templates/epochs) are saved under:
+  - `results/StartStop analysis/`
+  - `results/Stimulation-induced responses/`
 
 ---
 

@@ -1587,11 +1587,11 @@ def run_pipeline(
 
     if edf_path.suffix.lower() == ".mat":
         raw = _load_raw_from_mat(edf_path)
-        fif_out = output_root / f"{edf_path.stem}.fif"
-        fif_out.parent.mkdir(parents=True, exist_ok=True)
-        raw.save(fif_out, overwrite=True)
     else:
         raw = mne.io.read_raw_edf(edf_path, preload=True)
+
+    original_fif_path = paths["data_dir"] / f"{edf_path.stem}_original_raw.fif"
+    raw.save(original_fif_path, overwrite=True)
     default_art_chans = _resolve_art_channels(raw, ARTCHAN)
     default_art_set = set(default_art_chans)
     nyq = raw.info["sfreq"] / 2.0
@@ -1609,8 +1609,6 @@ def run_pipeline(
     raw.save(preproc_path, overwrite=True)
 
     if use_startstop:
-        startstop_preproc_path = startstop_dir / f"{edf_path.stem}_preprocessed_raw.fif"
-        raw.save(startstop_preproc_path, overwrite=True)
         _run_startstop_analysis(raw, startstop_dir, default_art_chans)
         return output_root
 
