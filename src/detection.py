@@ -191,8 +191,8 @@ def detect_template_peaks(
     amp_thr = amp_min_uV * 1e-6
     max_gap = peak2_max_gap_ms / 1000.0
 
-    pos_idx, _ = find_peaks(seg0, prominence=prom, width=min_w)
-    neg_idx, _ = find_peaks(-seg0, prominence=prom, width=min_w)
+    pos_idx, pos_props = find_peaks(seg0, prominence=prom, width=min_w)
+    neg_idx, neg_props = find_peaks(-seg0, prominence=prom, width=min_w)
 
     if (len(pos_idx) == 0) or (len(neg_idx) == 0):
         return (np.nan, np.nan, np.nan, np.nan)
@@ -202,6 +202,16 @@ def detect_template_peaks(
 
     neg_sorted = neg_idx[np.argsort((-seg0[neg_idx]))[::-1]]
     neg_top = neg_sorted[:2]
+
+    pos_prom = {
+        int(i): float(p)
+        for i, p in zip(pos_idx.tolist(), pos_props.get("prominences", np.zeros(len(pos_idx))))
+    }
+    neg_prom = {
+        int(i): float(p)
+        for i, p in zip(neg_idx.tolist(), neg_props.get("prominences", np.zeros(len(neg_idx))))
+    }
+    prom_by_idx = {**pos_prom, **neg_prom}
 
     peaks = []
     for i in pos_top:
@@ -213,6 +223,7 @@ def detect_template_peaks(
 
     peaks = list({p[0]: p for p in peaks}.values())
     peaks.sort(key=lambda x: x[0])
+    peak_by_idx = {p[0]: p for p in peaks}
 
     if len(peaks) < 2:
         return (np.nan, np.nan, np.nan, np.nan)
@@ -262,6 +273,29 @@ def detect_template_peaks(
         else:
             p1_i, p1_val = peaks[k1][0], peaks[k1][2]
             p2_i, p2_val = peaks[k2_best][0], peaks[k2_best][2]
+
+    # Guard against assigning a tiny pre-wave as P1 when a much more prominent
+    # later response was selected as P2 (common in stimulation templates).
+    if (p2_i is not None) and (not np.isnan(p2_val)):
+        p1_prom = float(prom_by_idx.get(int(p1_i), 0.0))
+        p2_prom = float(prom_by_idx.get(int(p2_i), 0.0))
+        if p2_prom > 0 and p1_prom < (0.5 * p2_prom):
+            _p2_peak = peak_by_idx.get(int(p2_i))
+            if _p2_peak is not None:
+                p1_i, _p1_sign, p1_val = _p2_peak
+                p1_lat_local = float(seg_t[p1_i])
+                p2_i, p2_val = None, np.nan
+                candidates = []
+                for i, s, v in peaks:
+                    if i <= p1_i:
+                        continue
+                    t = float(seg_t[i])
+                    if (t - p1_lat_local) > max_gap:
+                        break
+                    if s == -_p1_sign:
+                        candidates.append((i, v))
+                if candidates:
+                    p2_i, p2_val = max(candidates, key=lambda x: abs(x[1]))
 
     p1_lat = float(seg_t[p1_i])
     p2_lat = float(seg_t[p2_i]) if (p2_i is not None and not np.isnan(p2_val)) else np.nan
