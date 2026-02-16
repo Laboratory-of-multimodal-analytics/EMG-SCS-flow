@@ -252,6 +252,28 @@ def _refine_onset_before_p1(
     return float(seg_t[int(idx[0])])
 
 
+def _max_template_markers_are_valid_for_transfer(markers: dict[str, float]) -> bool:
+    """Check whether config-level markers are sane enough to transfer to a file."""
+    onset = float(markers.get("onset", np.nan))
+    p1 = float(markers.get("p1", np.nan))
+    p2 = float(markers.get("p2", np.nan))
+    if not (np.isfinite(onset) and np.isfinite(p1) and np.isfinite(p2)):
+        return False
+    if onset < 0.0:
+        return False
+    # Empirically robust guardrails for transfer from high-amp templates:
+    # very-late onsets and very-late p2 peaks tend to produce mismatches.
+    if onset > 0.020:
+        return False
+    if p1 <= onset:
+        return False
+    if p2 <= p1:
+        return False
+    if p2 > 0.035:
+        return False
+    return True
+
+
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
     mat = loadmat(mat_path)
     data = mat["data"].ravel()
@@ -1350,7 +1372,12 @@ def _run_startstop_analysis(
             valid_fraction = np.mean(valid_flags) if len(valid_flags) else 0.0
             median_corr = float(np.median(corrs)) if len(corrs) else 0.0
 
-            if (valid_fraction < min_valid_frac) and (median_corr < corr_min_median):
+            # Keep the original conservative gate, and add a stricter low-corr
+            # guard for borderline channels: moderate valid fraction can still
+            # be dominated by mismatched shape when template similarity is very low.
+            low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
+            borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
+            if low_valid_low_corr or borderline_valid_very_low_corr:
                 for e in entries:
                     e["onset"] = np.nan
                     e["p1"] = np.nan
@@ -1970,8 +1997,7 @@ def run_pipeline(
             # missing/invalid, fall back to per-file estimation for this channel.
             if template_mode == "max_amp_only" and (ch_name in tmpl_cfg):
                 markers_existing = markers_cfg.get(ch_name, {})
-                p1_existing = float(markers_existing.get("p1", np.nan))
-                if np.isfinite(p1_existing):
+                if _max_template_markers_are_valid_for_transfer(markers_existing):
                     continue
                 use_filewise_fallback = True
             elif template_mode == "max_amp_only":
@@ -1994,7 +2020,7 @@ def run_pipeline(
                 # User-requested behavior: when max-amp template is unavailable/
                 # invalid and we fall back to file-wise template, tighten peak
                 # selection by increasing prominence requirement.
-                prom_k = float(prom_k) * 1.5
+                prom_k = float(prom_k) * 1.0
             prom_baseline_mask = _choose_silent_prominence_baseline_mask(
                 sig=tmpl,
                 prestim_mask=prestim_prom_mask,
@@ -2108,7 +2134,9 @@ def run_pipeline(
                         sfreq=sfreq,
                         baseline_mask=baseline_mask,
                         t_center=t_p2,
-                        win_ms=5.0,
+                        # P2 has larger latency jitter than P1 on this dataset;
+                        # use a wider search window to avoid systematic misses.
+                        win_ms=12.0,
                         polarity=pol2,
                         amp_min_uV=10.0,
                         min_width_ms=0.4,
