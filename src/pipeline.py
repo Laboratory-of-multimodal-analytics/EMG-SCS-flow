@@ -1714,15 +1714,30 @@ def run_pipeline(
 
     config_max_amp = {}
     if template_mode == "max_amp_only":
+        # For each configuration, use the highest available amplitude that also
+        # has enough detected stimulus epochs to build a stable template.
+        config_candidates: dict[str, list[tuple[float, str]]] = defaultdict(list)
         for file_name in file_list:
             configuration = file_name.split("-")[0]
             stim_amp_raw = file_name.split("_")[1].split(".fif")[0]
             amp_num = amp_to_number(stim_amp_raw)
             if np.isnan(amp_num):
                 continue
-            current = config_max_amp.get(configuration)
-            if current is None or amp_num > current:
-                config_max_amp[configuration] = amp_num
+            config_candidates[configuration].append((float(amp_num), file_name))
+
+        for configuration, amp_files in config_candidates.items():
+            amp_files_sorted = sorted(amp_files, key=lambda x: x[0], reverse=True)
+            for amp_num, file_name in amp_files_sorted:
+                file_path = crops_dir / file_name
+                raw_file = mne.io.read_raw_fif(file_path, preload=False)
+                sfreq = raw_file.info["sfreq"]
+                art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
+                art = _get_art_signal(raw_file, art_chans)
+                threshold = THRESH * np.std(art)
+                peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
+                if len(peaks) > MIN_VALID_EPOCHS:
+                    config_max_amp[configuration] = amp_num
+                    break
 
     config_waveforms = defaultdict(lambda: defaultdict(list))
     config_meta: dict[str, dict[str, np.ndarray | float]] = {}
@@ -1979,7 +1994,7 @@ def run_pipeline(
                 # User-requested behavior: when max-amp template is unavailable/
                 # invalid and we fall back to file-wise template, tighten peak
                 # selection by increasing prominence requirement.
-                prom_k = int(prom_k) * 3
+                prom_k = float(prom_k) * 1.5
             prom_baseline_mask = _choose_silent_prominence_baseline_mask(
                 sig=tmpl,
                 prestim_mask=prestim_prom_mask,
