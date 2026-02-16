@@ -55,6 +55,12 @@ BASELINE_TMAX = 0.0
 RESP_TMIN = 0.01
 RESP_TMAX = 0.04
 
+# Stimulation-induced: use post-stimulus baseline for prominence estimation.
+STIM_PROM_BASELINE_TMIN = 0.06
+STIM_PROM_BASELINE_TMAX = 0.10
+STIM_PROM_PRESTIM_TMIN = -0.05
+STIM_PROM_PRESTIM_TMAX = -0.025
+
 # Stimulation-induced: reject detections if full-epoch waveform
 # is highly correlated with any artifact channel (abs correlation).
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
@@ -64,10 +70,4 @@ MIN_VALID_EPOCHS = 5 #very conservative
 
 
 def get_prominence_k(file_name: str, ch_name: str) -> int:
-    # if file_name in ["14+15-_8.fif", "14+15-_9.fif"]:
-    #     return 30 if ch_name == "Flex U R" else 10
-    # if file_name in ["8+9-_2.fif"]:
-    #     return 30 if ch_name == "Ext U R" else 10
-    # if file_name in ["1+2-_8.fif"]:
-    #     return 40 if ch_name == "Ext U L" else 10
     return 10

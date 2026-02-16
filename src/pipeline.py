@@ -31,6 +31,10 @@ from .constants import (
     RAW_BANDPASS_L_FREQ,
     RESP_TMAX,
     RESP_TMIN,
+    STIM_PROM_PRESTIM_TMAX,
+    STIM_PROM_PRESTIM_TMIN,
+    STIM_PROM_BASELINE_TMAX,
+    STIM_PROM_BASELINE_TMIN,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
     STARTSTOP_MIN_DIST_MS,
@@ -169,6 +173,39 @@ def _normalize_text(value) -> str:
     if _cyrillic_score(restored) > _cyrillic_score(text):
         return restored
     return text
+
+
+def _robust_noise_scale(sig: np.ndarray, mask: np.ndarray) -> float:
+    """Estimate noise scale robustly for a masked interval."""
+    if np.sum(mask) < 5:
+        return np.inf
+    x = np.asarray(sig[mask], dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 5:
+        return np.inf
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale <= 0:
+        scale = float(np.std(x))
+    if not np.isfinite(scale) or scale <= 0:
+        return np.inf
+    return scale
+
+
+def _choose_silent_prominence_baseline_mask(
+    sig: np.ndarray,
+    prestim_mask: np.ndarray,
+    poststim_mask: np.ndarray,
+) -> np.ndarray:
+    """Choose the quieter baseline window for prominence estimation."""
+    pre_scale = _robust_noise_scale(sig, prestim_mask)
+    post_scale = _robust_noise_scale(sig, poststim_mask)
+    if np.isinf(pre_scale) and np.isinf(post_scale):
+        return prestim_mask
+    if post_scale < pre_scale:
+        return poststim_mask
+    return prestim_mask
 
 
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
@@ -1710,6 +1747,10 @@ def run_pipeline(
         sfreq = float(config_meta[configuration]["sfreq"])
 
         baseline_mask = (times >= BASELINE_TMIN) & (times <= BASELINE_TMAX)
+        prestim_prom_mask = (times >= STIM_PROM_PRESTIM_TMIN) & (times <= STIM_PROM_PRESTIM_TMAX)
+        if np.sum(prestim_prom_mask) < 5:
+            prestim_prom_mask = baseline_mask
+        poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
 
         for ch_name, waves in ch_dict.items():
             if len(waves) == 0:
@@ -1730,11 +1771,16 @@ def run_pipeline(
                 sustain_ms=5,
             )
 
+            prom_baseline_mask = _choose_silent_prominence_baseline_mask(
+                sig=tmpl_global,
+                prestim_mask=prestim_prom_mask,
+                poststim_mask=poststim_prom_mask,
+            )
             p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
                 tmpl_global,
                 times,
                 sfreq,
-                baseline_mask=baseline_mask,
+                baseline_mask=prom_baseline_mask,
                 onset_latency=onset_t,
                 resp_tmax=RESP_TMAX,
                 min_prom_k=0,
@@ -1835,6 +1881,10 @@ def run_pipeline(
             group_store[configuration][ch][stim_amp_raw].append(file_mean)
 
         baseline_mask = (times >= BASELINE_TMIN) & (times <= BASELINE_TMAX)
+        prestim_prom_mask = (times >= STIM_PROM_PRESTIM_TMIN) & (times <= STIM_PROM_PRESTIM_TMAX)
+        if np.sum(prestim_prom_mask) < 5:
+            prestim_prom_mask = baseline_mask
+        poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
 
         tmpl_cfg = config_templates[configuration]
         markers_cfg = config_template_markers[configuration]
@@ -1858,11 +1908,16 @@ def run_pipeline(
             )
 
             prom_k = get_prominence_k(file_name, ch_name)
+            prom_baseline_mask = _choose_silent_prominence_baseline_mask(
+                sig=tmpl,
+                prestim_mask=prestim_prom_mask,
+                poststim_mask=poststim_prom_mask,
+            )
             p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
                 tmpl,
                 times,
                 sfreq,
-                baseline_mask=baseline_mask,
+                baseline_mask=prom_baseline_mask,
                 onset_latency=onset_t,
                 resp_tmax=RESP_TMAX,
                 min_prom_k=prom_k,

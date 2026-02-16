@@ -241,7 +241,6 @@ def detect_template_peaks(
         p1_i, p1_val = i1, v1
         p2_i, p2_val = i2, v2
     else:
-        print(peaks)
         k1 = 0
         k2_first = None
         for kk in range(1, len(peaks)):
