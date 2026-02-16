@@ -65,6 +65,7 @@ STIM_PROM_PRESTIM_TMAX = -0.025
 # is highly correlated with any artifact channel (abs correlation).
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
 STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.7
+STIM_USE_ONSET = False
 
 MIN_VALID_EPOCHS = 5 #very conservative
 

@@ -37,6 +37,7 @@ from .constants import (
     STIM_PROM_BASELINE_TMIN,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
+    STIM_USE_ONSET,
     STARTSTOP_MIN_DIST_MS,
     STARTSTOP_MODE,
     STARTSTOP_LEAKAGE_CORR_REJECTION,
@@ -253,20 +254,25 @@ def _refine_onset_before_p1(
     return float(seg_t[int(idx[0])])
 
 
-def _max_template_markers_are_valid_for_transfer(markers: dict[str, float]) -> bool:
+def _max_template_markers_are_valid_for_transfer(
+    markers: dict[str, float],
+    require_onset: bool = True,
+) -> bool:
     """Check whether config-level markers are sane enough to transfer to a file."""
     onset = float(markers.get("onset", np.nan))
     p1 = float(markers.get("p1", np.nan))
     p2 = float(markers.get("p2", np.nan))
-    if not (np.isfinite(onset) and np.isfinite(p1) and np.isfinite(p2)):
+    if not (np.isfinite(p1) and np.isfinite(p2)):
         return False
-    if onset < 0.0:
+    if require_onset and (not np.isfinite(onset)):
+        return False
+    if np.isfinite(onset) and onset < 0.0:
         return False
     # Empirically robust guardrails for transfer from high-amp templates:
     # very-late onsets and very-late p2 peaks tend to produce mismatches.
-    if onset > 0.020:
+    if require_onset and onset > 0.020:
         return False
-    if p1 <= onset:
+    if np.isfinite(onset) and (p1 <= onset):
         return False
     if p2 <= p1:
         return False
@@ -1850,16 +1856,19 @@ def run_pipeline(
 
             tmpl_global = np.mean(np.stack(waves, axis=0), axis=0)
 
-            onset_t = detect_onset_rectified(
-                tmpl_global,
-                times,
-                sfreq,
-                baseline_mask=baseline_mask,
-                onset_tmin=0.003,
-                onset_tmax=0.035,
-                k=4,
-                sustain_ms=5,
-            )
+            if STIM_USE_ONSET:
+                onset_t = detect_onset_rectified(
+                    tmpl_global,
+                    times,
+                    sfreq,
+                    baseline_mask=baseline_mask,
+                    onset_tmin=0.003,
+                    onset_tmax=0.035,
+                    k=4,
+                    sustain_ms=5,
+                )
+            else:
+                onset_t = np.nan
 
             prom_baseline_mask = _choose_silent_prominence_baseline_mask(
                 sig=tmpl_global,
@@ -1879,7 +1888,7 @@ def run_pipeline(
                 min_width_ms=0.6,
                 amp_min_uV=10,
             )
-            if (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
+            if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
                 onset_t_ref = _refine_onset_before_p1(
                     sig_f=tmpl_global,
                     times=times,
@@ -1889,8 +1898,10 @@ def run_pipeline(
                 )
                 if not np.isnan(onset_t_ref):
                     onset_t = float(onset_t_ref)
-            if np.isfinite(onset_t) and (onset_t < 0.0):
+            if STIM_USE_ONSET and np.isfinite(onset_t) and (onset_t < 0.0):
                 onset_t = 0.0
+            if not STIM_USE_ONSET:
+                onset_t = np.nan
 
             config_templates[configuration][ch_name] = tmpl_global
             config_template_markers[configuration][ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
@@ -1906,7 +1917,9 @@ def run_pipeline(
                     ch_name, {"onset": np.nan, "p1": np.nan, "p2": np.nan}
                 )
                 cfg_bank[ch_name] = []
-                if (template is None) or (not _max_template_markers_are_valid_for_transfer(markers)):
+                if (template is None) or (
+                    not _max_template_markers_are_valid_for_transfer(markers, require_onset=STIM_USE_ONSET)
+                ):
                     continue
                 cfg_bank[ch_name].append(
                     {"amp": float(max_amp), "template": template, "markers": dict(markers)}
@@ -1964,16 +1977,19 @@ def run_pipeline(
 
                     ch_idx = epochs.ch_names.index(ch_name)
                     tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
-                    onset_t = detect_onset_rectified(
-                        tmpl,
-                        times,
-                        sfreq,
-                        baseline_mask=baseline_mask,
-                        onset_tmin=0.003,
-                        onset_tmax=0.035,
-                        k=4,
-                        sustain_ms=5,
-                    )
+                    if STIM_USE_ONSET:
+                        onset_t = detect_onset_rectified(
+                            tmpl,
+                            times,
+                            sfreq,
+                            baseline_mask=baseline_mask,
+                            onset_tmin=0.003,
+                            onset_tmax=0.035,
+                            k=4,
+                            sustain_ms=5,
+                        )
+                    else:
+                        onset_t = np.nan
                     prom_baseline_mask = _choose_silent_prominence_baseline_mask(
                         sig=tmpl,
                         prestim_mask=prestim_prom_mask,
@@ -1992,7 +2008,7 @@ def run_pipeline(
                         min_width_ms=0.6,
                         amp_min_uV=10,
                     )
-                    if (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
+                    if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
                         onset_t_ref = _refine_onset_before_p1(
                             sig_f=tmpl,
                             times=times,
@@ -2002,11 +2018,15 @@ def run_pipeline(
                         )
                         if not np.isnan(onset_t_ref):
                             onset_t = float(onset_t_ref)
-                    if np.isfinite(onset_t) and (onset_t < 0.0):
+                    if STIM_USE_ONSET and np.isfinite(onset_t) and (onset_t < 0.0):
                         onset_t = 0.0
+                    if not STIM_USE_ONSET:
+                        onset_t = np.nan
 
                     markers = dict(onset=onset_t, p1=p1_t, p2=p2_t)
-                    if not _max_template_markers_are_valid_for_transfer(markers):
+                    if not _max_template_markers_are_valid_for_transfer(
+                        markers, require_onset=STIM_USE_ONSET
+                    ):
                         continue
 
                     existing = cfg_bank.setdefault(ch_name, [])
@@ -2155,16 +2175,19 @@ def run_pipeline(
                 continue
 
             tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
-            onset_t = detect_onset_rectified(
-                tmpl,
-                times,
-                sfreq,
-                baseline_mask=baseline_mask,
-                onset_tmin=0.003,
-                onset_tmax=0.035,
-                k=0.8,
-                sustain_ms=3,
-            )
+            if STIM_USE_ONSET:
+                onset_t = detect_onset_rectified(
+                    tmpl,
+                    times,
+                    sfreq,
+                    baseline_mask=baseline_mask,
+                    onset_tmin=0.003,
+                    onset_tmax=0.035,
+                    k=0.8,
+                    sustain_ms=3,
+                )
+            else:
+                onset_t = np.nan
 
             prom_k = get_prominence_k(file_name, ch_name)
             prom_baseline_mask = _choose_silent_prominence_baseline_mask(
@@ -2185,7 +2208,7 @@ def run_pipeline(
                 min_width_ms=0.6,
                 amp_min_uV=10,
             )
-            if (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
+            if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
                 onset_t_ref = _refine_onset_before_p1(
                     sig_f=tmpl,
                     times=times,
@@ -2195,8 +2218,10 @@ def run_pipeline(
                 )
                 if not np.isnan(onset_t_ref):
                     onset_t = float(onset_t_ref)
-            if np.isfinite(onset_t) and (onset_t < 0.0):
+            if STIM_USE_ONSET and np.isfinite(onset_t) and (onset_t < 0.0):
                 onset_t = 0.0
+            if not STIM_USE_ONSET:
+                onset_t = np.nan
 
             tmpl_cfg[ch_name] = tmpl
             markers_cfg[ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
@@ -2208,7 +2233,9 @@ def run_pipeline(
                 if (
                     (ch not in art_set)
                     and (tmpl_cfg.get(ch) is not None)
-                    and _max_template_markers_are_valid_for_transfer(markers_cfg.get(ch, {}))
+                    and _max_template_markers_are_valid_for_transfer(
+                        markers_cfg.get(ch, {}), require_onset=STIM_USE_ONSET
+                    )
                 )
             ]
         else:
@@ -2248,16 +2275,19 @@ def run_pipeline(
                 t_p2 = markers_cfg[ch_name]["p2"]
                 tmpl = tmpl_cfg[ch_name]
 
-                onset_latency = detect_onset_near_template(
-                    sig_f,
-                    times,
-                    sfreq,
-                    baseline_mask,
-                    t_on_tmpl,
-                    win_ms=2,
-                    k=1,
-                    sustain_ms=2,
-                )
+                if STIM_USE_ONSET:
+                    onset_latency = detect_onset_near_template(
+                        sig_f,
+                        times,
+                        sfreq,
+                        baseline_mask,
+                        t_on_tmpl,
+                        win_ms=2,
+                        k=1,
+                        sustain_ms=2,
+                    )
+                else:
+                    onset_latency = np.nan
 
                 peak1_latency = peak2_latency = np.nan
                 peak1_value = peak2_value = np.nan
@@ -2329,7 +2359,7 @@ def run_pipeline(
                         win_ms=1.0,
                         polarity=pol2,
                     )
-                if (not np.isnan(peak1_latency)) and (
+                if STIM_USE_ONSET and (not np.isnan(peak1_latency)) and (
                     np.isnan(onset_latency) or onset_latency >= (peak1_latency - 0.0015)
                 ):
                     onset_ref = _refine_onset_before_p1(
@@ -2480,9 +2510,12 @@ def run_pipeline(
                             artifact_like_channel = True
                             break
 
+            # If overall shape match to transferred template is poor, discard
+            # regardless of valid fraction to suppress stable false positives.
+            low_median_corr = (median_corr < corr_min_median)
             low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
             borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
-            if artifact_like_channel or low_valid_low_corr or borderline_valid_very_low_corr:
+            if artifact_like_channel or low_median_corr or low_valid_low_corr or borderline_valid_very_low_corr:
                 for e in entries:
                     e["onset"] = np.nan
                     e["p1"] = np.nan
