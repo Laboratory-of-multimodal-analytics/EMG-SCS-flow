@@ -222,9 +222,9 @@ def plot_boxplots(df: pd.DataFrame, output_dir: Path) -> None:
         ("Onset latency", "Latency (s)", False),
         ("Peak1 latency", "Latency (s)", False),
         ("Peak2 latency", "Latency (s)", False),
-        ("Peak1 value", "Amplitude |V|", True),
-        ("Peak2 value", "Amplitude |V|", True),
-        ("PTP amplitude", "Amplitude |V|", True),
+        ("Peak1 value", "Amplitude |mkV|", True),
+        ("Peak2 value", "Amplitude |mkV|", True),
+        ("PTP amplitude", "Amplitude |mkV|", True),
     ]
 
     dot_alpha = 0.35
@@ -271,7 +271,7 @@ def plot_boxplots(df: pd.DataFrame, output_dir: Path) -> None:
                     if vals.size == 0:
                         continue
                     if take_abs:
-                        vals = np.abs(vals)
+                        vals = np.abs(vals) * 1e6
                     data.append(vals)
                     labels.append(a)
 
