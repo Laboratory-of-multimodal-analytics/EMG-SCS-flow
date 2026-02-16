@@ -2451,7 +2451,7 @@ def run_pipeline(
                     }
                 )
 
-        corr_min_median = 0.5
+        corr_min_median = 0.7
         min_valid_frac = 0.4
 
         # File-wise artifact reference means (one mean waveform per artifact channel).
