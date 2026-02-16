@@ -64,7 +64,7 @@ STIM_PROM_PRESTIM_TMAX = -0.025
 # Stimulation-induced: reject detections if full-epoch waveform
 # is highly correlated with any artifact channel (abs correlation).
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
-STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.7
+STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.5
 STIM_USE_ONSET = False
 STIM_PEAK_AMP_MIN_UV = 10.0
 STIM_PTP_MIN_UV = 30.0
