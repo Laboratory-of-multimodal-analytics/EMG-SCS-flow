@@ -70,4 +70,4 @@ MIN_VALID_EPOCHS = 5 #very conservative
 
 
 def get_prominence_k(file_name: str, ch_name: str) -> int:
-    return 10
+    return 15

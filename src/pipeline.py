@@ -241,7 +241,11 @@ def _refine_onset_before_p1(
     rect = np.abs(seg - bmean)
     thr = float(k) * bstd
     w = max(1, int((sustain_ms / 1000.0) * sfreq))
-    rect_s = _moving_mean(rect, w)
+    if w <= 1:
+        rect_s = rect
+    else:
+        k_win = np.ones(int(w), dtype=float) / float(w)
+        rect_s = np.convolve(rect, k_win, mode="same")
     idx = np.where(rect_s > thr)[0]
     if len(idx) == 0:
         return np.nan
