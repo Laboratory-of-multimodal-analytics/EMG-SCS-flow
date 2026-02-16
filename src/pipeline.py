@@ -1895,6 +1895,11 @@ def run_pipeline(
             if ch_name in art_set:
                 continue
 
+            # In max-amp mode, keep config-level templates/markers from PASS 1
+            # (built on the strongest amplitude) and do not overwrite per file.
+            if template_mode == "max_amp_only":
+                continue
+
             tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
             onset_t = detect_onset_rectified(
                 tmpl,
