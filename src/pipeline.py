@@ -208,6 +208,46 @@ def _choose_silent_prominence_baseline_mask(
     return prestim_mask
 
 
+def _refine_onset_before_p1(
+    sig_f: np.ndarray,
+    times: np.ndarray,
+    sfreq: float,
+    baseline_mask: np.ndarray,
+    p1_latency: float,
+    min_gap_s: float = 0.0015,
+    search_back_s: float = 0.03,
+    k: float = 1.0,
+    sustain_ms: float = 1.5,
+) -> float:
+    """Refine onset as first robust crossing before P1."""
+    if np.isnan(p1_latency):
+        return np.nan
+    base = np.asarray(sig_f[baseline_mask], dtype=float)
+    if base.size < 5:
+        return np.nan
+    bmean = float(np.mean(base))
+    bstd = float(np.std(base))
+    if (not np.isfinite(bstd)) or bstd <= 0:
+        return np.nan
+
+    tmax = float(p1_latency - min_gap_s)
+    tmin = max(float(times[0]), float(p1_latency - search_back_s))
+    m = (times >= tmin) & (times <= tmax)
+    if np.sum(m) < 5:
+        return np.nan
+
+    seg = np.asarray(sig_f[m], dtype=float)
+    seg_t = np.asarray(times[m], dtype=float)
+    rect = np.abs(seg - bmean)
+    thr = float(k) * bstd
+    w = max(1, int((sustain_ms / 1000.0) * sfreq))
+    rect_s = _moving_mean(rect, w)
+    idx = np.where(rect_s > thr)[0]
+    if len(idx) == 0:
+        return np.nan
+    return float(seg_t[int(idx[0])])
+
+
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
     mat = loadmat(mat_path)
     data = mat["data"].ravel()
@@ -1788,6 +1828,16 @@ def run_pipeline(
                 min_width_ms=0.6,
                 amp_min_uV=10,
             )
+            if (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
+                onset_t_ref = _refine_onset_before_p1(
+                    sig_f=tmpl_global,
+                    times=times,
+                    sfreq=sfreq,
+                    baseline_mask=baseline_mask,
+                    p1_latency=float(p1_t),
+                )
+                if not np.isnan(onset_t_ref):
+                    onset_t = float(onset_t_ref)
 
             config_templates[configuration][ch_name] = tmpl_global
             config_template_markers[configuration][ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
@@ -1896,11 +1946,13 @@ def run_pipeline(
                 continue
 
             # In max-amp mode, keep config-level templates/markers from PASS 1
-            # (built on the strongest amplitude) and do not overwrite per file
-            # when they exist. If a channel has no template from PASS 1, fall
-            # back to per-file template so downstream code still has markers.
+            # (built on the strongest amplitude) when valid. If markers are
+            # missing/invalid, fall back to per-file estimation for this channel.
             if template_mode == "max_amp_only" and (ch_name in tmpl_cfg):
-                continue
+                markers_existing = markers_cfg.get(ch_name, {})
+                p1_existing = float(markers_existing.get("p1", np.nan))
+                if np.isfinite(p1_existing):
+                    continue
 
             tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
             onset_t = detect_onset_rectified(
@@ -1932,6 +1984,16 @@ def run_pipeline(
                 min_width_ms=0.6,
                 amp_min_uV=10,
             )
+            if (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
+                onset_t_ref = _refine_onset_before_p1(
+                    sig_f=tmpl,
+                    times=times,
+                    sfreq=sfreq,
+                    baseline_mask=baseline_mask,
+                    p1_latency=float(p1_t),
+                )
+                if not np.isnan(onset_t_ref):
+                    onset_t = float(onset_t_ref)
 
             tmpl_cfg[ch_name] = tmpl
             markers_cfg[ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
@@ -2048,6 +2110,18 @@ def run_pipeline(
                         win_ms=1.0,
                         polarity=pol2,
                     )
+                if (not np.isnan(peak1_latency)) and (
+                    np.isnan(onset_latency) or onset_latency >= (peak1_latency - 0.0015)
+                ):
+                    onset_ref = _refine_onset_before_p1(
+                        sig_f=sig_f,
+                        times=times,
+                        sfreq=sfreq,
+                        baseline_mask=baseline_mask,
+                        p1_latency=float(peak1_latency),
+                    )
+                    if not np.isnan(onset_ref):
+                        onset_latency = float(onset_ref)
 
                 if (not np.isnan(peak1_latency)) and (not np.isnan(peak2_latency)):
                     if peak2_latency <= peak1_latency:
