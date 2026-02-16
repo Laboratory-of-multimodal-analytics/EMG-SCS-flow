@@ -37,6 +37,9 @@ from .constants import (
     STIM_PROM_BASELINE_TMIN,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
+    STIM_P1_ABS_MIN_UV,
+    STIM_PEAK_AMP_MIN_UV,
+    STIM_PTP_MIN_UV,
     STIM_USE_ONSET,
     STARTSTOP_MIN_DIST_MS,
     STARTSTOP_MODE,
@@ -1886,7 +1889,7 @@ def run_pipeline(
                 min_prom_k=0,
                 peak2_max_gap_ms=20.0,
                 min_width_ms=0.6,
-                amp_min_uV=10,
+                amp_min_uV=STIM_PEAK_AMP_MIN_UV,
             )
             if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
                 onset_t_ref = _refine_onset_before_p1(
@@ -2006,7 +2009,7 @@ def run_pipeline(
                         min_prom_k=0,
                         peak2_max_gap_ms=20.0,
                         min_width_ms=0.6,
-                        amp_min_uV=10,
+                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
                     )
                     if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
                         onset_t_ref = _refine_onset_before_p1(
@@ -2206,7 +2209,7 @@ def run_pipeline(
                 min_prom_k=prom_k,
                 peak2_max_gap_ms=20.0,
                 min_width_ms=0.6,
-                amp_min_uV=10,
+                amp_min_uV=STIM_PEAK_AMP_MIN_UV,
             )
             if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
                 onset_t_ref = _refine_onset_before_p1(
@@ -2306,7 +2309,7 @@ def run_pipeline(
                         t_center=t_p1,
                         win_ms=5.0,
                         polarity=pol1,
-                        amp_min_uV=10.0,
+                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
                         min_width_ms=0.4,
                         choose="nearest",
                         template_peak_val=tmpl_p1_val,
@@ -2331,7 +2334,7 @@ def run_pipeline(
                         # use a wider search window to avoid systematic misses.
                         win_ms=12.0,
                         polarity=pol2,
-                        amp_min_uV=10.0,
+                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
                         min_width_ms=0.4,
                         choose="nearest",
                         template_peak_val=tmpl_p2_val,
@@ -2400,7 +2403,7 @@ def run_pipeline(
                         guard_ms=1.0,
                         hint_ms=4.0,
                         min_width_ms=0.4,
-                        amp_min_uV=10.0,
+                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
                         choose="dominant",
                     )
                     if not np.isnan(extra_val):
@@ -2411,7 +2414,7 @@ def run_pipeline(
                 else:
                     ptp_amp = np.nan
 
-                if (not np.isnan(ptp_amp)) and (ptp_amp < 30e-6):
+                if (not np.isnan(ptp_amp)) and (ptp_amp < (STIM_PTP_MIN_UV * 1e-6)):
                     onset_latency = np.nan
                     peak1_latency = np.nan
                     peak2_latency = np.nan
@@ -2419,7 +2422,7 @@ def run_pipeline(
                     peak2_value = np.nan
                     ptp_amp = np.nan
 
-                if (not np.isnan(peak1_value)) and (np.abs(peak1_value) <= 10e-6):
+                if (not np.isnan(peak1_value)) and (np.abs(peak1_value) <= (STIM_P1_ABS_MIN_UV * 1e-6)):
                     onset_latency = np.nan
                     peak1_latency = np.nan
                     peak2_latency = np.nan
