@@ -7,7 +7,7 @@ THRESH = 4
 RAW_BANDPASS_L_FREQ = 20
 RAW_BANDPASS_H_FREQ = 180
 
-ARTIFACT_REREF = True
+ARTIFACT_REREF = False
 CAR_REREF = False
 LATERAL_CAR_REREF = False
 
@@ -65,7 +65,7 @@ STIM_PROM_PRESTIM_TMAX = -0.025
 # is highly correlated with any artifact channel (abs correlation).
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
 STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.5
-STIM_USE_ONSET = False
+STIM_USE_ONSET = True
 STIM_PEAK_AMP_MIN_UV = 10.0
 STIM_PTP_MIN_UV = 30.0
 STIM_P1_ABS_MIN_UV = 10.0
@@ -74,4 +74,4 @@ MIN_VALID_EPOCHS = 5 #very conservative
 
 
 def get_prominence_k(file_name: str, ch_name: str) -> int:
-    return 15
+    return 10
