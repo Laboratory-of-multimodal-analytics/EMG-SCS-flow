@@ -1949,6 +1949,7 @@ def run_pipeline(
             if ch_name in art_set:
                 continue
 
+            use_filewise_fallback = False
             # In max-amp mode, keep config-level templates/markers from PASS 1
             # (built on the strongest amplitude) when valid. If markers are
             # missing/invalid, fall back to per-file estimation for this channel.
@@ -1957,6 +1958,9 @@ def run_pipeline(
                 p1_existing = float(markers_existing.get("p1", np.nan))
                 if np.isfinite(p1_existing):
                     continue
+                use_filewise_fallback = True
+            elif template_mode == "max_amp_only":
+                use_filewise_fallback = True
 
             tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
             onset_t = detect_onset_rectified(
@@ -1971,6 +1975,11 @@ def run_pipeline(
             )
 
             prom_k = get_prominence_k(file_name, ch_name)
+            if use_filewise_fallback:
+                # User-requested behavior: when max-amp template is unavailable/
+                # invalid and we fall back to file-wise template, tighten peak
+                # selection by increasing prominence requirement.
+                prom_k = int(prom_k) * 3
             prom_baseline_mask = _choose_silent_prominence_baseline_mask(
                 sig=tmpl,
                 prestim_mask=prestim_prom_mask,
