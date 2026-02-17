@@ -193,9 +193,33 @@ def detect_template_peaks(
 
     pos_idx, pos_props = find_peaks(seg0, prominence=prom, width=min_w)
     neg_idx, neg_props = find_peaks(-seg0, prominence=prom, width=min_w)
+    pos_prom_arr = np.asarray(pos_props.get("prominences", np.zeros(len(pos_idx))), dtype=float)
+    neg_prom_arr = np.asarray(neg_props.get("prominences", np.zeros(len(neg_idx))), dtype=float)
 
+    # Guarded fallback: if strict prominence keeps only one polarity,
+    # relax prominence for the missing polarity only.
     if (len(pos_idx) == 0) or (len(neg_idx) == 0):
-        return (np.nan, np.nan, np.nan, np.nan)
+        relaxed_prom = max(amp_thr, 0.35 * float(prom))
+        if len(pos_idx) == 0:
+            pos_idx_relaxed, pos_props_relaxed = find_peaks(seg0, prominence=relaxed_prom, width=min_w)
+            pos_prom_relaxed = np.asarray(
+                pos_props_relaxed.get("prominences", np.zeros(len(pos_idx_relaxed))),
+                dtype=float,
+            )
+            if len(pos_idx_relaxed) > 0:
+                pos_idx = pos_idx_relaxed
+                pos_prom_arr = pos_prom_relaxed
+        if len(neg_idx) == 0:
+            neg_idx_relaxed, neg_props_relaxed = find_peaks(-seg0, prominence=relaxed_prom, width=min_w)
+            neg_prom_relaxed = np.asarray(
+                neg_props_relaxed.get("prominences", np.zeros(len(neg_idx_relaxed))),
+                dtype=float,
+            )
+            if len(neg_idx_relaxed) > 0:
+                neg_idx = neg_idx_relaxed
+                neg_prom_arr = neg_prom_relaxed
+        if (len(pos_idx) == 0) or (len(neg_idx) == 0):
+            return (np.nan, np.nan, np.nan, np.nan)
 
     pos_sorted = pos_idx[np.argsort(seg0[pos_idx])[::-1]]
     pos_top = pos_sorted[:2]
@@ -203,14 +227,8 @@ def detect_template_peaks(
     neg_sorted = neg_idx[np.argsort((-seg0[neg_idx]))[::-1]]
     neg_top = neg_sorted[:2]
 
-    pos_prom = {
-        int(i): float(p)
-        for i, p in zip(pos_idx.tolist(), pos_props.get("prominences", np.zeros(len(pos_idx))))
-    }
-    neg_prom = {
-        int(i): float(p)
-        for i, p in zip(neg_idx.tolist(), neg_props.get("prominences", np.zeros(len(neg_idx))))
-    }
+    pos_prom = {int(i): float(p) for i, p in zip(pos_idx.tolist(), pos_prom_arr.tolist())}
+    neg_prom = {int(i): float(p) for i, p in zip(neg_idx.tolist(), neg_prom_arr.tolist())}
     prom_by_idx = {**pos_prom, **neg_prom}
 
     peaks = []

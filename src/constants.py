@@ -74,5 +74,5 @@ STIM_P1_ABS_MIN_UV = 10.0
 MIN_VALID_EPOCHS = 5 #very conservative
 
 
-def get_prominence_k(file_name: str, ch_name: str) -> int:
-    return 10
+def get_prominence_k(file_name: str, ch_name: str) -> float:
+    return 8.5
