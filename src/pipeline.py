@@ -37,6 +37,7 @@ from .constants import (
     STIM_PROM_BASELINE_TMIN,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
+    STIM_ONSET_MAX_DEV_S,
     STIM_P1_ABS_MIN_UV,
     STIM_PEAK_AMP_MIN_UV,
     STIM_PTP_MIN_UV,
@@ -2374,6 +2375,15 @@ def run_pipeline(
                     )
                     if not np.isnan(onset_ref):
                         onset_latency = float(onset_ref)
+                if STIM_USE_ONSET and np.isfinite(onset_latency) and np.isfinite(t_on_tmpl):
+                    # Keep transferred onset tightly anchored to template onset.
+                    onset_latency = float(
+                        np.clip(
+                            onset_latency,
+                            float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
+                            float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
+                        )
+                    )
 
                 if (not np.isnan(peak1_latency)) and (not np.isnan(peak2_latency)):
                     if peak2_latency <= peak1_latency:
@@ -2451,7 +2461,7 @@ def run_pipeline(
                     }
                 )
 
-        corr_min_median = 0.7
+        corr_min_median = 0.69
         min_valid_frac = 0.4
 
         # File-wise artifact reference means (one mean waveform per artifact channel).
