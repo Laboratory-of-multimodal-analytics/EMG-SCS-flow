@@ -49,8 +49,6 @@ from .constants import (
     STARTSTOP_CHANNEL_MIN_MEDIAN_CORR,
     STARTSTOP_CHANNEL_MIN_VALID_FRAC,
     STARTSTOP_MIN_DETECTIONS_PER_CHANNEL,
-    STARTSTOP_RMS_K,
-    STARTSTOP_RMS_WIN_MS,
     STARTSTOP_TM_MATCH_PEAK_MIN_DIST_MS,
     STARTSTOP_TM_MATCH_PEAK_PROMINENCE,
     STARTSTOP_TM_MAX_MATCHES_PER_CHANNEL,
@@ -771,63 +769,6 @@ def _detect_template_anchor_samples(
     candidates.sort(key=lambda x: int(x["anchor_sample"]))
     selected_anchors = np.asarray([int(s["anchor_sample"]) for s in candidates], dtype=int)
     return selected_anchors, candidates, discarded
-
-
-def _select_best_template_for_channel(
-    channel_template: np.ndarray,
-    epoch_times: np.ndarray,
-    template_bank: list[dict[str, object]],
-    scales: tuple[float, ...],
-) -> dict[str, object] | None:
-    ch = np.asarray(channel_template, dtype=float)
-    ch = ch - np.mean(ch)
-    ch_std = float(np.std(ch))
-    if ch_std <= 0:
-        return None
-
-    best: dict[str, object] | None = None
-    best_corr = -np.inf
-    for tpl in template_bank:
-        template_wave = np.asarray(tpl["wave"], dtype=float)
-        template_times = np.asarray(tpl["times"], dtype=float)
-        for scale in scales:
-            for flip in (1, -1):
-                synth = _synthesize_template_on_times(
-                    template_wave=template_wave,
-                    template_times=template_times,
-                    target_times=epoch_times,
-                    scale=float(scale),
-                    flip=int(flip),
-                )
-                synth = synth - np.mean(synth)
-                synth_std = float(np.std(synth))
-                if synth_std <= 0:
-                    continue
-                corr = float(np.corrcoef(ch, synth)[0, 1])
-                if np.isnan(corr):
-                    continue
-                if corr > best_corr:
-                    markers = tpl["markers"]
-                    best_corr = corr
-                    best = {
-                        "template_name": tpl["name"],
-                        "scale": float(scale),
-                        "flip": int(flip),
-                        "corr": corr,
-                        "template": _synthesize_template_on_times(
-                            template_wave=template_wave,
-                            template_times=template_times,
-                            target_times=epoch_times,
-                            scale=float(scale),
-                            flip=int(flip),
-                        ),
-                        "markers": {
-                            "onset": float(markers["onset"] * scale) if np.isfinite(markers["onset"]) else np.nan,
-                            "p1": float(markers["peak1"] * scale) if np.isfinite(markers["peak1"]) else np.nan,
-                            "p2": float(markers["peak2"] * scale) if np.isfinite(markers["peak2"]) else np.nan,
-                        },
-                    }
-    return best
 
 
 def _run_startstop_analysis(

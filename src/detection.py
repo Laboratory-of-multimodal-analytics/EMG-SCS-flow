@@ -14,43 +14,6 @@ def _moving_mean(x: np.ndarray, w: int) -> np.ndarray:
     return np.convolve(x, k, mode="same")
 
 
-def rms_envelope(sig: np.ndarray, sfreq: float, win_ms: float) -> np.ndarray:
-    w = max(1, int((win_ms / 1000.0) * sfreq))
-    return np.sqrt(_moving_mean(sig ** 2, w))
-
-
-def detect_rms_events(
-    sig: np.ndarray,
-    sfreq: float,
-    win_ms: float,
-    k: float,
-    min_dist_ms: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    env = rms_envelope(sig, sfreq, win_ms)
-    med = np.median(env)
-    mad = np.median(np.abs(env - med))
-    thr = med + (k * mad * 1.4826)
-    min_dist = max(1, int((min_dist_ms / 1000.0) * sfreq))
-    peaks, props = find_peaks(env, height=thr, distance=min_dist)
-    onsets = []
-    offsets = []
-    n = len(env)
-    for p in peaks:
-        left = p
-        while left > 0 and env[left] > thr:
-            left -= 1
-        onset_idx = left + 1 if left < p else p
-
-        right = p
-        while right < n - 1 and env[right] > thr:
-            right += 1
-        offset_idx = right - 1 if right > p else p
-
-        onsets.append(onset_idx)
-        offsets.append(offset_idx)
-    return env, np.asarray(onsets, dtype=int), np.asarray(offsets, dtype=int), peaks, float(thr)
-
-
 def detect_onset_rectified(
     sig_filt: np.ndarray,
     times: np.ndarray,
