@@ -94,23 +94,17 @@ RESP_TMIN = 0.01
 # Latest response time allowed for peak search (s).
 RESP_TMAX = 0.04
 
-# Post-stimulus "quiet" window candidate for prominence baseline (s).
-STIM_PROM_BASELINE_TMIN = 0.06
-# Post-stimulus "quiet" window candidate for prominence baseline (s).
-STIM_PROM_BASELINE_TMAX = 0.10
-# Pre-stimulus window candidate for prominence baseline (s).
-STIM_PROM_PRESTIM_TMIN = -0.05
-# Pre-stimulus window candidate for prominence baseline (s).
-STIM_PROM_PRESTIM_TMAX = -0.025
-
 # Enable artifact-correlation channel-level rejection in stimulation mode.
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
 # Absolute correlation threshold vs artifact channel means.
 STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.5
-# Use onset detection/transfer logic in stimulation mode.
-STIM_USE_ONSET = True
 # Maximum allowed deviation of epoch onset from template onset (s).
 STIM_ONSET_MAX_DEV_S = 0.003
+
+# Time-scale factors tested when matching pre-computed templates in SIR mode.
+SIR_TM_SCALES = (0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2)
+# Minimum correlation to accept a template match in SIR mode.
+SIR_TM_MIN_CORR = 0.3
 # Minimum absolute amplitude for individual detected peaks (uV).
 STIM_PEAK_AMP_MIN_UV = 10.0
 # Minimum PTP (|P1-P2|) required for a valid response (uV).
@@ -119,10 +113,4 @@ STIM_PTP_MIN_UV = 30.0
 STIM_P1_ABS_MIN_UV = 10.0
 
 # Minimum number of detected stimulus events needed to build templates.
-MIN_VALID_EPOCHS = 5 
-
-
-def get_prominence_k(file_name: str, ch_name: str) -> float:
-    # Global prominence multiplier for template peak detection.
-    # file_name/ch_name are kept for future per-file/per-channel tuning.
-    return 8.5
+MIN_VALID_EPOCHS = 5

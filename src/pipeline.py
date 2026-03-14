@@ -25,23 +25,19 @@ from .constants import (
     BASELINE_TMIN,
     EPOCH_TMAX,
     EPOCH_TMIN,
-    LOWPASS_CUTOFF_HZ,
     MIN_VALID_EPOCHS,
     RAW_BANDPASS_H_FREQ,
     RAW_BANDPASS_L_FREQ,
     RESP_TMAX,
     RESP_TMIN,
-    STIM_PROM_PRESTIM_TMAX,
-    STIM_PROM_PRESTIM_TMIN,
-    STIM_PROM_BASELINE_TMAX,
-    STIM_PROM_BASELINE_TMIN,
+    SIR_TM_MIN_CORR,
+    SIR_TM_SCALES,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
     STIM_ONSET_MAX_DEV_S,
     STIM_P1_ABS_MIN_UV,
     STIM_PEAK_AMP_MIN_UV,
     STIM_PTP_MIN_UV,
-    STIM_USE_ONSET,
     STARTSTOP_MIN_DIST_MS,
     STARTSTOP_MODE,
     STARTSTOP_LEAKAGE_CORR_REJECTION,
@@ -68,14 +64,11 @@ from .constants import (
     STARTSTOP_SIM_TMIN,
     STARTSTOP_SIM_TMAX,
     THRESH,
-    get_prominence_k,
 )
 from .detection import (
     add_extra_peak_to_p1,
     detect_onset_near_template,
-    detect_onset_rectified,
     detect_peak_in_window,
-    detect_template_peaks,
     find_extra_p1_peak,
     pick_epoch_value_near_latency,
 )
@@ -91,7 +84,6 @@ from .plotting import (
 
 
 GIB_CHARS = set(":>=;@<#")
-MAX_AMP_TEMPLATE_MULTI_P1_GAP_S = 0.003  # 3 ms: treat as distinct latency class
 
 
 def _cyrillic_score(text: str) -> int:
@@ -179,108 +171,120 @@ def _normalize_text(value) -> str:
     return text
 
 
-def _robust_noise_scale(sig: np.ndarray, mask: np.ndarray) -> float:
-    """Estimate noise scale robustly for a masked interval."""
-    if np.sum(mask) < 5:
-        return np.inf
-    x = np.asarray(sig[mask], dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size < 5:
-        return np.inf
-    med = float(np.median(x))
-    mad = float(np.median(np.abs(x - med)))
-    scale = 1.4826 * mad
-    if not np.isfinite(scale) or scale <= 0:
-        scale = float(np.std(x))
-    if not np.isfinite(scale) or scale <= 0:
-        return np.inf
-    return scale
-
-
-def _choose_silent_prominence_baseline_mask(
-    sig: np.ndarray,
-    prestim_mask: np.ndarray,
-    poststim_mask: np.ndarray,
-) -> np.ndarray:
-    """Choose the quieter baseline window for prominence estimation."""
-    pre_scale = _robust_noise_scale(sig, prestim_mask)
-    post_scale = _robust_noise_scale(sig, poststim_mask)
-    if np.isinf(pre_scale) and np.isinf(post_scale):
-        return prestim_mask
-    if post_scale < pre_scale:
-        return poststim_mask
-    return prestim_mask
-
-
-def _refine_onset_before_p1(
-    sig_f: np.ndarray,
+def _match_sir_template(
+    mean_waveform: np.ndarray,
     times: np.ndarray,
     sfreq: float,
     baseline_mask: np.ndarray,
-    p1_latency: float,
-    min_gap_s: float = 0.0015,
-    search_back_s: float = 0.03,
-    k: float = 1.0,
-    sustain_ms: float = 1.5,
-) -> float:
-    """Refine onset as first robust crossing before P1."""
-    if np.isnan(p1_latency):
-        return np.nan
-    base = np.asarray(sig_f[baseline_mask], dtype=float)
-    if base.size < 5:
-        return np.nan
-    bmean = float(np.mean(base))
-    bstd = float(np.std(base))
-    if (not np.isfinite(bstd)) or bstd <= 0:
-        return np.nan
+    resp_tmin: float,
+    resp_tmax: float,
+    template_bank: list[dict[str, object]],
+    scales: tuple[float, ...],
+    min_corr: float,
+) -> dict[str, object] | None:
+    """Match pre-computed templates to a channel's mean stimulus-evoked response.
 
-    tmax = float(p1_latency - min_gap_s)
-    tmin = max(float(times[0]), float(p1_latency - search_back_s))
-    m = (times >= tmin) & (times <= tmax)
-    if np.sum(m) < 5:
-        return np.nan
+    For each template variant (template x scale x flip), tries candidate shifts
+    that place P1 within [resp_tmin, resp_tmax] and computes Pearson correlation
+    in the response window.  Returns the best match with absolute marker times
+    and a synthesized template waveform on the epoch time axis, or None if no
+    match exceeds *min_corr*.
+    """
+    bmean = float(np.mean(mean_waveform[baseline_mask]))
+    sig = mean_waveform - bmean
 
-    seg = np.asarray(sig_f[m], dtype=float)
-    seg_t = np.asarray(times[m], dtype=float)
-    rect = np.abs(seg - bmean)
-    thr = float(k) * bstd
-    w = max(1, int((sustain_ms / 1000.0) * sfreq))
-    if w <= 1:
-        rect_s = rect
-    else:
-        k_win = np.ones(int(w), dtype=float) / float(w)
-        rect_s = np.convolve(rect, k_win, mode="same")
-    idx = np.where(rect_s > thr)[0]
-    if len(idx) == 0:
-        return np.nan
-    return float(seg_t[int(idx[0])])
+    resp_mask = (times >= resp_tmin) & (times <= resp_tmax)
+    resp_times = times[resp_mask]
+    sig_resp = sig[resp_mask]
+    sig_resp_c = sig_resp - float(np.mean(sig_resp))
+    if float(np.std(sig_resp_c)) == 0 or len(sig_resp) < 5:
+        return None
 
+    best_corr = -np.inf
+    best: dict[str, object] | None = None
 
-def _max_template_markers_are_valid_for_transfer(
-    markers: dict[str, float],
-    require_onset: bool = True,
-) -> bool:
-    """Check whether config-level markers are sane enough to transfer to a file."""
-    onset = float(markers.get("onset", np.nan))
-    p1 = float(markers.get("p1", np.nan))
-    p2 = float(markers.get("p2", np.nan))
-    if not (np.isfinite(p1) and np.isfinite(p2)):
-        return False
-    if require_onset and (not np.isfinite(onset)):
-        return False
-    if np.isfinite(onset) and onset < 0.0:
-        return False
-    # Empirically robust guardrails for transfer from high-amp templates:
-    # very-late onsets and very-late p2 peaks tend to produce mismatches.
-    if require_onset and onset > 0.020:
-        return False
-    if np.isfinite(onset) and (p1 <= onset):
-        return False
-    if p2 <= p1:
-        return False
-    if p2 > 0.035:
-        return False
-    return True
+    for tpl in template_bank:
+        wave_raw = np.asarray(tpl["wave"], dtype=float)
+        tpl_times = np.asarray(tpl["times"], dtype=float)
+        markers = tpl["markers"]
+        p1_marker = float(markers.get("peak1", np.nan))
+        if np.isnan(p1_marker):
+            continue
+        onset_marker = float(markers.get("onset", np.nan))
+        p2_marker = float(markers.get("peak2", np.nan))
+
+        for scale in scales:
+            p1_scaled = p1_marker * scale
+            onset_scaled = onset_marker * scale if np.isfinite(onset_marker) else np.nan
+            p2_scaled = p2_marker * scale if np.isfinite(p2_marker) else np.nan
+
+            # Anchor range: shifts where P1 lands in [resp_tmin, resp_tmax].
+            anchor_tmin = resp_tmin - p1_scaled
+            anchor_tmax = resp_tmax - p1_scaled
+            n_shifts = max(3, int((anchor_tmax - anchor_tmin) * sfreq) + 1)
+            anchor_candidates = np.linspace(anchor_tmin, anchor_tmax, n_shifts)
+
+            for flip in (1, -1):
+                for anchor_t in anchor_candidates:
+                    # Template times in epoch coordinates.
+                    shifted_tpl_times = tpl_times * scale + anchor_t
+
+                    # Interpolate template at response-window time points.
+                    tpl_at_resp = np.interp(
+                        resp_times, shifted_tpl_times, float(flip) * wave_raw,
+                        left=0.0, right=0.0,
+                    )
+                    tpl_at_resp_c = tpl_at_resp - float(np.mean(tpl_at_resp))
+                    if float(np.std(tpl_at_resp_c)) == 0:
+                        continue
+
+                    corr = float(np.corrcoef(sig_resp_c, tpl_at_resp_c)[0, 1])
+                    if np.isnan(corr) or corr <= best_corr:
+                        continue
+
+                    p1_abs = anchor_t + p1_scaled
+                    p2_abs = anchor_t + p2_scaled if np.isfinite(p2_scaled) else np.nan
+                    onset_abs = anchor_t + onset_scaled if np.isfinite(onset_scaled) else np.nan
+
+                    # Sanity: onset must be non-negative, P2 must follow P1.
+                    if np.isfinite(onset_abs) and onset_abs < 0:
+                        onset_abs = np.nan
+                    if np.isfinite(p2_abs) and p2_abs <= p1_abs:
+                        continue
+
+                    best_corr = corr
+
+                    # Synthesize the full template on the epoch time axis.
+                    synth_on_epoch = np.interp(
+                        times, shifted_tpl_times, float(flip) * wave_raw,
+                        left=0.0, right=0.0,
+                    )
+
+                    best = {
+                        "name": tpl["name"],
+                        "scale": scale,
+                        "flip": flip,
+                        "corr": best_corr,
+                        "template": synth_on_epoch,
+                        "onset": onset_abs,
+                        "p1": p1_abs,
+                        "p2": p2_abs,
+                    }
+
+    if best is None or best["corr"] < min_corr:
+        return None
+
+    # Scale the synthesized template to the signal's amplitude so that
+    # downstream peak detectors can compare template values against the
+    # real signal (both in Volts).
+    tmpl_resp = best["template"][resp_mask]
+    tmpl_resp_c = tmpl_resp - float(np.mean(tmpl_resp))
+    denom = float(np.dot(tmpl_resp_c, tmpl_resp_c))
+    if denom > 0:
+        gain = float(np.dot(sig_resp_c, tmpl_resp_c)) / denom
+        best["template"] = best["template"] * gain
+
+    return best
 
 
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
@@ -1624,7 +1628,6 @@ def _default_output_root_for_input(edf_path: Path) -> Path:
 def run_pipeline(
     edf_path: str | Path,
     output_dir: str | Path | None = None,
-    template_mode: str = "per_file_mean",
     startstop_mode: bool | None = None,
 ) -> Path:
     edf_path = Path(edf_path)
@@ -1634,7 +1637,6 @@ def run_pipeline(
         output_root = Path(output_dir)
 
     use_startstop = startstop_mode if startstop_mode is not None else STARTSTOP_MODE
-    # Keep both flows quiet except explicit stage messages and tqdm.
     old_mne_log_level = mne.set_log_level("ERROR", return_old_level=True)
     if use_startstop:
         print("[STARTSTOP] Preparing data...", flush=True)
@@ -1665,7 +1667,6 @@ def run_pipeline(
     if notch_freqs:
         raw.notch_filter(freqs=notch_freqs, method="fir", phase="zero")
     raw.filter(l_freq=RAW_BANDPASS_L_FREQ, h_freq=RAW_BANDPASS_H_FREQ, method="fir", phase="zero")
-    # When both are enabled: first subtract artifact channels, then CAR (mean over non-artifact channels only).
     if ARTIFACT_REREF:
         _apply_artifact_reref(raw, default_art_chans)
     if CAR_REREF:
@@ -1680,66 +1681,32 @@ def run_pipeline(
             mne.set_log_level(old_mne_log_level)
         return output_root
 
-    print("[SIR] Creating annotation crops...", flush=True)
-    create_annotation_crops(raw, crops_dir, overwrite=True)
-
-    file_list = list_crop_files(crops_dir)
-
-    valid_modes = {"per_file_mean", "config_grand_avg", "max_amp_only"}
-    if template_mode not in valid_modes:
+    # ── SIR: load pre-computed template bank ──
+    template_dir = _resolve_startstop_template_dir()
+    template_bank = _load_startstop_template_bank(
+        template_dir=template_dir,
+        template_native_sfreq=float(STARTSTOP_TM_TEMPLATE_SFREQ),
+        template_center_sample=int(STARTSTOP_TM_TEMPLATE_CENTER_SAMPLE),
+    )
+    if not template_bank:
+        print("[SIR] No templates found in bank; cannot proceed.", flush=True)
         if old_mne_log_level is not None:
             mne.set_log_level(old_mne_log_level)
-        raise ValueError(f"template_mode must be one of {sorted(valid_modes)}")
+        return output_root
 
-    config_max_amp = {}
-    config_amp_files_sorted: dict[str, list[tuple[float, str]]] = {}
-    if template_mode == "max_amp_only":
-        # For each configuration, use the highest available amplitude that also
-        # has enough detected stimulus epochs to build a stable template.
-        config_candidates: dict[str, list[tuple[float, str]]] = defaultdict(list)
-        for file_name in file_list:
-            configuration = file_name.split("-")[0]
-            stim_amp_raw = file_name.split("_")[1].split(".fif")[0]
-            amp_num = amp_to_number(stim_amp_raw)
-            if np.isnan(amp_num):
-                continue
-            config_candidates[configuration].append((float(amp_num), file_name))
+    print("[SIR] Creating annotation crops...", flush=True)
+    create_annotation_crops(raw, crops_dir, overwrite=True)
+    file_list = list_crop_files(crops_dir)
 
-        for configuration, amp_files in config_candidates.items():
-            amp_files_sorted = sorted(amp_files, key=lambda x: x[0], reverse=True)
-            config_amp_files_sorted[configuration] = amp_files_sorted
-            for amp_num, file_name in amp_files_sorted:
-                file_path = crops_dir / file_name
-                raw_file = mne.io.read_raw_fif(file_path, preload=False)
-                sfreq = raw_file.info["sfreq"]
-                art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
-                art = _get_art_signal(raw_file, art_chans)
-                threshold = THRESH * np.std(art)
-                peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
-                if len(peaks) > MIN_VALID_EPOCHS:
-                    config_max_amp[configuration] = amp_num
-                    break
-
-    config_waveforms = defaultdict(lambda: defaultdict(list))
+    # ── PASS 1: collect per-config channel means across all amplitudes ──
+    config_waveforms: dict[str, dict[str, list[np.ndarray]]] = defaultdict(lambda: defaultdict(list))
     config_meta: dict[str, dict[str, np.ndarray | float]] = {}
-    config_templates = defaultdict(dict)
-    config_template_markers = defaultdict(dict)
-    config_template_banks: dict[str, dict[str, list[dict[str, object]]]] = defaultdict(dict)
 
-    print("[SIR] Finding templates...", flush=True)
+    print("[SIR] Collecting channel means...", flush=True)
     for file_name in file_list:
         file_path = crops_dir / file_name
-        if template_mode == "max_amp_only":
-            configuration = file_name.split("-")[0]
-            stim_amp_raw = file_name.split("_")[1].split(".fif")[0]
-            amp_num = amp_to_number(stim_amp_raw)
-            max_amp = config_max_amp.get(configuration)
-            if max_amp is None or np.isnan(amp_num) or not np.isclose(amp_num, max_amp):
-                continue
         raw_file = mne.io.read_raw_fif(file_path, preload=False)
-
         sfreq = raw_file.info["sfreq"]
-        # No additional low-pass in this flow
 
         art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
         art_set = set(art_chans)
@@ -1753,13 +1720,9 @@ def run_pipeline(
             [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
         )
         epochs = mne.Epochs(
-            raw_file,
-            events,
-            event_id=1,
-            tmin=EPOCH_TMIN,
-            tmax=EPOCH_TMAX,
-            baseline=None,
-            preload=True,
+            raw_file, events, event_id=1,
+            tmin=EPOCH_TMIN, tmax=EPOCH_TMAX,
+            baseline=None, preload=True,
         )
 
         times = epochs.times
@@ -1772,26 +1735,22 @@ def run_pipeline(
                 continue
 
         data_epoched = epochs.get_data()
-        data_filt = np.zeros_like(data_epoched)
-        for ep in range(len(epochs)):
-            for ch_idx in range(len(epochs.ch_names)):
-                data_filt[ep, ch_idx, :] = data_epoched[ep, ch_idx, :]
-
         for ch_idx, ch_name in enumerate(epochs.ch_names):
             if ch_name in art_set:
                 continue
-            tmpl_file = np.mean(data_filt[:, ch_idx, :], axis=0)
-            config_waveforms[configuration][ch_name].append(tmpl_file)
+            config_waveforms[configuration][ch_name].append(
+                np.mean(data_epoched[:, ch_idx, :], axis=0)
+            )
 
+    # ── Match each config/channel mean to the best template from the bank ──
+    config_templates: dict[str, dict[str, np.ndarray | None]] = defaultdict(dict)
+    config_template_markers: dict[str, dict[str, dict[str, float]]] = defaultdict(dict)
+
+    print("[SIR] Matching templates...", flush=True)
     for configuration, ch_dict in config_waveforms.items():
         times = config_meta[configuration]["times"]
         sfreq = float(config_meta[configuration]["sfreq"])
-
         baseline_mask = (times >= BASELINE_TMIN) & (times <= BASELINE_TMAX)
-        prestim_prom_mask = (times >= STIM_PROM_PRESTIM_TMIN) & (times <= STIM_PROM_PRESTIM_TMAX)
-        if np.sum(prestim_prom_mask) < 5:
-            prestim_prom_mask = baseline_mask
-        poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
 
         for ch_name, waves in ch_dict.items():
             if len(waves) == 0:
@@ -1801,198 +1760,28 @@ def run_pipeline(
 
             tmpl_global = np.mean(np.stack(waves, axis=0), axis=0)
 
-            if STIM_USE_ONSET:
-                onset_t = detect_onset_rectified(
-                    tmpl_global,
-                    times,
-                    sfreq,
-                    baseline_mask=baseline_mask,
-                    onset_tmin=0.003,
-                    onset_tmax=0.035,
-                    k=4,
-                    sustain_ms=5,
-                )
-            else:
-                onset_t = np.nan
-
-            prom_baseline_mask = _choose_silent_prominence_baseline_mask(
-                sig=tmpl_global,
-                prestim_mask=prestim_prom_mask,
-                poststim_mask=poststim_prom_mask,
-            )
-            onset_for_peaks = float(onset_t) if np.isfinite(onset_t) else float(RESP_TMIN)
-            p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
-                tmpl_global,
-                times,
-                sfreq,
-                baseline_mask=prom_baseline_mask,
-                onset_latency=onset_for_peaks,
+            match = _match_sir_template(
+                mean_waveform=tmpl_global,
+                times=times,
+                sfreq=sfreq,
+                baseline_mask=baseline_mask,
+                resp_tmin=RESP_TMIN,
                 resp_tmax=RESP_TMAX,
-                min_prom_k=0,
-                peak2_max_gap_ms=20.0,
-                min_width_ms=0.6,
-                amp_min_uV=STIM_PEAK_AMP_MIN_UV,
+                template_bank=template_bank,
+                scales=tuple(float(s) for s in SIR_TM_SCALES),
+                min_corr=float(SIR_TM_MIN_CORR),
             )
-            if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
-                onset_t_ref = _refine_onset_before_p1(
-                    sig_f=tmpl_global,
-                    times=times,
-                    sfreq=sfreq,
-                    baseline_mask=baseline_mask,
-                    p1_latency=float(p1_t),
-                )
-                if not np.isnan(onset_t_ref):
-                    onset_t = float(onset_t_ref)
-            if STIM_USE_ONSET and np.isfinite(onset_t) and (onset_t < 0.0):
-                onset_t = 0.0
-            if not STIM_USE_ONSET:
-                onset_t = np.nan
 
-            config_templates[configuration][ch_name] = tmpl_global
-            config_template_markers[configuration][ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
-
-    if template_mode == "max_amp_only":
-        # Build multi-template banks per channel. Start from top valid amplitude,
-        # then add lower-amplitude templates only when latency class is distinct.
-        for configuration, ch_dict in config_templates.items():
-            cfg_bank = config_template_banks[configuration]
-            max_amp = config_max_amp.get(configuration, np.nan)
-            for ch_name, template in ch_dict.items():
-                markers = config_template_markers[configuration].get(
-                    ch_name, {"onset": np.nan, "p1": np.nan, "p2": np.nan}
-                )
-                cfg_bank[ch_name] = []
-                if (template is None) or (
-                    not _max_template_markers_are_valid_for_transfer(markers, require_onset=STIM_USE_ONSET)
-                ):
-                    continue
-                cfg_bank[ch_name].append(
-                    {"amp": float(max_amp), "template": template, "markers": dict(markers)}
+            if match is None:
+                config_templates[configuration][ch_name] = None
+                config_template_markers[configuration][ch_name] = dict(onset=np.nan, p1=np.nan, p2=np.nan)
+            else:
+                config_templates[configuration][ch_name] = match["template"]
+                config_template_markers[configuration][ch_name] = dict(
+                    onset=match["onset"], p1=match["p1"], p2=match["p2"],
                 )
 
-        for configuration, amp_files_sorted in config_amp_files_sorted.items():
-            if configuration not in config_meta:
-                continue
-
-            times = np.asarray(config_meta[configuration]["times"])
-            sfreq = float(config_meta[configuration]["sfreq"])
-            baseline_mask = (times >= BASELINE_TMIN) & (times <= BASELINE_TMAX)
-            prestim_prom_mask = (times >= STIM_PROM_PRESTIM_TMIN) & (times <= STIM_PROM_PRESTIM_TMAX)
-            if np.sum(prestim_prom_mask) < 5:
-                prestim_prom_mask = baseline_mask
-            poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
-
-            cfg_bank = config_template_banks[configuration]
-            max_amp = config_max_amp.get(configuration)
-            for amp_num, file_name in amp_files_sorted:
-                if max_amp is not None and np.isclose(amp_num, max_amp):
-                    continue
-
-                file_path = crops_dir / file_name
-                raw_file = mne.io.read_raw_fif(file_path, preload=False)
-                art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
-                art_set = set(art_chans)
-                art = _get_art_signal(raw_file, art_chans)
-                threshold = THRESH * np.std(art)
-                peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
-                if len(peaks) <= MIN_VALID_EPOCHS:
-                    continue
-
-                events = np.column_stack(
-                    [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
-                )
-                epochs = mne.Epochs(
-                    raw_file,
-                    events,
-                    event_id=1,
-                    tmin=EPOCH_TMIN,
-                    tmax=EPOCH_TMAX,
-                    baseline=None,
-                    preload=True,
-                )
-
-                if (epochs.info["sfreq"] != sfreq) or (len(epochs.times) != len(times)):
-                    continue
-
-                data_epoched = epochs.get_data()
-                data_filt = data_epoched
-                for ch_name in epochs.ch_names:
-                    if ch_name in art_set:
-                        continue
-
-                    ch_idx = epochs.ch_names.index(ch_name)
-                    tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
-                    if STIM_USE_ONSET:
-                        onset_t = detect_onset_rectified(
-                            tmpl,
-                            times,
-                            sfreq,
-                            baseline_mask=baseline_mask,
-                            onset_tmin=0.003,
-                            onset_tmax=0.035,
-                            k=4,
-                            sustain_ms=5,
-                        )
-                    else:
-                        onset_t = np.nan
-                    prom_baseline_mask = _choose_silent_prominence_baseline_mask(
-                        sig=tmpl,
-                        prestim_mask=prestim_prom_mask,
-                        poststim_mask=poststim_prom_mask,
-                    )
-                    onset_for_peaks = float(onset_t) if np.isfinite(onset_t) else float(RESP_TMIN)
-                    p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
-                        tmpl,
-                        times,
-                        sfreq,
-                        baseline_mask=prom_baseline_mask,
-                        onset_latency=onset_for_peaks,
-                        resp_tmax=RESP_TMAX,
-                        min_prom_k=0,
-                        peak2_max_gap_ms=20.0,
-                        min_width_ms=0.6,
-                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
-                    )
-                    if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
-                        onset_t_ref = _refine_onset_before_p1(
-                            sig_f=tmpl,
-                            times=times,
-                            sfreq=sfreq,
-                            baseline_mask=baseline_mask,
-                            p1_latency=float(p1_t),
-                        )
-                        if not np.isnan(onset_t_ref):
-                            onset_t = float(onset_t_ref)
-                    if STIM_USE_ONSET and np.isfinite(onset_t) and (onset_t < 0.0):
-                        onset_t = 0.0
-                    if not STIM_USE_ONSET:
-                        onset_t = np.nan
-
-                    markers = dict(onset=onset_t, p1=p1_t, p2=p2_t)
-                    if not _max_template_markers_are_valid_for_transfer(
-                        markers, require_onset=STIM_USE_ONSET
-                    ):
-                        continue
-
-                    existing = cfg_bank.setdefault(ch_name, [])
-                    p1_cur = float(markers["p1"])
-                    if len(existing) > 0:
-                        p1_existing = [float(c["markers"]["p1"]) for c in existing]
-                        if np.min(np.abs(np.asarray(p1_existing) - p1_cur)) < MAX_AMP_TEMPLATE_MULTI_P1_GAP_S:
-                            continue
-                    existing.append({"amp": float(amp_num), "template": tmpl, "markers": markers})
-                    # Keep deterministic order by amplitude (high to low).
-                    existing.sort(key=lambda c: float(c["amp"]), reverse=True)
-
-        # Keep config-level template as highest-amplitude candidate for legacy outputs.
-        for configuration, ch_bank in config_template_banks.items():
-            for ch_name, candidates in ch_bank.items():
-                if len(candidates) == 0:
-                    continue
-                lead = candidates[0]
-                config_templates[configuration][ch_name] = lead["template"]
-                config_template_markers[configuration][ch_name] = dict(lead["markers"])
-
+    # ── Save template figures ──
     for configuration, ch_dict in config_templates.items():
         times = config_meta[configuration]["times"]
         for ch_name, template in ch_dict.items():
@@ -2005,26 +1794,17 @@ def run_pipeline(
             safe_ch = re.sub(r"[^\w\-_\. ]", "_", str(ch_name))
             out_path = templates_dir / safe_config / f"{safe_ch}_template.png"
             plot_template_with_markers(
-                times=times,
-                template=template,
-                markers=markers,
+                times=times, template=template, markers=markers,
                 out_path=out_path,
                 title=f"Template: {configuration} | {ch_name}",
             )
 
+    # ── PASS 2: epoch-level detection driven by template markers ──
     group_store = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     results = {key: [] for key in [
-        "Configuration",
-        "Stim. amplitude",
-        "Epoch",
-        "Channel",
-        "Onset latency",
-        "Peak1 latency",
-        "Peak2 latency",
-        "Peak1 value",
-        "Peak2 value",
-        "PTP amplitude",
-        "Time series",
+        "Configuration", "Stim. amplitude", "Epoch", "Channel",
+        "Onset latency", "Peak1 latency", "Peak2 latency",
+        "Peak1 value", "Peak2 value", "PTP amplitude", "Time series",
     ]}
 
     print("[SIR] Detecting epochs...", flush=True)
@@ -2034,7 +1814,6 @@ def run_pipeline(
         _apply_special_crops(raw_file, file_name)
 
         sfreq = raw_file.info["sfreq"]
-
         art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
         art_set = set(art_chans)
         art = _get_art_signal(raw_file, art_chans)
@@ -2048,13 +1827,9 @@ def run_pipeline(
             [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
         )
         epochs = mne.Epochs(
-            raw_file,
-            events,
-            event_id=1,
-            tmin=EPOCH_TMIN,
-            tmax=EPOCH_TMAX,
-            baseline=None,
-            preload=True,
+            raw_file, events, event_id=1,
+            tmin=EPOCH_TMIN, tmax=EPOCH_TMAX,
+            baseline=None, preload=True,
         )
 
         epochs.save(epochs_dir / f"{file_name.split('.fif')[0]}-epo.fif", overwrite=True)
@@ -2070,7 +1845,6 @@ def run_pipeline(
 
         data_epoched = epochs.get_data()
         times = epochs.times
-
         configuration = file_name.split("-")[0]
         stim_amp_raw = file_name.split("_")[1].split(".fif")[0]
 
@@ -2082,113 +1856,21 @@ def run_pipeline(
             group_store[configuration][ch][stim_amp_raw].append(file_mean)
 
         baseline_mask = (times >= BASELINE_TMIN) & (times <= BASELINE_TMAX)
-        prestim_prom_mask = (times >= STIM_PROM_PRESTIM_TMIN) & (times <= STIM_PROM_PRESTIM_TMAX)
-        if np.sum(prestim_prom_mask) < 5:
-            prestim_prom_mask = baseline_mask
-        poststim_prom_mask = (times >= STIM_PROM_BASELINE_TMIN) & (times <= STIM_PROM_BASELINE_TMAX)
 
-        # Work on per-file copies to avoid mutating config-level templates.
-        tmpl_cfg = dict(config_templates[configuration])
-        markers_cfg = dict(config_template_markers[configuration])
+        # Use config-level templates directly (no per-file rebuild).
+        tmpl_cfg = dict(config_templates.get(configuration, {}))
+        markers_cfg = dict(config_template_markers.get(configuration, {}))
 
-        data_filt = data_epoched
-
-        stim_amp_num = amp_to_number(stim_amp_raw)
-        for ch_idx, ch_name in enumerate(epochs.ch_names):
-            if ch_name in art_set:
-                continue
-
-            # In max-amp mode, choose a transferred template from the
-            # per-channel template bank in descending-cascade mode:
-            # choose the nearest source amplitude from above (>= current amp).
-            if template_mode == "max_amp_only":
-                bank = config_template_banks.get(configuration, {}).get(ch_name, [])
-                if len(bank) == 0:
-                    continue
-                if np.isnan(stim_amp_num):
-                    chosen = bank[0]
-                else:
-                    higher_or_equal = [c for c in bank if float(c["amp"]) >= float(stim_amp_num)]
-                    if len(higher_or_equal) > 0:
-                        # Closest template from above (descending transfer).
-                        chosen = min(higher_or_equal, key=lambda c: float(c["amp"]))
-                    else:
-                        # If no source is above this amplitude, keep the highest available.
-                        chosen = bank[0]
-                tmpl_cfg[ch_name] = chosen["template"]
-                markers_cfg[ch_name] = dict(chosen["markers"])
-                continue
-
-            tmpl = np.mean(data_filt[:, ch_idx, :], axis=0)
-            if STIM_USE_ONSET:
-                onset_t = detect_onset_rectified(
-                    tmpl,
-                    times,
-                    sfreq,
-                    baseline_mask=baseline_mask,
-                    onset_tmin=0.003,
-                    onset_tmax=0.035,
-                    k=0.8,
-                    sustain_ms=3,
-                )
-            else:
-                onset_t = np.nan
-
-            prom_k = get_prominence_k(file_name, ch_name)
-            prom_baseline_mask = _choose_silent_prominence_baseline_mask(
-                sig=tmpl,
-                prestim_mask=prestim_prom_mask,
-                poststim_mask=poststim_prom_mask,
-            )
-            onset_for_peaks = float(onset_t) if np.isfinite(onset_t) else float(RESP_TMIN)
-            p1_t, p1_v, p2_t, p2_v = detect_template_peaks(
-                tmpl,
-                times,
-                sfreq,
-                baseline_mask=prom_baseline_mask,
-                onset_latency=onset_for_peaks,
-                resp_tmax=RESP_TMAX,
-                min_prom_k=prom_k,
-                peak2_max_gap_ms=20.0,
-                min_width_ms=0.6,
-                amp_min_uV=STIM_PEAK_AMP_MIN_UV,
-            )
-            if STIM_USE_ONSET and (not np.isnan(p1_t)) and (np.isnan(onset_t) or onset_t >= (p1_t - 0.0015)):
-                onset_t_ref = _refine_onset_before_p1(
-                    sig_f=tmpl,
-                    times=times,
-                    sfreq=sfreq,
-                    baseline_mask=baseline_mask,
-                    p1_latency=float(p1_t),
-                )
-                if not np.isnan(onset_t_ref):
-                    onset_t = float(onset_t_ref)
-            if STIM_USE_ONSET and np.isfinite(onset_t) and (onset_t < 0.0):
-                onset_t = 0.0
-            if not STIM_USE_ONSET:
-                onset_t = np.nan
-
-            tmpl_cfg[ch_name] = tmpl
-            markers_cfg[ch_name] = dict(onset=onset_t, p1=p1_t, p2=p2_t)
-
-        if template_mode == "max_amp_only":
-            eligible_channels = [
-                ch
-                for ch in epochs.ch_names
-                if (
-                    (ch not in art_set)
-                    and (tmpl_cfg.get(ch) is not None)
-                    and _max_template_markers_are_valid_for_transfer(
-                        markers_cfg.get(ch, {}), require_onset=STIM_USE_ONSET
-                    )
-                )
-            ]
-        else:
-            eligible_channels = [ch for ch in epochs.ch_names if ch not in art_set]
+        eligible_channels = [
+            ch for ch in epochs.ch_names
+            if ch not in art_set
+            and tmpl_cfg.get(ch) is not None
+            and np.isfinite(markers_cfg.get(ch, {}).get("p1", np.nan))
+        ]
         eligible_set = set(eligible_channels)
 
-        channel_epoch_results = {ch: [] for ch in eligible_channels}
-        latency_markers = {ch: [] for ch in epochs.ch_names if ch not in art_set}
+        channel_epoch_results: dict[str, list[dict]] = {ch: [] for ch in eligible_channels}
+        latency_markers: dict[str, list[dict]] = {ch: [] for ch in epochs.ch_names if ch not in art_set}
 
         for ep in range(len(epochs)):
             for ch_idx, ch_name in enumerate(epochs.ch_names):
@@ -2196,22 +1878,13 @@ def run_pipeline(
                     continue
 
                 sig = data_epoched[ep, ch_idx, :]
-                sig_f = data_filt[ep, ch_idx, :]
 
-                base = sig_f[baseline_mask]
+                base = sig[baseline_mask]
                 bstd = base.std()
                 if bstd == 0 or np.isnan(bstd):
                     channel_epoch_results[ch_name].append(
-                        {
-                            "ep": ep,
-                            "onset": np.nan,
-                            "p1": np.nan,
-                            "p2": np.nan,
-                            "pv1": np.nan,
-                            "pv2": np.nan,
-                            "ptp": np.nan,
-                            "sig": sig,
-                        }
+                        {"ep": ep, "onset": np.nan, "p1": np.nan, "p2": np.nan,
+                         "pv1": np.nan, "pv2": np.nan, "ptp": np.nan, "sig": sig}
                     )
                     continue
 
@@ -2220,269 +1893,162 @@ def run_pipeline(
                 t_p2 = markers_cfg[ch_name]["p2"]
                 tmpl = tmpl_cfg[ch_name]
 
-                if STIM_USE_ONSET:
-                    onset_latency = detect_onset_near_template(
-                        sig_f,
-                        times,
-                        sfreq,
-                        baseline_mask,
-                        t_on_tmpl,
-                        win_ms=2,
-                        k=1,
-                        sustain_ms=2,
-                    )
-                else:
-                    onset_latency = np.nan
+                # Onset near template onset
+                onset_latency = detect_onset_near_template(
+                    sig, times, sfreq, baseline_mask, t_on_tmpl,
+                    win_ms=2, k=1, sustain_ms=2,
+                ) if np.isfinite(t_on_tmpl) else np.nan
+
+                # Clip onset to template ± max_dev
+                if np.isfinite(onset_latency) and np.isfinite(t_on_tmpl):
+                    onset_latency = float(np.clip(
+                        onset_latency,
+                        float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
+                        float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
+                    ))
 
                 peak1_latency = peak2_latency = np.nan
                 peak1_value = peak2_value = np.nan
 
+                # P1 detection near template P1
                 if not np.isnan(t_p1):
                     idx_tmpl_p1 = int(np.argmin(np.abs(times - t_p1)))
                     pol1 = np.sign(tmpl[idx_tmpl_p1] - np.mean(tmpl[baseline_mask]))
                     pol1 = +1 if pol1 >= 0 else -1
-
                     tmpl_p1_val = tmpl[idx_tmpl_p1]
                     peak1_latency, peak1_value = detect_peak_in_window(
-                        sig_f=sig_f,
-                        times=times,
-                        sfreq=sfreq,
-                        baseline_mask=baseline_mask,
-                        t_center=t_p1,
-                        win_ms=5.0,
-                        polarity=pol1,
-                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
-                        min_width_ms=0.4,
+                        sig_f=sig, times=times, sfreq=sfreq,
+                        baseline_mask=baseline_mask, t_center=t_p1,
+                        win_ms=5.0, polarity=pol1,
+                        amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
                         choose="nearest",
-                        template_peak_val=tmpl_p1_val,
-                        min_rel_to_template=0.1,
+                        template_peak_val=tmpl_p1_val, min_rel_to_template=0.1,
                     )
                 else:
                     pol1 = +1
 
+                # P2 detection near template P2
                 if not np.isnan(t_p2):
                     idx_tmpl_p2 = int(np.argmin(np.abs(times - t_p2)))
                     pol2 = np.sign(tmpl[idx_tmpl_p2] - np.mean(tmpl[baseline_mask]))
                     pol2 = +1 if pol2 >= 0 else -1
-
                     tmpl_p2_val = tmpl[idx_tmpl_p2]
                     peak2_latency, peak2_value = detect_peak_in_window(
-                        sig_f=sig_f,
-                        times=times,
-                        sfreq=sfreq,
-                        baseline_mask=baseline_mask,
-                        t_center=t_p2,
-                        # P2 has larger latency jitter than P1 on this dataset;
-                        # use a wider search window to avoid systematic misses.
-                        win_ms=12.0,
-                        polarity=pol2,
-                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
-                        min_width_ms=0.4,
+                        sig_f=sig, times=times, sfreq=sfreq,
+                        baseline_mask=baseline_mask, t_center=t_p2,
+                        win_ms=12.0, polarity=pol2,
+                        amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
                         choose="nearest",
-                        template_peak_val=tmpl_p2_val,
-                        min_rel_to_template=0.1,
+                        template_peak_val=tmpl_p2_val, min_rel_to_template=0.1,
                     )
                 else:
                     pol2 = +1
 
+                # Refine on unfiltered signal
                 if not np.isnan(peak1_latency):
                     peak1_latency, peak1_value = pick_epoch_value_near_latency(
-                        sig,
-                        times,
-                        peak1_latency,
-                        sfreq,
-                        win_ms=1.0,
-                        polarity=pol1,
+                        sig, times, peak1_latency, sfreq, win_ms=1.0, polarity=pol1,
                     )
-
                 if not np.isnan(peak2_latency):
                     peak2_latency, peak2_value = pick_epoch_value_near_latency(
-                        sig,
-                        times,
-                        peak2_latency,
-                        sfreq,
-                        win_ms=1.0,
-                        polarity=pol2,
-                    )
-                if STIM_USE_ONSET and (not np.isnan(peak1_latency)) and (
-                    np.isnan(onset_latency) or onset_latency >= (peak1_latency - 0.0015)
-                ):
-                    onset_ref = _refine_onset_before_p1(
-                        sig_f=sig_f,
-                        times=times,
-                        sfreq=sfreq,
-                        baseline_mask=baseline_mask,
-                        p1_latency=float(peak1_latency),
-                    )
-                    if not np.isnan(onset_ref):
-                        onset_latency = float(onset_ref)
-                if STIM_USE_ONSET and np.isfinite(onset_latency) and np.isfinite(t_on_tmpl):
-                    # Keep transferred onset tightly anchored to template onset.
-                    onset_latency = float(
-                        np.clip(
-                            onset_latency,
-                            float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
-                            float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
-                        )
+                        sig, times, peak2_latency, sfreq, win_ms=1.0, polarity=pol2,
                     )
 
+                # Ordering / same-sign guards
                 if (not np.isnan(peak1_latency)) and (not np.isnan(peak2_latency)):
                     if peak2_latency <= peak1_latency:
-                        peak2_latency = np.nan
-                        peak2_value = np.nan
-
+                        peak2_latency = peak2_value = np.nan
                 if (not np.isnan(peak1_value)) and (not np.isnan(peak2_value)):
                     if np.sign(peak1_value) == np.sign(peak2_value):
-                        peak2_latency = np.nan
-                        peak2_value = np.nan
+                        peak2_latency = peak2_value = np.nan
 
-                p1_corr_value = peak1_value
-                if (
-                    (not np.isnan(peak1_latency))
-                    and (not np.isnan(peak2_latency))
-                    and (not np.isnan(peak1_value))
-                    and (not np.isnan(peak2_value))
-                ):
-                    extra_lat, extra_val = find_extra_p1_peak(
-                        sig_f=sig_f,
-                        times=times,
-                        sfreq=sfreq,
-                        p1_lat=peak1_latency,
-                        p2_lat=peak2_latency,
-                        p1_polarity=pol1,
-                        p2_hint_lat=np.nan,
-                        guard_ms=1.0,
-                        hint_ms=4.0,
-                        min_width_ms=0.4,
-                        amp_min_uV=STIM_PEAK_AMP_MIN_UV,
-                        choose="dominant",
-                    )
-                    if not np.isnan(extra_val):
-                        p1_corr_value = add_extra_peak_to_p1(peak1_value, pol1, extra_val)
-
-                if (not np.isnan(p1_corr_value)) and (not np.isnan(peak2_value)):
-                    ptp_amp = float(np.abs(p1_corr_value - peak2_value))
+                # PTP
+                if (not np.isnan(peak1_value)) and (not np.isnan(peak2_value)):
+                    ptp_amp = float(np.abs(peak1_value - peak2_value))
                 else:
                     ptp_amp = np.nan
 
+                # Amplitude / PTP thresholds → wipe
                 if (not np.isnan(ptp_amp)) and (ptp_amp < (STIM_PTP_MIN_UV * 1e-6)):
-                    onset_latency = np.nan
-                    peak1_latency = np.nan
-                    peak2_latency = np.nan
-                    peak1_value = np.nan
-                    peak2_value = np.nan
-                    ptp_amp = np.nan
-
+                    onset_latency = peak1_latency = peak2_latency = np.nan
+                    peak1_value = peak2_value = ptp_amp = np.nan
                 if (not np.isnan(peak1_value)) and (np.abs(peak1_value) <= (STIM_P1_ABS_MIN_UV * 1e-6)):
-                    onset_latency = np.nan
-                    peak1_latency = np.nan
-                    peak2_latency = np.nan
-                    peak1_value = np.nan
-                    peak2_value = np.nan
-                    ptp_amp = np.nan
-
-                if np.isnan(peak2_value) or np.isnan(peak1_value):
-                    onset_latency = np.nan
-                    peak1_latency = np.nan
-                    peak2_latency = np.nan
-                    peak1_value = np.nan
-                    peak2_value = np.nan
-                    ptp_amp = np.nan
+                    onset_latency = peak1_latency = peak2_latency = np.nan
+                    peak1_value = peak2_value = ptp_amp = np.nan
+                if np.isnan(peak1_value) or np.isnan(peak2_value):
+                    onset_latency = peak1_latency = peak2_latency = np.nan
+                    peak1_value = peak2_value = ptp_amp = np.nan
 
                 channel_epoch_results[ch_name].append(
-                    {
-                        "ep": ep,
-                        "onset": onset_latency,
-                        "p1": peak1_latency,
-                        "p2": peak2_latency,
-                        "pv1": p1_corr_value,
-                        "pv2": peak2_value,
-                        "ptp": ptp_amp,
-                        "sig": sig,
-                    }
+                    {"ep": ep, "onset": onset_latency,
+                     "p1": peak1_latency, "p2": peak2_latency,
+                     "pv1": peak1_value, "pv2": peak2_value,
+                     "ptp": ptp_amp, "sig": sig}
                 )
 
+        # ── Channel-level consistency / artifact rejection ──
         corr_min_median = 0.69
         min_valid_frac = 0.4
 
-        # File-wise artifact reference means (one mean waveform per artifact channel).
         artifact_mean_by_ch: dict[str, np.ndarray] = {}
         for art_ch in art_chans:
             if art_ch not in epochs.ch_names:
                 continue
             art_idx = epochs.ch_names.index(art_ch)
-            artifact_mean_by_ch[art_ch] = np.asarray(np.mean(data_filt[:, art_idx, :], axis=0), dtype=float)
+            artifact_mean_by_ch[art_ch] = np.asarray(
+                np.mean(data_epoched[:, art_idx, :], axis=0), dtype=float,
+            )
 
         for ch in eligible_channels:
-
             entries = channel_epoch_results[ch]
             tmpl = tmpl_cfg[ch]
 
             sim_mask = (times >= 0.003) & (times <= RESP_TMAX)
-            tmpl_seg = tmpl[sim_mask]
-            tmpl_seg = tmpl_seg - np.mean(tmpl[baseline_mask])
+            tmpl_seg = tmpl[sim_mask] - np.mean(tmpl[baseline_mask])
 
             corrs = []
             valid_flags = []
             for e in entries:
-                ep = e["ep"]
                 is_valid = not np.isnan(e["p1"])
                 valid_flags.append(is_valid)
-
-                sig_ep = data_filt[ep, epochs.ch_names.index(ch), :]
+                sig_ep = data_epoched[e["ep"], epochs.ch_names.index(ch), :]
                 seg = sig_ep[sim_mask] - np.mean(sig_ep[baseline_mask])
-
                 if np.std(seg) == 0 or np.std(tmpl_seg) == 0:
                     corrs.append(0.0)
                 else:
                     c = float(np.corrcoef(seg, tmpl_seg)[0, 1])
-                    if np.isnan(c):
-                        c = 0.0
-                    corrs.append(c)
+                    corrs.append(0.0 if np.isnan(c) else c)
 
-            valid_fraction = np.mean(valid_flags) if len(valid_flags) else 0.0
-            median_corr = float(np.median(corrs)) if len(corrs) else 0.0
+            valid_fraction = np.mean(valid_flags) if valid_flags else 0.0
+            median_corr = float(np.median(corrs)) if corrs else 0.0
 
-            # Reject likely artifact-driven detections using file-wise channel mean
-            # (requested behavior: channel-level, not per-epoch subset).
             artifact_like_channel = False
             if STIM_EPOCH_ARTIFACT_CORR_REJECTION:
                 ch_idx = epochs.ch_names.index(ch)
-                ch_mean = np.asarray(np.mean(data_filt[:, ch_idx, :], axis=0), dtype=float)
+                ch_mean = np.asarray(np.mean(data_epoched[:, ch_idx, :], axis=0), dtype=float)
                 ch_centered = ch_mean - np.mean(ch_mean)
-                ch_std = float(np.std(ch_centered))
-                if ch_std > 0:
+                if float(np.std(ch_centered)) > 0:
                     for _art_ch, art_mean in artifact_mean_by_ch.items():
                         art_centered = art_mean - np.mean(art_mean)
-                        art_std = float(np.std(art_centered))
-                        if art_std <= 0:
+                        if float(np.std(art_centered)) <= 0:
                             continue
                         corr = float(np.corrcoef(ch_centered, art_centered)[0, 1])
-                        if np.isnan(corr):
-                            continue
-                        if abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
+                        if not np.isnan(corr) and abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
                             artifact_like_channel = True
                             break
 
-            # If overall shape match to transferred template is poor, discard
-            # regardless of valid fraction to suppress stable false positives.
             low_median_corr = (median_corr < corr_min_median)
             low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
             borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
             if artifact_like_channel or low_median_corr or low_valid_low_corr or borderline_valid_very_low_corr:
                 for e in entries:
-                    e["onset"] = np.nan
-                    e["p1"] = np.nan
-                    e["p2"] = np.nan
-                    e["pv1"] = np.nan
-                    e["pv2"] = np.nan
-                    e["ptp"] = np.nan
+                    e["onset"] = e["p1"] = e["p2"] = np.nan
+                    e["pv1"] = e["pv2"] = e["ptp"] = np.nan
 
             for e in entries:
                 latency_markers[ch].append(
                     {"epoch": e["ep"], "onset": e["onset"], "peak1": e["p1"], "peak2": e["p2"]}
                 )
-
             for e in entries:
                 results["Configuration"].append(file_name.split("-")[0])
                 results["Stim. amplitude"].append(file_name.split("_")[1].split(".fif")[0])
@@ -2498,31 +2064,21 @@ def run_pipeline(
 
         base_name = file_name.split(".fif")[0]
         plot_epochs_panel(
-            data_epoched=data_epoched,
-            times=times,
-            ch_names=raw_file.info["ch_names"],
-            epochs_ch_names=epochs.ch_names,
-            art_chans=art_set,
-            latency_markers=latency_markers,
-            title=base_name,
-            out_path=plots_grid_dir / f"{base_name}.png",
-            show_grid=True,
-            show_markers=True,
+            data_epoched=data_epoched, times=times,
+            ch_names=raw_file.info["ch_names"], epochs_ch_names=epochs.ch_names,
+            art_chans=art_set, latency_markers=latency_markers,
+            title=base_name, out_path=plots_grid_dir / f"{base_name}.png",
+            show_grid=True, show_markers=True,
         )
-
         plot_epochs_panel(
-            data_epoched=data_epoched,
-            times=times,
-            ch_names=raw_file.info["ch_names"],
-            epochs_ch_names=epochs.ch_names,
-            art_chans=art_set,
-            latency_markers=latency_markers,
-            title=base_name,
-            out_path=plots_plain_dir / f"{base_name}.png",
-            show_grid=False,
-            show_markers=False,
+            data_epoched=data_epoched, times=times,
+            ch_names=raw_file.info["ch_names"], epochs_ch_names=epochs.ch_names,
+            art_chans=art_set, latency_markers=latency_markers,
+            title=base_name, out_path=plots_plain_dir / f"{base_name}.png",
+            show_grid=False, show_markers=False,
         )
 
+    # ── Write outputs ──
     print("[SIR] Writing outputs...", flush=True)
     df_results = pd.DataFrame(results)
     df_results.to_csv(excel_dir / "Large_dataset_emg_response_metrics.csv", index=False)
@@ -2530,12 +2086,8 @@ def run_pipeline(
     plot_grouped_by_amplitude(group_store, times, plots_grouped_dir, default_art_set)
 
     metrics = [
-        "Onset latency",
-        "Peak1 latency",
-        "Peak2 latency",
-        "Peak1 value",
-        "Peak2 value",
-        "PTP amplitude",
+        "Onset latency", "Peak1 latency", "Peak2 latency",
+        "Peak1 value", "Peak2 value", "PTP amplitude",
     ]
 
     df = df_results.copy()
@@ -2547,71 +2099,44 @@ def run_pipeline(
 
     group_cols = ["Configuration", "Stim. amplitude", "Stim_amp_num", "Channel"]
     summary_rows = []
-
     for metric in metrics:
         g = df[group_cols + [metric]].copy()
         g[metric] = pd.to_numeric(g[metric], errors="coerce")
         grouped = g.groupby(group_cols, dropna=False)[metric]
-
         tmp = grouped.agg(
-            n_total="size",
-            n_valid=lambda x: x.notna().sum(),
-            mean="mean",
-            std="std",
-            median="median",
-            q25=lambda x: x.quantile(0.25),
-            q75=lambda x: x.quantile(0.75),
-            min="min",
-            max="max",
+            n_total="size", n_valid=lambda x: x.notna().sum(),
+            mean="mean", std="std", median="median",
+            q25=lambda x: x.quantile(0.25), q75=lambda x: x.quantile(0.75),
+            min="min", max="max",
         ).reset_index()
-
         tmp["iqr"] = tmp["q75"] - tmp["q25"]
         tmp["Metric"] = metric
         summary_rows.append(tmp)
 
     summary = pd.concat(summary_rows, ignore_index=True)
-    summary = summary[
-        [
-            "Configuration",
-            "Stim. amplitude",
-            "Stim_amp_num",
-            "Channel",
-            "Metric",
-            "n_total",
-            "n_valid",
-            "mean",
-            "std",
-            "median",
-            "q25",
-            "q75",
-            "iqr",
-            "min",
-            "max",
-        ]
-    ]
+    summary = summary[[
+        "Configuration", "Stim. amplitude", "Stim_amp_num", "Channel", "Metric",
+        "n_total", "n_valid", "mean", "std", "median", "q25", "q75", "iqr", "min", "max",
+    ]]
     summary = summary.sort_values(
         by=["Configuration", "Stim_amp_num", "Stim. amplitude", "Channel", "Metric"],
         kind="mergesort",
     ).reset_index(drop=True)
 
-    summary_csv = excel_dir / "Summary_stats_by_config_amp_channel.csv"
-    summary.to_csv(summary_csv, index=False)
+    summary.to_csv(excel_dir / "Summary_stats_by_config_amp_channel.csv", index=False)
 
     with pd.ExcelWriter(
-        excel_dir / "Summary_stats_by_config_amp_channel_by_config.xlsx",
-        engine="xlsxwriter",
+        excel_dir / "Summary_stats_by_config_amp_channel_by_config.xlsx", engine="xlsxwriter",
     ) as writer:
         for config, dfc in summary.groupby("Configuration"):
             sheet_name = _excel_safe_sheet_name(config)
             dfc = dfc.sort_values(
-                by=["Stim_amp_num", "Stim. amplitude", "Channel", "Metric"],
-                kind="mergesort",
+                by=["Stim_amp_num", "Stim. amplitude", "Channel", "Metric"], kind="mergesort",
             ).reset_index(drop=True)
             dfc.to_excel(writer, sheet_name=sheet_name, index=False)
 
     with pd.ExcelWriter(
-        excel_dir / "Large_dataset_emg_response_metrics_by_config.xlsx",
-        engine="xlsxwriter",
+        excel_dir / "Large_dataset_emg_response_metrics_by_config.xlsx", engine="xlsxwriter",
     ) as writer:
         for config, dfc in df_results.groupby("Configuration"):
             sheet_name = _excel_safe_sheet_name(config)

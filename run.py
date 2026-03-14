@@ -50,26 +50,16 @@ def main() -> None:
         default=None,
         help="Output directory root (default: results/<filename_stem>).",
     )
-    parser.add_argument(
-        "--template-mode",
-        choices=["per_file_mean", "config_grand_avg", "max_amp_only"],
-        default="per_file_mean",
-        help="Template mode for stimulation-induced detection (default: per_file_mean).",
-    )
     args = parser.parse_args()
 
     if not args.input_path.exists():
         print(f"Error: input file not found: {args.input_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = args.output_dir
-    startstop_mode = args.startstop
-
     output_root = run_pipeline(
         args.input_path,
-        output_dir=output_dir,
-        template_mode=args.template_mode,
-        startstop_mode=startstop_mode,
+        output_dir=args.output_dir,
+        startstop_mode=args.startstop,
     )
     print(f"Outputs saved under: {output_root}")
 
