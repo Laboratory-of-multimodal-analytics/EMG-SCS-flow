@@ -6,11 +6,15 @@ STARTSTOP_MODE = False
 ARTCHAN = None
 # Multiplier for artifact-channel std to detect stimulus events.
 THRESH = 4
+# Width range (in samples) for artifact peak detection. None to use THRESH-based detection.
+ART_PEAK_WIDTH = (2, 15)
+# Height range (in V) for artifact peak detection. None to use THRESH-based detection.
+ART_PEAK_HEIGHT = (0.00002, 0.00006)
 
-# Main band-pass low cutoff for raw preprocessing (Hz).
-RAW_BANDPASS_L_FREQ = 20
-# Main band-pass high cutoff for raw preprocessing (Hz).
-RAW_BANDPASS_H_FREQ = 180
+# Main band-pass low cutoff for raw preprocessing (Hz). None to skip filtering.
+RAW_BANDPASS_L_FREQ = None
+# Main band-pass high cutoff for raw preprocessing (Hz). None to skip filtering.
+RAW_BANDPASS_H_FREQ = None
 
 # Enable artifact-reference subtraction before other processing.
 ARTIFACT_REREF = False

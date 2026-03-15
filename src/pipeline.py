@@ -64,6 +64,8 @@ from .constants import (
     STARTSTOP_SIM_TMIN,
     STARTSTOP_SIM_TMAX,
     THRESH,
+    ART_PEAK_WIDTH,
+    ART_PEAK_HEIGHT,
 )
 from .detection import (
     add_extra_peak_to_p1,
@@ -1663,11 +1665,12 @@ def run_pipeline(
     raw.save(original_fif_path, overwrite=True)
     default_art_chans = _resolve_art_channels(raw, ARTCHAN)
     default_art_set = set(default_art_chans)
-    nyq = raw.info["sfreq"] / 2.0
-    notch_freqs = [f for f in (50, 100, 150, 200, 250, 300) if f < nyq]
-    if notch_freqs:
-        raw.notch_filter(freqs=notch_freqs, method="fir", phase="zero")
-    raw.filter(l_freq=RAW_BANDPASS_L_FREQ, h_freq=RAW_BANDPASS_H_FREQ, method="fir", phase="zero")
+    if RAW_BANDPASS_L_FREQ is not None or RAW_BANDPASS_H_FREQ is not None:
+        nyq = raw.info["sfreq"] / 2.0
+        notch_freqs = [f for f in (50, 100, 150, 200, 250, 300) if f < nyq]
+        if notch_freqs:
+            raw.notch_filter(freqs=notch_freqs, method="fir", phase="zero")
+        raw.filter(l_freq=RAW_BANDPASS_L_FREQ, h_freq=RAW_BANDPASS_H_FREQ, method="fir", phase="zero")
     if ARTIFACT_REREF:
         _apply_artifact_reref(raw, default_art_chans)
     if CAR_REREF:
@@ -1712,8 +1715,11 @@ def run_pipeline(
         art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
         art_set = set(art_chans)
         art = _get_art_signal(raw_file, art_chans)
-        threshold = THRESH * np.std(art)
-        peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
+        if ART_PEAK_WIDTH is not None and ART_PEAK_HEIGHT is not None:
+            peaks, _ = find_peaks(-art, height=ART_PEAK_HEIGHT, width=ART_PEAK_WIDTH, distance=sfreq * 0.1)
+        else:
+            threshold = THRESH * np.std(art)
+            peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
         if len(peaks) <= MIN_VALID_EPOCHS:
             continue
 
@@ -1841,8 +1847,11 @@ def run_pipeline(
         art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
         art_set = set(art_chans)
         art = _get_art_signal(raw_file, art_chans)
-        threshold = THRESH * np.std(art)
-        peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
+        if ART_PEAK_WIDTH is not None and ART_PEAK_HEIGHT is not None:
+            peaks, _ = find_peaks(-art, height=ART_PEAK_HEIGHT, width=ART_PEAK_WIDTH, distance=sfreq * 0.1)
+        else:
+            threshold = THRESH * np.std(art)
+            peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
 
         if len(peaks) <= MIN_VALID_EPOCHS:
             continue
@@ -2107,7 +2116,8 @@ def run_pipeline(
     df_results = pd.DataFrame(results)
     df_results.to_csv(excel_dir / "Large_dataset_emg_response_metrics.csv", index=False)
 
-    plot_grouped_by_amplitude(group_store, times, plots_grouped_dir, default_art_set)
+    if group_store:
+        plot_grouped_by_amplitude(group_store, times, plots_grouped_dir, default_art_set)
 
     metrics = [
         "Onset latency", "Peak1 latency", "Peak2 latency",
