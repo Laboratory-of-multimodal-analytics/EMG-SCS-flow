@@ -80,6 +80,7 @@ from .plotting import (
     plot_grouped_by_condition,
     plot_grouped_by_amplitude,
     plot_template_with_markers,
+    plot_template_overlay_panel,
 )
 
 
@@ -1798,6 +1799,29 @@ def run_pipeline(
                 out_path=out_path,
                 title=f"Template: {configuration} | {ch_name}",
             )
+
+    # ── Save template overlay panels (mean waveform + template per config) ──
+    overlay_dir = paths["stim_results_dir"] / "Template overlays"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    for configuration in config_templates:
+        times = config_meta[configuration]["times"]
+        ch_waves = config_waveforms[configuration]
+        ch_means: dict[str, np.ndarray] = {}
+        for ch_name, waves in ch_waves.items():
+            if waves:
+                ch_means[ch_name] = np.mean(np.stack(waves, axis=0), axis=0)
+
+        safe_config = re.sub(r"[^\w\-\+\. ]", "_", str(configuration))
+        plot_template_overlay_panel(
+            times=times,
+            ch_names=raw.ch_names,
+            art_chans=default_art_set,
+            config_waveforms=ch_means,
+            config_templates=dict(config_templates[configuration]),
+            config_markers=dict(config_template_markers[configuration]),
+            title=f"Template overlay: {configuration}",
+            out_path=overlay_dir / f"{safe_config}_overlay.png",
+        )
 
     # ── PASS 2: epoch-level detection driven by template markers ──
     group_store = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))

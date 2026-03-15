@@ -326,6 +326,74 @@ def plot_boxplots(df: pd.DataFrame, output_dir: Path) -> None:
             plt.close(fig)
 
 
+def plot_template_overlay_panel(
+    times: np.ndarray,
+    ch_names: list[str],
+    art_chans: set[str],
+    config_waveforms: dict[str, np.ndarray],
+    config_templates: dict[str, np.ndarray | None],
+    config_markers: dict[str, dict[str, float]],
+    title: str,
+    out_path: Path,
+) -> None:
+    """Multi-channel panel matching 'plots without grid' style.
+
+    Shows only the mean waveform (black) per channel.  When a template was
+    matched the scaled template is overlaid in red and P1/P2 markers are
+    drawn as coloured dots on the mean waveform.
+    """
+    n_channels = len(ch_names)
+    fig, axes = plt.subplots(n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=500)
+    if n_channels == 1:
+        axes = [axes]
+
+    for i, ch in enumerate(ch_names):
+        ax = axes[i]
+
+        if ch in art_chans:
+            mean_wave = config_waveforms.get(ch)
+            if mean_wave is not None:
+                ax.plot(times, mean_wave * 1e6, color="black", linewidth=2)
+            ax.set_title(ch)
+            ax.set_ylabel("Amplitude (mkV)")
+            continue
+
+        mean_wave = config_waveforms.get(ch)
+        tmpl = config_templates.get(ch)
+        markers = config_markers.get(ch, {})
+
+        if mean_wave is not None:
+            ax.plot(times, mean_wave * 1e6, color="black", linewidth=2)
+
+        if tmpl is not None:
+            ax.plot(times, tmpl * 1e6, color="red", linewidth=1.2, alpha=0.7)
+
+            onset = markers.get("onset", np.nan)
+            p1 = markers.get("p1", np.nan)
+            p2 = markers.get("p2", np.nan)
+
+            if mean_wave is not None:
+                if not np.isnan(onset):
+                    idx = int(np.argmin(np.abs(times - onset)))
+                    ax.scatter(onset, mean_wave[idx] * 1e6, color="blue", s=18, zorder=5)
+                if not np.isnan(p1):
+                    idx = int(np.argmin(np.abs(times - p1)))
+                    ax.scatter(p1, mean_wave[idx] * 1e6, color="red", s=18, zorder=5)
+                if not np.isnan(p2):
+                    idx = int(np.argmin(np.abs(times - p2)))
+                    ax.scatter(p2, mean_wave[idx] * 1e6, color="green", s=18, zorder=5)
+
+        ax.set_ylabel("Amplitude (mkV)")
+        ax.set_title(ch)
+
+    axes[-1].set_xlabel("Time (s)")
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
 def plot_template_with_markers(
     times: np.ndarray,
     template: np.ndarray,
