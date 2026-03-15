@@ -64,7 +64,7 @@ from .constants import (
     STARTSTOP_SIM_TMIN,
     STARTSTOP_SIM_TMAX,
     THRESH,
-    ART_PEAK_WIDTH,
+    ART_PEAK_WIDTH_MS,
     ART_PEAK_HEIGHT,
 )
 from .detection import (
@@ -1715,8 +1715,9 @@ def run_pipeline(
         art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
         art_set = set(art_chans)
         art = _get_art_signal(raw_file, art_chans)
-        if ART_PEAK_WIDTH is not None and ART_PEAK_HEIGHT is not None:
-            peaks, _ = find_peaks(-art, height=ART_PEAK_HEIGHT, width=ART_PEAK_WIDTH, distance=sfreq * 0.1)
+        if ART_PEAK_WIDTH_MS is not None and ART_PEAK_HEIGHT is not None:
+            width_samples = (ART_PEAK_WIDTH_MS[0] / 1000.0 * sfreq, ART_PEAK_WIDTH_MS[1] / 1000.0 * sfreq)
+            peaks, _ = find_peaks(-art, height=ART_PEAK_HEIGHT, width=width_samples, distance=sfreq * 0.1)
         else:
             threshold = THRESH * np.std(art)
             peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)
@@ -1847,8 +1848,9 @@ def run_pipeline(
         art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
         art_set = set(art_chans)
         art = _get_art_signal(raw_file, art_chans)
-        if ART_PEAK_WIDTH is not None and ART_PEAK_HEIGHT is not None:
-            peaks, _ = find_peaks(-art, height=ART_PEAK_HEIGHT, width=ART_PEAK_WIDTH, distance=sfreq * 0.1)
+        if ART_PEAK_WIDTH_MS is not None and ART_PEAK_HEIGHT is not None:
+            width_samples = (ART_PEAK_WIDTH_MS[0] / 1000.0 * sfreq, ART_PEAK_WIDTH_MS[1] / 1000.0 * sfreq)
+            peaks, _ = find_peaks(-art, height=ART_PEAK_HEIGHT, width=width_samples, distance=sfreq * 0.1)
         else:
             threshold = THRESH * np.std(art)
             peaks, _ = find_peaks(-art, height=threshold, distance=sfreq * 0.1)

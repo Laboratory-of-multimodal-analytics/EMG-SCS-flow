@@ -6,8 +6,8 @@ STARTSTOP_MODE = False
 ARTCHAN = None
 # Multiplier for artifact-channel std to detect stimulus events.
 THRESH = 4
-# Width range (in samples) for artifact peak detection. None to use THRESH-based detection.
-ART_PEAK_WIDTH = (2, 15)
+# Width range (in ms) for artifact peak detection. None to use THRESH-based detection.
+ART_PEAK_WIDTH_MS = (0.93, 6.98)
 # Height range (in V) for artifact peak detection. None to use THRESH-based detection.
 ART_PEAK_HEIGHT = (0.00002, 0.00006)
 
