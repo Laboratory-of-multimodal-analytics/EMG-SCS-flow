@@ -80,9 +80,6 @@ STARTSTOP_SIM_TMIN = -0.02
 # Similarity-comparison window end (s) for StartStop channel QC.
 STARTSTOP_SIM_TMAX = 0.02
 
-# Generic low-pass cutoff helper used in some signal steps (Hz).
-LOWPASS_CUTOFF_HZ = 180.0
-
 # Stimulation-induced epoch start relative to detected stimulus event (s).
 EPOCH_TMIN = -0.05
 # Stimulation-induced epoch end relative to detected stimulus event (s).
