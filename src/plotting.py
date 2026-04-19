@@ -430,3 +430,182 @@ def plot_template_with_markers(
     plt.close(fig)
 
 
+def ci_plot(
+    df_ci: pd.DataFrame,
+    out_path: Path,
+    title: str = "Dependence of the costimulation coefficient on the stimulation amplitude",
+) -> None:
+   
+    if df_ci.empty:
+        print(f"[ci_plot] No data to plot", flush=True)
+        return
+    
+    pairs = df_ci[["Musc_A", "Musc_B"]].drop_duplicates().values
+    n_pairs = len(pairs)
+    if n_pairs == 0:
+        return
+    
+    all_configs = sorted(df_ci["Configuration"].unique())
+    n_configs = len(all_configs)
+    config_colors = sns.color_palette("tab20", n_configs)
+    config_color_map = {config: config_colors[i] for i, config in enumerate(all_configs)}
+    
+    n_cols = 2
+    n_rows = int(np.ceil(n_pairs / n_cols))
+    
+    fig, axes = plt.subplots(
+        nrows=n_rows,
+        ncols=n_cols,
+        figsize=(16, 6 * n_rows),
+        squeeze=False
+    )
+    
+    idx = 0
+    for row in range(n_rows):
+        for col in range(n_cols):
+            ax = axes[row, col]
+            
+            if idx >= n_pairs:
+                ax.set_visible(False)
+                continue
+            
+            muscle_a, muscle_b = pairs[idx]
+            
+            pair_data = df_ci[
+                (df_ci["Musc_A"] == muscle_a) & 
+                (df_ci["Musc_B"] == muscle_b)
+            ].sort_values("Stim. amplitude")
+            
+            for config in all_configs:
+                config_data = pair_data[pair_data["Configuration"] == config]
+                
+                if len(config_data) == 0:
+                    continue
+                
+                ax.scatter(
+                    config_data["Stim. amplitude"],
+                    config_data["CI"],
+                    color=config_color_map[config],
+                    s=100,
+                    alpha=1,
+                    edgecolors='white',
+                    linewidth=1,
+                    label=config
+                )
+            
+            ax.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, linewidth=1.5, zorder=2)
+            
+            from matplotlib.ticker import MultipleLocator
+            x_min = pair_data["Stim. amplitude"].min()
+            x_max = pair_data["Stim. amplitude"].max()
+            x_min_floor = np.floor(x_min * 2) / 2 - 1
+            x_max_ceil = np.ceil(x_max * 2) / 2 + 1
+            ax.set_xticks(np.arange(x_min_floor, x_max_ceil + 0.5, 1))
+            ax.xaxis.set_major_locator(MultipleLocator(1))
+            
+            ax.set_xlabel("Stim. amplitude", fontsize=10)
+            ax.set_ylabel("CI", fontsize=10)
+            ax.set_title(f"{muscle_a} + {muscle_b}", fontsize=11)
+            ax.set_ylim(0, 0.55)
+            ax.set_xlim(x_min_floor, x_max_ceil)
+            ax.grid(True, alpha=0.3, linestyle='--', which='both', zorder=0)
+            
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, labels, fontsize=8, loc='upper right', title='Configuration')
+            
+            idx += 1
+    
+    fig.suptitle(title, fontsize=15)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    
+
+def plot_lshape(
+    df_ci: pd.DataFrame,
+    out_path: Path,
+    title: str = "L-shape plots for each pair of muscles",
+) -> None:
+    
+    if df_ci.empty:
+        print(f"[plot_lshape] No data to plot", flush=True)
+        return
+    
+    pairs = df_ci[["Musc_A", "Musc_B"]].drop_duplicates().values
+    n_pairs = len(pairs)
+    if n_pairs == 0:
+        return
+
+    all_configs = sorted(df_ci["Configuration"].unique())
+    n_configs = len(all_configs)
+    config_colors = sns.color_palette("tab20", n_configs)
+    config_color_map = {config: config_colors[i] for i, config in enumerate(all_configs)}
+    
+    n_cols = 2
+    n_rows = int(np.ceil(n_pairs / n_cols))
+    
+    fig, axes = plt.subplots(
+        nrows=n_rows,
+        ncols=n_cols,
+        figsize=(12, 6 * n_rows),
+        squeeze=False
+    )
+    
+    idx = 0
+    for row in range(n_rows):
+        for col in range(n_cols):
+            ax = axes[row, col]
+            
+            if idx >= n_pairs:
+                ax.set_visible(False)
+                continue
+            
+            muscle_a, muscle_b = pairs[idx]
+            
+            pair_data = df_ci[
+                (df_ci["Musc_A"] == muscle_a) & 
+                (df_ci["Musc_B"] == muscle_b)
+            ].sort_values("Stim. amplitude")
+            
+            for config in all_configs:
+                config_data = pair_data[pair_data["Configuration"] == config]
+                
+                if len(config_data) == 0:
+                    continue
+                
+                ax.scatter(
+                    config_data["A_amp_norm"],
+                    config_data["B_amp_norm"],
+                    color=config_color_map[config],
+                    s=100,
+                    alpha=1,
+                    edgecolors='white',
+                    linewidth=1,
+                    label=config
+                )
+            
+            ax.set_xlabel(f"Amplitude {muscle_a}", fontsize=10)
+            ax.set_ylabel(f"Amplitude {muscle_b}", fontsize=10)
+            ax.set_title(f"{muscle_a} + {muscle_b}", fontsize=11)
+            ax.set_xlim(0, 105)
+            ax.set_ylim(0, 105)
+            ax.set_aspect('equal', 'box')
+            ax.grid(True, alpha=0.3, linestyle='--', zorder=0)
+            
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, labels, fontsize=8, loc='upper right', title='Configuration')
+            
+            idx += 1
+    
+    fig.suptitle(title, fontsize=15)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+

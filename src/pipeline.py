@@ -10,6 +10,7 @@ import mne
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 from scipy.signal import find_peaks
 from scipy.io import loadmat
 from tqdm import tqdm
@@ -83,6 +84,8 @@ from .plotting import (
     plot_grouped_by_amplitude,
     plot_template_with_markers,
     plot_template_overlay_panel,
+    ci_plot,
+    plot_lshape,
 )
 
 
@@ -1628,6 +1631,53 @@ def _default_output_root_for_input(edf_path: Path) -> Path:
     return edf_path.parent.parent / "results" / edf_path.stem
 
 
+def coactivation_analysis(df_results: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
+    dfv = df_results[df_results['PTP amplitude'].notna()].copy()
+    if dfv.empty:
+        print(" No valid data for CI analysis.", flush=True)
+        return pd.DataFrame()
+    max_musc = dfv.groupby('Channel')['PTP amplitude'].max()
+    df_norm = dfv.groupby(['Configuration','Stim. amplitude','Channel'])['PTP amplitude'].mean().reset_index()
+    df_norm.rename(columns={'PTP amplitude':'PTP_mean'}, inplace=True)
+    df_norm['Max_musc'] = df_norm['Channel'].map(max_musc)
+    df_norm['PTP_norm'] = (df_norm['PTP_mean']/df_norm['Max_musc'])*100
+
+    ANTAGONIST_PAIRS = [
+    ("Bic L", "Tric L"),
+    ("Bic R", "Trip B"), 
+    ("Flex U L", "Ext U L"),
+    ("Flex U R", "Ext U R")   
+    ]
+
+    CI = []
+    for musc_a,musc_b in ANTAGONIST_PAIRS:
+        df_a = df_norm[df_norm['Channel']==musc_a][['Configuration','Stim. amplitude','PTP_norm']].copy()
+        df_a.columns = ['Configuration','Stim. amplitude','A_amp_norm']
+        df_b = df_norm[df_norm['Channel']==musc_b][['Configuration','Stim. amplitude','PTP_norm']].copy()
+        df_b.columns = ['Configuration','Stim. amplitude','B_amp_norm']
+        df_ab = pd.merge(df_a, df_b, on=['Configuration','Stim. amplitude'], how='inner')
+        if len(df_ab) == 0:
+            continue
+
+        A = df_ab['A_amp_norm'].values
+        B = df_ab['B_amp_norm'].values
+        df_ab['CI'] = np.minimum(A, B)/(A+B)
+
+        df_ab['Musc_A'] = musc_a
+        df_ab['Musc_B'] = musc_b
+        CI.append(df_ab)
+
+    df_ci = pd.concat(CI, ignore_index=True)
+    
+    ci_excel_dir = output_dir / "CI_analysis"
+    ci_excel_dir.mkdir(parents=True, exist_ok=True)
+    df_ci.to_excel(ci_excel_dir / "CI_data.xlsx", index=False)
+
+    return df_ci
+
+    
+        
+
 def run_pipeline(
     edf_path: str | Path,
     output_dir: str | Path | None = None,
@@ -2182,4 +2232,22 @@ def run_pipeline(
     if old_mne_log_level is not None:
         mne.set_log_level(old_mne_log_level)
 
-    return output_root
+    print("\n[CI ANALYSIS] Starting coactivation analysis...", flush=True)
+    try:
+        df_ci = coactivation_analysis(
+            df_results=df_results,
+            output_dir=output_root,
+        )
+        if not df_ci.empty:            
+            ci_plots_dir = output_root / "CI_analysis" / "figures"
+            ci_plots_dir.mkdir(parents=True, exist_ok=True)
+            ci_plot(df_ci, ci_plots_dir / "CI_plots.png")
+            plot_lshape(df_ci, ci_plots_dir / "L-shape_plots.png")
+        else:
+            print("No CI data generated", flush=True)
+    except Exception as e:
+        print(f"[CI ANALYSIS] ✗ Error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+
+return output_root
