@@ -1669,6 +1669,8 @@ def coactivation_analysis(df_results: pd.DataFrame, output_dir: Path) -> pd.Data
 
     df_ci = pd.concat(CI, ignore_index=True)
     
+    df_ci["Stim. amplitude"] = pd.to_numeric(df_ci["Stim. amplitude"], errors='coerce')
+    
     ci_excel_dir = output_dir / "CI_analysis"
     ci_excel_dir.mkdir(parents=True, exist_ok=True)
     df_ci.to_excel(ci_excel_dir / "CI_data.xlsx", index=False)
@@ -2232,22 +2234,21 @@ def run_pipeline(
     if old_mne_log_level is not None:
         mne.set_log_level(old_mne_log_level)
 
-    print("\n[CI ANALYSIS] Starting coactivation analysis...", flush=True)
-    try:
-        df_ci = coactivation_analysis(
-            df_results=df_results,
-            output_dir=output_root,
-        )
-        if not df_ci.empty:            
-            ci_plots_dir = output_root / "CI_analysis" / "figures"
-            ci_plots_dir.mkdir(parents=True, exist_ok=True)
-            ci_plot(df_ci, ci_plots_dir / "CI_plots.png")
-            plot_lshape(df_ci, ci_plots_dir / "L-shape_plots.png")
-        else:
-            print("No CI data generated", flush=True)
-    except Exception as e:
-        print(f"[CI ANALYSIS] ✗ Error: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
 
-return output_root
+
+    print("\n Starting coactivation analysis...", flush=True)
+    
+
+    ci_target_dir = excel_dir.parent / "CI_analysis"
+    df_ci = coactivation_analysis(df_results, ci_target_dir.parent)
+
+    if not df_ci.empty:
+        plots_dir = ci_target_dir / "figures"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        from .plotting import ci_plot, plot_lshape
+        ci_plot(df_ci, plots_dir / "CI_plots.png")
+        plot_lshape(df_ci, plots_dir / "L-shape_plots.png")
+    else:
+        print("No CI data generated.", flush=True)
+
+    return output_root

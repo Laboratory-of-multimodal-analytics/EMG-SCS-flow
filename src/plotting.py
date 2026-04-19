@@ -10,6 +10,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 
 matplotlib.use("Agg")
 
@@ -496,6 +497,7 @@ def ci_plot(
             ax.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, linewidth=1.5, zorder=2)
             
             from matplotlib.ticker import MultipleLocator
+
             x_min = pair_data["Stim. amplitude"].min()
             x_max = pair_data["Stim. amplitude"].max()
             x_min_floor = np.floor(x_min * 2) / 2 - 1
