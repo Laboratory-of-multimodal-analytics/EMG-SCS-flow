@@ -61,6 +61,8 @@ def detect_peak_in_window(
     choose: str = "dominant",
     template_peak_val: float = np.nan,
     min_rel_to_template: float = 0.1,
+    t_min: float | None = None,
+    t_max: float | None = None,
 ) -> tuple[float, float]:
     if np.isnan(t_center):
         return (np.nan, np.nan)
@@ -71,7 +73,13 @@ def detect_peak_in_window(
         return (np.nan, np.nan)
 
     w = win_ms / 1000.0
-    m = (times >= t_center - w) & (times <= t_center + w)
+    lo = t_center - w
+    hi = t_center + w
+    if t_min is not None:
+        lo = max(lo, float(t_min))
+    if t_max is not None:
+        hi = min(hi, float(t_max))
+    m = (times >= lo) & (times <= hi)
     if np.sum(m) < 5:
         return (np.nan, np.nan)
 

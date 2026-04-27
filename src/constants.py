@@ -7,14 +7,14 @@ ARTCHAN = None
 # Multiplier for artifact-channel std to detect stimulus events.
 THRESH = 4
 # Width range (in ms) for artifact peak detection. None to use THRESH-based detection.
-ART_PEAK_WIDTH_MS = (0.93, 6.98)
+ART_PEAK_WIDTH_MS = None
 # Height range (in V) for artifact peak detection. None to use THRESH-based detection.
-ART_PEAK_HEIGHT = (0.00002, 0.00006)
+ART_PEAK_HEIGHT = None
 
 # Main band-pass low cutoff for raw preprocessing (Hz). None to skip filtering.
-RAW_BANDPASS_L_FREQ = None
+RAW_BANDPASS_L_FREQ = 60
 # Main band-pass high cutoff for raw preprocessing (Hz). None to skip filtering.
-RAW_BANDPASS_H_FREQ = None
+RAW_BANDPASS_H_FREQ = 300
 
 # Enable artifact-reference subtraction before other processing.
 ARTIFACT_REREF = False
@@ -24,7 +24,7 @@ CAR_REREF = False
 LATERAL_CAR_REREF = False
 
 # Convert MAT signal units by dividing by 1000.
-MAT_DIVIDE_BY_1000 = False
+MAT_DIVIDE_BY_1000 = True
 
 
 # Reject StartStop channels that look like artifact leakage.
@@ -88,30 +88,46 @@ EPOCH_TMAX = 0.1
 # Baseline start for stimulation-induced per-epoch metrics (s).
 BASELINE_TMIN = -0.04
 # Baseline end for stimulation-induced per-epoch metrics (s).
-BASELINE_TMAX = 0.0
+BASELINE_TMAX = -0.01
 
 # Earliest response time allowed for peak search (s).
-RESP_TMIN = 0.01
+RESP_TMIN = -0.01
 # Latest response time allowed for peak search (s).
-RESP_TMAX = 0.04
+RESP_TMAX = 0.02
 
 # Enable artifact-correlation channel-level rejection in stimulation mode.
-STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
+STIM_EPOCH_ARTIFACT_CORR_REJECTION = False
 # Absolute correlation threshold vs artifact channel means.
 STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.5
 # Maximum allowed deviation of epoch onset from template onset (s).
 STIM_ONSET_MAX_DEV_S = 0.003
 
 # Time-scale factors tested when matching pre-computed templates in SIR mode.
-SIR_TM_SCALES = (0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2)
+# Keep scales near 1.0 so the synthesized template preserves the shape of the
+# original .npy templates (small scales compress them into ringing).
+SIR_TM_SCALES = (0.3, 0.5, 0.75, 1.0, 1.25, 1.5)
 # Minimum correlation to accept a template match in SIR mode.
-SIR_TM_MIN_CORR = 0.3
+SIR_TM_MIN_CORR = 0.7
+# When True, fit a separate template per (config, amplitude, channel)
+# instead of one template per (config, channel) — useful when the
+# response shape changes meaningfully with stim amplitude.
+SIR_TEMPLATE_PER_AMPLITUDE = True
 # Minimum absolute amplitude for individual detected peaks (uV).
-STIM_PEAK_AMP_MIN_UV = 10.0
+STIM_PEAK_AMP_MIN_UV = 3.0
 # Minimum PTP (|P1-P2|) required for a valid response (uV).
-STIM_PTP_MIN_UV = 30.0
+STIM_PTP_MIN_UV = 5.0
 # Minimum absolute P1 amplitude required (uV).
-STIM_P1_ABS_MIN_UV = 10.0
+STIM_P1_ABS_MIN_UV = 3.0
 
 # Minimum number of detected stimulus events needed to build templates.
 MIN_VALID_EPOCHS = 5
+
+# Minimum inter-trial median pairwise Pearson correlation in the response
+# window required to keep a channel. None disables the gate.
+STIM_MIN_INTER_TRIAL_CORR = 0.7
+
+# Minimum median correlation between each epoch and the matched config-level
+# template in the response window — channel-level rejection gate.
+STIM_CHANNEL_MIN_MEDIAN_CORR = 0.5
+# Minimum fraction of epochs with a valid p1 — channel-level rejection gate.
+STIM_CHANNEL_MIN_VALID_FRAC = 0.3
