@@ -14,6 +14,7 @@ import seaborn as sns
 from scipy.signal import find_peaks
 from scipy.io import loadmat
 from tqdm import tqdm
+from scipy.ndimage import uniform_filter1d
 
 from .annotations import create_annotation_crops, extract_start_stop_segments
 from .constants import (
@@ -31,6 +32,9 @@ from .constants import (
     RAW_BANDPASS_L_FREQ,
     RESP_TMAX,
     RESP_TMIN,
+    BURST_TMAX,
+    BURST_TMIN,
+    BURST_THR,
     SIR_TM_MIN_CORR,
     SIR_TM_SCALES,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
@@ -1227,6 +1231,7 @@ def _run_startstop_analysis(
                     ptp_amp = float(np.abs(p1_corr_value - peak2_value))
                 else:
                     ptp_amp = np.nan
+                
 
                 if not STARTSTOP_TM_NO_POSTHOC_CHECKS:
                     if (not np.isnan(ptp_amp)) and (ptp_amp < 15e-6):
@@ -1365,6 +1370,7 @@ def _run_startstop_analysis(
                 results["Peak2 value"].append(e["pv2"])
                 results["PTP amplitude"].append(e["ptp"])
                 results["Time series"].append(e["sig"])
+                
 
             valid_epochs = [e["ep"] for e in entries if not np.isnan(e["p1"])]
             if valid_epochs:
@@ -1631,54 +1637,60 @@ def _default_output_root_for_input(edf_path: Path) -> Path:
     return edf_path.parent.parent / "results" / edf_path.stem
 
 
-def coactivation_analysis(df_results: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
-    dfv = df_results[df_results['PTP amplitude'].notna()].copy()
+def coactivation_analysis(df_burst: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
+    dfv = df_burst[df_burst['Burst power'].notna()].copy()
     if dfv.empty:
         print(" No valid data for CI analysis.", flush=True)
         return pd.DataFrame()
-    max_musc = dfv.groupby('Channel')['PTP amplitude'].max()
-    df_norm = dfv.groupby(['Configuration','Stim. amplitude','Channel'])['PTP amplitude'].mean().reset_index()
-    df_norm.rename(columns={'PTP amplitude':'PTP_mean'}, inplace=True)
+    
+    max_musc = dfv.groupby('Channel')['Burst power'].max()
+    df_norm = dfv.groupby(['Configuration', 'Stim. amplitude', 'Channel']
+    )['Burst power'].mean().reset_index()
+    df_norm.rename(columns={'Burst power': 'Power_mean'}, inplace=True)
+    
     df_norm['Max_musc'] = df_norm['Channel'].map(max_musc)
-    df_norm['PTP_norm'] = (df_norm['PTP_mean']/df_norm['Max_musc'])*100
-
+    df_norm['Power_norm'] = (df_norm['Power_mean'] / df_norm['Max_musc']) * 100
+    
     ANTAGONIST_PAIRS = [
-    ("Bic L", "Tric L"),
-    ("Bic R", "Trip B"), 
-    ("Flex U L", "Ext U L"),
-    ("Flex U R", "Ext U R")   
+        ("Bic L", "Tric L"),
+        ("Bic R", "Trip B"), 
+        ("Flex U L", "Ext U L"),
+        ("Flex U R", "Ext U R")   
     ]
 
     CI = []
-    for musc_a,musc_b in ANTAGONIST_PAIRS:
-        df_a = df_norm[df_norm['Channel']==musc_a][['Configuration','Stim. amplitude','PTP_norm']].copy()
-        df_a.columns = ['Configuration','Stim. amplitude','A_amp_norm']
-        df_b = df_norm[df_norm['Channel']==musc_b][['Configuration','Stim. amplitude','PTP_norm']].copy()
-        df_b.columns = ['Configuration','Stim. amplitude','B_amp_norm']
-        df_ab = pd.merge(df_a, df_b, on=['Configuration','Stim. amplitude'], how='inner')
+    for musc_a, musc_b in ANTAGONIST_PAIRS:
+        df_a = df_norm[df_norm['Channel'] == musc_a][['Configuration', 'Stim. amplitude', 'Power_norm']].copy()
+        df_a.columns = ['Configuration', 'Stim. amplitude', 'A_power_norm']
+        df_b = df_norm[df_norm['Channel'] == musc_b][['Configuration', 'Stim. amplitude', 'Power_norm'] ].copy()
+        df_b.columns = ['Configuration', 'Stim. amplitude', 'B_power_norm']
+        df_ab = pd.merge(df_a, df_b, on=['Configuration', 'Stim. amplitude'], how='inner')
         if len(df_ab) == 0:
             continue
 
-        A = df_ab['A_amp_norm'].values
-        B = df_ab['B_amp_norm'].values
-        df_ab['CI'] = np.minimum(A, B)/(A+B)
+        A = df_ab['A_power_norm'].values
+        B = df_ab['B_power_norm'].values
+        df_ab['CI'] = np.minimum(A, B) / (A + B + 1e-10)  # +1e-10 защита от деления на 0
 
         df_ab['Musc_A'] = musc_a
         df_ab['Musc_B'] = musc_b
         CI.append(df_ab)
 
+    if not CI:
+        print(" No CI calculated for any pair.", flush=True)
+        return pd.DataFrame()
+
     df_ci = pd.concat(CI, ignore_index=True)
     
     df_ci["Stim. amplitude"] = pd.to_numeric(df_ci["Stim. amplitude"], errors='coerce')
-    
+
     ci_excel_dir = output_dir / "CI_analysis"
     ci_excel_dir.mkdir(parents=True, exist_ok=True)
     df_ci.to_excel(ci_excel_dir / "CI_data.xlsx", index=False)
-
+    
     return df_ci
 
     
-        
 
 def run_pipeline(
     edf_path: str | Path,
@@ -1891,6 +1903,9 @@ def run_pipeline(
     ]}
 
     print("[SIR] Detecting epochs...", flush=True)
+    
+    all_burst_data = []
+    
     for file_name in tqdm(file_list, desc="PASS 2: detect epochs"):
         file_path = crops_dir / file_name
         raw_file = mne.io.read_raw_fif(file_path)
@@ -1959,6 +1974,43 @@ def run_pipeline(
         channel_epoch_results: dict[str, list[dict]] = {ch: [] for ch in eligible_channels}
         latency_markers: dict[str, list[dict]] = {ch: [] for ch in epochs.ch_names if ch not in art_set}
 
+        # Burst power
+        burst_results = {key: [] for key in [
+            "Configuration", "Stim. amplitude", "Epoch", "Channel", "Burst power"
+        ]}
+        
+        for ep in range(len(epochs)):
+            for ch_idx, ch_name in enumerate(epochs.ch_names):
+                if ch_name in art_set:
+                    continue
+        
+                sig = data_epoched[ep, ch_idx, :]
+                
+                burst_power = np.nan
+                win_samples = max(1, int((20.0 / 1000.0) * sfreq))
+                env = uniform_filter1d(np.abs(sig), size=win_samples, axis=-1, mode='nearest')
+                thr = np.mean(env[baseline_mask]) + BURST_THR * np.std(env[baseline_mask])
+                resp_mask = (times >= BURST_TMIN) & (times <= BURST_TMAX)
+                active_in_resp = env[resp_mask] > thr
+                                
+                if np.any(active_in_resp):
+                    active_times = times[resp_mask][active_in_resp]
+                    burst_onset = float(np.min(active_times))
+                    burst_offset = float(np.max(active_times))
+                    burst_mask = (times >= burst_onset) & (times <= burst_offset)
+                    if np.any(burst_mask):
+                        power_sig = sig[burst_mask] ** 2
+                        burst_power = float(np.mean(power_sig))
+        
+                burst_results["Configuration"].append(configuration)
+                burst_results["Stim. amplitude"].append(stim_amp_raw)
+                burst_results["Epoch"].append(ep)
+                burst_results["Channel"].append(ch_name)
+                burst_results["Burst power"].append(burst_power)
+
+        df_burst = pd.DataFrame(burst_results)
+        all_burst_data.append(df_burst)
+
         for ep in range(len(epochs)):
             for ch_idx, ch_name in enumerate(epochs.ch_names):
                 if (ch_name in art_set) or (ch_name not in eligible_set):
@@ -1971,7 +2023,7 @@ def run_pipeline(
                 if bstd == 0 or np.isnan(bstd):
                     channel_epoch_results[ch_name].append(
                         {"ep": ep, "onset": np.nan, "p1": np.nan, "p2": np.nan,
-                         "pv1": np.nan, "pv2": np.nan, "ptp": np.nan, "sig": sig}
+                         "pv1": np.nan, "pv2": np.nan, "ptp": np.nan, "sig": sig,}
                     )
                     continue
 
@@ -2065,14 +2117,16 @@ def run_pipeline(
                 if np.isnan(peak1_value) or np.isnan(peak2_value):
                     onset_latency = peak1_latency = peak2_latency = np.nan
                     peak1_value = peak2_value = ptp_amp = np.nan
-
+                    
+            
+                    
                 channel_epoch_results[ch_name].append(
                     {"ep": ep, "onset": onset_latency,
                      "p1": peak1_latency, "p2": peak2_latency,
                      "pv1": peak1_value, "pv2": peak2_value,
-                     "ptp": ptp_amp, "sig": sig}
+                     "ptp": ptp_amp, "sig": sig,}
                 )
-
+                
         # ── Channel-level consistency / artifact rejection ──
         corr_min_median = 0.69
         min_valid_frac = 0.4
@@ -2131,6 +2185,7 @@ def run_pipeline(
                 for e in entries:
                     e["onset"] = e["p1"] = e["p2"] = np.nan
                     e["pv1"] = e["pv2"] = e["ptp"] = np.nan
+        
 
             for e in entries:
                 latency_markers[ch].append(
@@ -2148,7 +2203,7 @@ def run_pipeline(
                 results["Peak2 value"].append(e["pv2"])
                 results["PTP amplitude"].append(e["ptp"])
                 results["Time series"].append(e["sig"])
-
+                
         base_name = file_name.split(".fif")[0]
         plot_epochs_panel(
             data_epoched=data_epoched, times=times,
@@ -2164,6 +2219,12 @@ def run_pipeline(
             title=base_name, out_path=plots_plain_dir / f"{base_name}.png",
             show_grid=False, show_markers=False,
         )
+
+    if all_burst_data:
+        df_burst_all = pd.concat(all_burst_data, ignore_index=True)
+        df_burst_all.to_csv(excel_dir / "Burst_power_data.csv", index=False)
+    else:
+        df_burst_all = pd.DataFrame()
 
     # ── Write outputs ──
     print("[SIR] Writing outputs...", flush=True)
@@ -2240,7 +2301,7 @@ def run_pipeline(
     
 
     ci_target_dir = excel_dir.parent / "CI_analysis"
-    df_ci = coactivation_analysis(df_results, ci_target_dir.parent)
+    df_ci = coactivation_analysis(df_burst_all, ci_target_dir.parent)
 
     if not df_ci.empty:
         plots_dir = ci_target_dir / "figures"

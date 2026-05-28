@@ -579,8 +579,8 @@ def plot_lshape(
                     continue
                 
                 ax.scatter(
-                    config_data["A_amp_norm"],
-                    config_data["B_amp_norm"],
+                    config_data["A_power_norm"],
+                    config_data["B_power_norm"],
                     color=config_color_map[config],
                     s=100,
                     alpha=1,
@@ -588,12 +588,18 @@ def plot_lshape(
                     linewidth=1,
                     label=config
                 )
+
+            max_val_a = pair_data["A_power_norm"].max()
+            max_val_b = pair_data["B_power_norm"].max()
+            max_val = max(max_val_a, max_val_b)
+
+            limit = max_val * 1.1 if max_val > 0 else 100
             
             ax.set_xlabel(f"Amplitude {muscle_a}", fontsize=10)
             ax.set_ylabel(f"Amplitude {muscle_b}", fontsize=10)
             ax.set_title(f"{muscle_a} + {muscle_b}", fontsize=11)
-            ax.set_xlim(0, 105)
-            ax.set_ylim(0, 105)
+            ax.set_xlim(0, limit)
+            ax.set_ylim(0, limit)
             ax.set_aspect('equal', 'box')
             ax.grid(True, alpha=0.3, linestyle='--', zorder=0)
             

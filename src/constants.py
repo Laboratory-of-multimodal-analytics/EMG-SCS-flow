@@ -5,11 +5,13 @@ STARTSTOP_MODE = False
 # Artifact channel selection: None -> auto-detect by channel names.
 ARTCHAN = None
 # Multiplier for artifact-channel std to detect stimulus events.
-THRESH = 4
+THRESH = 3.0
 # Width range (in ms) for artifact peak detection. None to use THRESH-based detection.
 ART_PEAK_WIDTH_MS = (0.93, 6.98)
+#ART_PEAK_WIDTH_MS = None
 # Height range (in V) for artifact peak detection. None to use THRESH-based detection.
 ART_PEAK_HEIGHT = (0.00002, 0.00006)
+#ART_PEAK_HEIGHT = None
 
 # Main band-pass low cutoff for raw preprocessing (Hz). None to skip filtering.
 RAW_BANDPASS_L_FREQ = None
@@ -83,7 +85,7 @@ STARTSTOP_SIM_TMAX = 0.02
 # Stimulation-induced epoch start relative to detected stimulus event (s).
 EPOCH_TMIN = -0.05
 # Stimulation-induced epoch end relative to detected stimulus event (s).
-EPOCH_TMAX = 0.1
+EPOCH_TMAX = 0.45
 
 # Baseline start for stimulation-induced per-epoch metrics (s).
 BASELINE_TMIN = -0.04
@@ -94,6 +96,13 @@ BASELINE_TMAX = 0.0
 RESP_TMIN = 0.01
 # Latest response time allowed for peak search (s).
 RESP_TMAX = 0.04
+
+# Burst detection window start relative to stimulus (s).
+BURST_TMAX = 0.4
+# Burst detection window end relative to stimulus (s).
+BURST_TMIN = 0.01
+# Number of standard deviations above baseline mean for burst detection threshold.
+BURST_THR = 2.5
 
 # Enable artifact-correlation channel-level rejection in stimulation mode.
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = True
@@ -107,11 +116,14 @@ SIR_TM_SCALES = (0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2)
 # Minimum correlation to accept a template match in SIR mode.
 SIR_TM_MIN_CORR = 0.3
 # Minimum absolute amplitude for individual detected peaks (uV).
-STIM_PEAK_AMP_MIN_UV = 10.0
+# STIM_PEAK_AMP_MIN_UV = 10.0
+STIM_PEAK_AMP_MIN_UV = 5.0
 # Minimum PTP (|P1-P2|) required for a valid response (uV).
-STIM_PTP_MIN_UV = 30.0
+# STIM_PTP_MIN_UV = 30.0
+STIM_PTP_MIN_UV = 15.0
 # Minimum absolute P1 amplitude required (uV).
-STIM_P1_ABS_MIN_UV = 10.0
+# STIM_P1_ABS_MIN_UV = 10.0
+STIM_P1_ABS_MIN_UV = 5.0
 
 # Minimum number of detected stimulus events needed to build templates.
 MIN_VALID_EPOCHS = 5
