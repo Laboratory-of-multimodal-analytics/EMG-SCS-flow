@@ -2000,7 +2000,7 @@ def run_pipeline(
                     burst_mask = (times >= burst_onset) & (times <= burst_offset)
                     if np.any(burst_mask):
                         power_sig = sig[burst_mask] ** 2
-                        burst_power = float(np.mean(power_sig))
+                        burst_power = np.sqrt(np.mean(power_sig))
         
                 burst_results["Configuration"].append(configuration)
                 burst_results["Stim. amplitude"].append(stim_amp_raw)
