@@ -40,9 +40,9 @@ STARTSTOP_LEAKAGE_CORR_REJECTION = True
 # gate (STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR) rejects channels firing on
 # irregular bursts, so a lower detection threshold improves recall on the real
 # response train without resurrecting false-positive channels.
-STARTSTOP_TM_SCORE_THR = 0.65
+STARTSTOP_TM_SCORE_THR = 0.6
 # Minimum correlation to template to keep a match.
-STARTSTOP_TM_TEMPLATE_CORR_THR = 0.65
+STARTSTOP_TM_TEMPLATE_CORR_THR = 0.6
 # Time-scale factors tested during template matching.
 STARTSTOP_TM_SCALES = (0.95, 1.0, 1.05, 1.1, 1.2)
 # Restrict template matching to the active response window (onset - pad .. peak2
