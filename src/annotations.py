@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import os
 import re
+from difflib import SequenceMatcher
 
 
 MISSING_AMP_LABEL = "unspecified"
@@ -16,6 +18,20 @@ CONFIG_WITH_AMP_RE = re.compile(
 CONFIG_TOKEN_RE = re.compile(r"(?P<cfg>\d+(?:[+-]\d+)+[+-]?)")
 AMP_RE = re.compile(r"^\s*[+-]?\d+(?:[.,/]\d+)?(?:\s*(?:mA|uA|ms|Hz|ma|ua))?\s*$", re.IGNORECASE)
 STARTSTOP_RE = re.compile(r"^\s*(start|stop)\W*\s*$", re.IGNORECASE)
+
+# Canonical start/stop spellings in Latin and Cyrillic. Cleaned labels that
+# match a key exactly map to the value; close-but-misspelled labels (e.g. the
+# real-world typo "СТРАРТ") are accepted via fuzzy matching below.
+_STARTSTOP_FORMS = {
+    "start": "start",
+    "stop": "stop",
+    "старт": "start",
+    "стоп": "stop",
+}
+# Minimum edit-similarity (0..1) to accept a typo'd start/stop label.
+_STARTSTOP_FUZZY_THR = 0.8
+# Keep only Latin/Cyrillic letters when normalizing a label for matching.
+_LETTERS_ONLY_RE = re.compile(r"[^a-zа-яё]+")
 
 
 def _parse_annotation(desc: str) -> tuple[str | None, str | None]:
@@ -68,13 +84,38 @@ def _next_relevant_index(items: list[tuple[float, str]], start: int) -> int | No
 def _normalize_startstop(desc: str) -> str | None:
     if not desc:
         return None
-    stripped = desc.strip()
-    m = STARTSTOP_RE.match(stripped)
+    # Some exports encode Cyrillic as HTML entities ("&#1057;&#1058;..."),
+    # decode them so "СТАРТ"/"СТОП" become matchable.
+    text = html.unescape(str(desc)).strip()
+    if not text:
+        return None
+
+    # Fast path: clean Latin "start"/"stop" (optionally with trailing punct).
+    m = STARTSTOP_RE.match(text)
     if m:
         return m.group(1).lower()
-    cleaned = re.sub(r"[^\w]+", "", stripped.lower())
-    if cleaned in {"start", "stop"}:
-        return cleaned
+
+    # Strip to Latin/Cyrillic letters only, lowercase. Handles "start1",
+    # "стоп.", "СТАРТ " and similar decorations.
+    cleaned = _LETTERS_ONLY_RE.sub("", text.lower())
+    if not cleaned:
+        return None
+    if cleaned in _STARTSTOP_FORMS:
+        return _STARTSTOP_FORMS[cleaned]
+
+    # Tolerate typos (e.g. "страрт", "сторп", "statr") via edit-similarity.
+    # A length guard keeps unrelated condition names from fuzzy-matching.
+    best_label: str | None = None
+    best_ratio = 0.0
+    for form, label in _STARTSTOP_FORMS.items():
+        if abs(len(cleaned) - len(form)) > 2:
+            continue
+        ratio = SequenceMatcher(None, cleaned, form).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_label = label
+    if best_ratio >= _STARTSTOP_FUZZY_THR:
+        return best_label
     return None
 
 
