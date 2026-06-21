@@ -11,9 +11,14 @@ ART_PEAK_WIDTH_MS = None
 # Height range (in V) for artifact peak detection. None to use THRESH-based detection.
 ART_PEAK_HEIGHT = None
 
-# Main band-pass low cutoff for raw preprocessing (Hz). None to skip filtering.
+# Power-line notch base frequency (Hz). The full harmonic comb (base, 2x, 3x,
+# ... up to Nyquist) is removed from the EMG channels. Applied independently of
+# the band-pass below. None to skip notch filtering.
+RAW_NOTCH_FREQ = 50
+# Main band-pass low cutoff for raw preprocessing (Hz). None to skip the low edge.
 RAW_BANDPASS_L_FREQ = 60
-# Main band-pass high cutoff for raw preprocessing (Hz). None to skip filtering.
+# Main band-pass high cutoff for raw preprocessing (Hz). None to skip the high edge.
+# Set both L and H to None to disable band-pass entirely (notch still applies).
 RAW_BANDPASS_H_FREQ = 300
 
 # Enable artifact-reference subtraction before other processing.
@@ -36,6 +41,13 @@ STARTSTOP_TM_SCORE_THR = 0.75
 STARTSTOP_TM_TEMPLATE_CORR_THR = 0.75
 # Time-scale factors tested during template matching.
 STARTSTOP_TM_SCALES = (0.95, 1.0, 1.05, 1.1, 1.2)
+# Restrict template matching to the active response window (onset - pad .. peak2
+# + pad) instead of correlating the full padded template. The flat template
+# tails otherwise overlap neighbouring responses in dense trains and drag the
+# normalized correlation below threshold. False uses the full template.
+STARTSTOP_TM_MATCH_TIGHT_WINDOW = True
+# Padding (ms) added on each side of the onset..peak2 active window.
+STARTSTOP_TM_MATCH_WINDOW_PAD_MS = 15.0
 # Minimum temporal distance between StartStop events (ms).
 STARTSTOP_MIN_DIST_MS = 50.0
 # StartStop epoch start time relative to event (s).

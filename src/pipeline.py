@@ -26,6 +26,7 @@ from .constants import (
     EPOCH_TMAX,
     EPOCH_TMIN,
     MIN_VALID_EPOCHS,
+    RAW_NOTCH_FREQ,
     RAW_BANDPASS_H_FREQ,
     RAW_BANDPASS_L_FREQ,
     RESP_TMAX,
@@ -51,6 +52,8 @@ from .constants import (
     STARTSTOP_MIN_DETECTIONS_PER_CHANNEL,
     STARTSTOP_TM_MATCH_PEAK_MIN_DIST_MS,
     STARTSTOP_TM_MATCH_PEAK_PROMINENCE,
+    STARTSTOP_TM_MATCH_TIGHT_WINDOW,
+    STARTSTOP_TM_MATCH_WINDOW_PAD_MS,
     STARTSTOP_TM_MAX_MATCHES_PER_CHANNEL,
     STARTSTOP_TM_SCALES,
     STARTSTOP_TM_SCORE_THR,
@@ -558,6 +561,8 @@ def _build_template_variants_for_matching(
     template_bank: list[dict[str, object]],
     sfreq: float,
     scales: tuple[float, ...],
+    tight_window: bool = False,
+    pad_ms: float = 15.0,
 ) -> list[dict[str, object]]:
     variants: list[dict[str, object]] = []
     for tpl in template_bank:
@@ -572,6 +577,21 @@ def _build_template_variants_for_matching(
                 continue
             t_var = np.linspace(template_times[0] * scale, template_times[-1] * scale, n_samples)
             base_wave = np.interp(t_var / scale, template_times, template_wave, left=0.0, right=0.0)
+            # Optionally crop to the active response window so the flat template
+            # tails do not correlate against neighbouring responses in trains.
+            if tight_window:
+                lo_m = markers.get("onset", np.nan)
+                hi_m = markers.get("peak2", np.nan)
+                if not np.isfinite(hi_m):
+                    hi_m = markers.get("peak1", np.nan)
+                if np.isfinite(lo_m) and np.isfinite(hi_m):
+                    pad = float(pad_ms) / 1000.0
+                    lo = lo_m * float(scale) - pad
+                    hi = hi_m * float(scale) + pad
+                    crop_mask = (t_var >= lo) & (t_var <= hi)
+                    if int(np.count_nonzero(crop_mask)) >= 5:
+                        t_var = t_var[crop_mask]
+                        base_wave = base_wave[crop_mask]
             for flip in (1, -1):
                 wave = float(flip) * base_wave
                 wave = wave - np.mean(wave)
@@ -860,6 +880,8 @@ def _run_startstop_analysis(
             template_bank=template_bank,
             sfreq=sfreq,
             scales=tuple(float(s) for s in STARTSTOP_TM_SCALES),
+            tight_window=bool(STARTSTOP_TM_MATCH_TIGHT_WINDOW),
+            pad_ms=float(STARTSTOP_TM_MATCH_WINDOW_PAD_MS),
         )
         peaks, peak_matches, peak_discarded = _detect_template_anchor_samples(
             data=data,
@@ -1645,6 +1667,9 @@ def run_pipeline(
     baseline_tmax: float = BASELINE_TMAX,
     resp_tmin: float = RESP_TMIN,
     resp_tmax: float = RESP_TMAX,
+    raw_notch_freq: float | None = RAW_NOTCH_FREQ,
+    raw_bandpass_l_freq: float | None = RAW_BANDPASS_L_FREQ,
+    raw_bandpass_h_freq: float | None = RAW_BANDPASS_H_FREQ,
 ) -> Path:
     edf_path = Path(edf_path)
     if output_dir is None:
@@ -1681,15 +1706,19 @@ def run_pipeline(
     raw.save(original_fif_path, overwrite=True)
     default_art_chans = _resolve_art_channels(raw, ARTCHAN)
     default_art_set = set(default_art_chans)
-    if RAW_BANDPASS_L_FREQ is not None or RAW_BANDPASS_H_FREQ is not None:
-        nyq = raw.info["sfreq"] / 2.0
-        notch_freqs = [f for f in (50, 100, 150, 200, 250, 300) if f < nyq]
-        emg_picks = [ch for ch in raw.ch_names if ch not in default_art_set]
-        if emg_picks:
+    emg_picks = [ch for ch in raw.ch_names if ch not in default_art_set]
+    if emg_picks:
+        # Notch is applied independently of the band-pass: the full power-line
+        # harmonic comb (base .. Nyquist) is removed whenever raw_notch_freq is
+        # set, even when the band-pass is disabled.
+        if raw_notch_freq is not None:
+            nyq = raw.info["sfreq"] / 2.0
+            notch_freqs = list(np.arange(float(raw_notch_freq), nyq, float(raw_notch_freq)))
             if notch_freqs:
                 raw.notch_filter(freqs=notch_freqs, picks=emg_picks, method="fir", phase="zero")
+        if raw_bandpass_l_freq is not None or raw_bandpass_h_freq is not None:
             raw.filter(
-                l_freq=RAW_BANDPASS_L_FREQ, h_freq=RAW_BANDPASS_H_FREQ,
+                l_freq=raw_bandpass_l_freq, h_freq=raw_bandpass_h_freq,
                 picks=emg_picks, method="fir", phase="zero",
             )
     if ARTIFACT_REREF:
