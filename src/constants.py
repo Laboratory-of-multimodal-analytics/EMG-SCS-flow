@@ -91,7 +91,7 @@ STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR = 0.6
 # whose median correlation to the other detections (response window) is below
 # this. Keeps only the mutually-consistent pattern; the dropped epochs vanish
 # from every output (markers, plots, grouped, boxplots, tables). None disables.
-STARTSTOP_EPOCH_MIN_INTERTRIAL_CORR = 0.5
+STARTSTOP_EPOCH_MIN_INTERTRIAL_CORR = 0.6
 # Minimum detections per channel/condition; below this, detections are dropped.
 STARTSTOP_MIN_DETECTIONS_PER_CHANNEL = 5  # if a channel has fewer detections in a condition, discard them (0 = disabled)
 # Skip amplitude/PTP posthoc wipes in StartStop mode.
