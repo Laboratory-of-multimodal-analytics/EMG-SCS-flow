@@ -65,10 +65,24 @@ STARTSTOP_TM_MAX_MATCHES_PER_CHANNEL = 0
 # Keep top-k candidate matches before filtering (0 means keep all).
 STARTSTOP_TM_TOP_K_CANDIDATES = 0
 
+# Save a copy of the analyzed StartStop segment annotated with one marker per
+# detected peak. The marker description is the channel name where the peak was
+# found; peaks found on several channels within the merge window below share a
+# single marker listing all of them (e.g. "ECR L+TR R").
+STARTSTOP_SAVE_DETECTION_MARKERS = True
+# Detections on different channels within this window (ms) are merged into one
+# marker.
+STARTSTOP_DETECTION_MARKER_MERGE_MS = 15.0
+
 # Minimum fraction of valid epochs required to keep a channel.
 STARTSTOP_CHANNEL_MIN_VALID_FRAC = 0.7   # min fraction of epochs with valid p1 for channel to be kept
 # Minimum median epoch-template correlation required per channel.
 STARTSTOP_CHANNEL_MIN_MEDIAN_CORR = 0.7  # min median epoch-template corr; with low valid_frac → wipe channel
+# Minimum median pairwise correlation between a channel's own detected epochs
+# (response window) — channel-level rejection gate. Real stereotyped responses
+# are reproducible across trials; channels firing on irregular EMG bursts are
+# self-inconsistent and get wiped. None disables the gate.
+STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR = 0.6
 # Minimum detections per channel/condition; below this, detections are dropped.
 STARTSTOP_MIN_DETECTIONS_PER_CHANNEL = 5  # if a channel has fewer detections in a condition, discard them (0 = disabled)
 # Skip amplitude/PTP posthoc wipes in StartStop mode.

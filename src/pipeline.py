@@ -45,9 +45,12 @@ from .constants import (
     STIM_CHANNEL_MIN_VALID_FRAC,
     STARTSTOP_MIN_DIST_MS,
     STARTSTOP_MODE,
+    STARTSTOP_SAVE_DETECTION_MARKERS,
+    STARTSTOP_DETECTION_MARKER_MERGE_MS,
     STARTSTOP_LEAKAGE_CORR_REJECTION,
     STARTSTOP_TM_NO_POSTHOC_CHECKS,
     STARTSTOP_CHANNEL_MIN_MEDIAN_CORR,
+    STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR,
     STARTSTOP_CHANNEL_MIN_VALID_FRAC,
     STARTSTOP_MIN_DETECTIONS_PER_CHANNEL,
     STARTSTOP_TM_MATCH_PEAK_MIN_DIST_MS,
@@ -368,6 +371,7 @@ def _resolve_art_channels(
     raw: mne.io.BaseRaw,
     artchan_setting,
     fallback_chans: list[str] | None = None,
+    allow_empty: bool = False,
 ) -> list[str]:
     art_chans: list[str] = []
     if artchan_setting:
@@ -379,7 +383,7 @@ def _resolve_art_channels(
         art_chans = [ch for ch in raw.ch_names if "art" in ch.lower()]
     if not art_chans and fallback_chans:
         art_chans = [ch for ch in fallback_chans if ch in raw.ch_names]
-    if not art_chans:
+    if not art_chans and not allow_empty:
         raise ValueError("No artifact channel found. Set ARTCHAN or name channel with 'art'.")
     return art_chans
 
@@ -848,6 +852,7 @@ def _run_startstop_analysis(
     group_store_by_condition = defaultdict(lambda: defaultdict(list))
     grouped_times = None
     all_results_rows: list[dict[str, object]] = []
+    channel_qc_rows: list[dict[str, object]] = []
     template_match_rows: list[dict[str, object]] = []
     template_discard_rows: list[dict[str, object]] = []
     channel_template_rows: list[dict[str, object]] = []
@@ -954,6 +959,18 @@ def _run_startstop_analysis(
             by_sample[int(m["anchor_sample"])].append(m)
         peak_matches_merged = [max(g, key=lambda x: float(x["score"])) for g in by_sample.values()]
         peak_matches_sorted = sorted(peak_matches_merged, key=lambda m: int(m["anchor_sample"]))
+        # Drop anchors too close to the segment edges so mne.Epochs does not
+        # silently discard epochs — otherwise epoch position no longer matches
+        # peak_matches_sorted / event_samples and every downstream per-epoch
+        # channel/template assignment is shifted.
+        n_seg = int(start_raw.n_times)
+        lo_guard = int(np.ceil(abs(STARTSTOP_EPOCH_TMIN) * sfreq)) + 1
+        hi_guard = n_seg - int(np.ceil(abs(STARTSTOP_EPOCH_TMAX) * sfreq)) - 1
+        peak_matches_sorted = [
+            m for m in peak_matches_sorted if lo_guard <= int(m["anchor_sample"]) <= hi_guard
+        ]
+        if not peak_matches_sorted:
+            continue
         event_samples = np.asarray([int(m["anchor_sample"]) for m in peak_matches_sorted], dtype=int)
         events = np.column_stack(
             [
@@ -1338,6 +1355,7 @@ def _run_startstop_analysis(
 
             corrs = []
             valid_flags = []
+            valid_segs: list[np.ndarray] = []
             for e in entries:
                 ep = e["ep"]
                 is_valid = not np.isnan(e["p1"])
@@ -1354,15 +1372,56 @@ def _run_startstop_analysis(
                         c = 0.0
                     corrs.append(c)
 
+                if is_valid and np.std(seg) > 0:
+                    valid_segs.append(seg - np.mean(seg))
+
             valid_fraction = np.mean(valid_flags) if len(valid_flags) else 0.0
             median_corr = float(np.median(corrs)) if len(corrs) else 0.0
+
+            # Inter-trial self-consistency: median pairwise correlation between
+            # the channel's own valid epochs. Real responses repeat the same
+            # shape; channels firing on irregular EMG bursts are inconsistent.
+            intertrial_corr = np.nan
+            if len(valid_segs) >= 3:
+                corr_mat = np.corrcoef(np.vstack(valid_segs))
+                iu = np.triu_indices(len(valid_segs), 1)
+                pair_vals = corr_mat[iu]
+                pair_vals = pair_vals[np.isfinite(pair_vals)]
+                if pair_vals.size:
+                    intertrial_corr = float(np.median(pair_vals))
 
             # Keep the original conservative gate, and add a stricter low-corr
             # guard for borderline channels: moderate valid fraction can still
             # be dominated by mismatched shape when template similarity is very low.
             low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
             borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
-            if low_valid_low_corr or borderline_valid_very_low_corr:
+            reject_intertrial = (
+                STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR is not None
+                and len(valid_segs) >= 3
+                and np.isfinite(intertrial_corr)
+                and intertrial_corr < float(STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR)
+            )
+            wiped = bool(low_valid_low_corr or borderline_valid_very_low_corr or reject_intertrial)
+            channel_qc_rows.append(
+                {
+                    "Condition": str(condition),
+                    "Channel": str(ch),
+                    "n_epochs": len(entries),
+                    "n_valid": int(np.sum(valid_flags)) if len(valid_flags) else 0,
+                    "valid_fraction": float(valid_fraction),
+                    "median_template_corr": float(median_corr),
+                    "intertrial_corr": float(intertrial_corr),
+                    "n_intertrial_segs": len(valid_segs),
+                    "wiped": wiped,
+                    "wipe_reason": (
+                        "intertrial" if reject_intertrial
+                        else "low_valid_low_corr" if low_valid_low_corr
+                        else "borderline_low_corr" if borderline_valid_very_low_corr
+                        else ""
+                    ),
+                }
+            )
+            if wiped:
                 for e in entries:
                     e["onset"] = np.nan
                     e["p1"] = np.nan
@@ -1419,6 +1478,50 @@ def _run_startstop_analysis(
                 if not np.isnan(e["p1"]):
                     detected_channels_by_epoch[e["ep"]].append(ch)
 
+        # Save the analyzed segment annotated with one marker per detected peak.
+        # Peaks on different channels within the merge window collapse into one
+        # marker whose description lists every channel they were found on.
+        if STARTSTOP_SAVE_DETECTION_MARKERS and detected_channels_by_epoch:
+            merge_tol = float(STARTSTOP_DETECTION_MARKER_MERGE_MS) / 1000.0
+            dets: list[tuple[float, str]] = []
+            for ep_idx, ch_list in detected_channels_by_epoch.items():
+                ev_t = float(event_samples[ep_idx]) / sfreq
+                for ch in ch_list:
+                    p1 = p1_by_epoch_channel.get(ep_idx, {}).get(ch, np.nan)
+                    peak_t = ev_t + (float(p1) if np.isfinite(p1) else 0.0)
+                    dets.append((peak_t, ch))
+            dets.sort(key=lambda x: x[0])
+
+            onsets: list[float] = []
+            descs: list[str] = []
+            cur_times: list[float] = []
+            cur_chs: list[str] = []
+            for t, ch in dets:
+                if cur_times and (t - cur_times[-1]) > merge_tol:
+                    onsets.append(float(np.mean(cur_times)))
+                    descs.append("+".join(sorted(set(cur_chs))))
+                    cur_times, cur_chs = [], []
+                cur_times.append(t)
+                cur_chs.append(ch)
+            if cur_times:
+                onsets.append(float(np.mean(cur_times)))
+                descs.append("+".join(sorted(set(cur_chs))))
+
+            if onsets:
+                det_raw = start_raw.copy()
+                det_raw.set_annotations(
+                    mne.Annotations(
+                        onset=onsets,
+                        duration=[0.0] * len(onsets),
+                        description=descs,
+                    )
+                )
+                det_dir = startstop_dir / "Detections raw"
+                det_dir.mkdir(parents=True, exist_ok=True)
+                det_raw.save(
+                    det_dir / f"{safe_condition}_detections_raw.fif", overwrite=True
+                )
+
         if detected_channels_by_epoch and has_any_detection:
             raw_epochs_dir = paths["raw_epochs_dir"] / safe_condition
             raw_epochs_dir.mkdir(parents=True, exist_ok=True)
@@ -1434,9 +1537,14 @@ def _run_startstop_analysis(
             )
             wide_times = epochs_wide.times
             wide_data = epochs_wide.get_data()
+            # epochs_wide uses a wider window and may drop more boundary events
+            # than the narrow epochs, so map narrow epoch index -> wide position
+            # via its selection instead of indexing wide_data by ep_idx directly.
+            wide_pos_by_orig = {int(o): i for i, o in enumerate(epochs_wide.selection)}
 
             for ep_idx, ch_list in detected_channels_by_epoch.items():
-                if ep_idx >= wide_data.shape[0]:
+                wpos = wide_pos_by_orig.get(int(ep_idx))
+                if wpos is None:
                     continue
                 max_abs = None
                 for ch in ch_list:
@@ -1447,18 +1555,18 @@ def _run_startstop_analysis(
                     win_mask = np.abs(wide_times - p1_t) <= 0.05
                     if not np.any(win_mask):
                         continue
-                    val = float(np.nanmax(np.abs(wide_data[ep_idx, ch_idx, win_mask])))
+                    val = float(np.nanmax(np.abs(wide_data[wpos, ch_idx, win_mask])))
                     if max_abs is None or val > max_abs:
                         max_abs = val
                 if max_abs is None:
-                    max_abs = float(np.nanmax(np.abs(wide_data[ep_idx]))) if wide_data.size else 0.0
+                    max_abs = float(np.nanmax(np.abs(wide_data[wpos]))) if wide_data.size else 0.0
                 scale = (max_abs * 2.5) if max_abs > 0 else None
                 safe_chs = [re.sub(r"[^\w\-_\. ]", "_", str(ch)) for ch in ch_list]
                 ch_suffix = "+".join(safe_chs)
                 if len(ch_suffix) > 80:
                     ch_suffix = f"{ch_suffix[:77]}..."
                 out_path = raw_epochs_dir / f"epoch_{ep_idx:03d}__{ch_suffix}.png"
-                fig = epochs_wide[ep_idx].plot(
+                fig = epochs_wide[wpos].plot(
                     picks=ch_names,
                     scalings={"eeg": scale} if scale is not None else None,
                     show=False,
@@ -1519,6 +1627,10 @@ def _run_startstop_analysis(
     if channel_template_rows:
         pd.DataFrame(channel_template_rows).to_csv(
             excel_dir / "STARTSTOP_channel_template_selection.csv", index=False
+        )
+    if channel_qc_rows:
+        pd.DataFrame(channel_qc_rows).to_csv(
+            excel_dir / "STARTSTOP_channel_qc.csv", index=False
         )
 
     if not all_results_rows:
@@ -1704,7 +1816,10 @@ def run_pipeline(
 
     original_fif_path = paths["data_dir"] / f"{edf_path.stem}_original_raw.fif"
     raw.save(original_fif_path, overwrite=True)
-    default_art_chans = _resolve_art_channels(raw, ARTCHAN)
+    # StartStop detection does not need a stimulus/artifact channel (template
+    # matching runs directly on the EMG). Allow art-less recordings there; SIR
+    # still requires one for stimulus-onset detection.
+    default_art_chans = _resolve_art_channels(raw, ARTCHAN, allow_empty=use_startstop)
     default_art_set = set(default_art_chans)
     emg_picks = [ch for ch in raw.ch_names if ch not in default_art_set]
     if emg_picks:
@@ -1721,9 +1836,9 @@ def run_pipeline(
                 l_freq=raw_bandpass_l_freq, h_freq=raw_bandpass_h_freq,
                 picks=emg_picks, method="fir", phase="zero",
             )
-    if ARTIFACT_REREF:
+    if ARTIFACT_REREF and default_art_chans:
         _apply_artifact_reref(raw, default_art_chans)
-    if CAR_REREF:
+    if CAR_REREF and default_art_chans:
         _apply_car_reref(raw, default_art_chans)
 
     preproc_path = paths["data_dir"] / f"{edf_path.stem}_preprocessed_raw.fif"
