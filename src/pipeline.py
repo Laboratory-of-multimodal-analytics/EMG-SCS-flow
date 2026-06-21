@@ -51,6 +51,7 @@ from .constants import (
     STARTSTOP_TM_NO_POSTHOC_CHECKS,
     STARTSTOP_CHANNEL_MIN_MEDIAN_CORR,
     STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR,
+    STARTSTOP_EPOCH_MIN_INTERTRIAL_CORR,
     STARTSTOP_CHANNEL_MIN_VALID_FRAC,
     STARTSTOP_MIN_DETECTIONS_PER_CHANNEL,
     STARTSTOP_TM_MATCH_PEAK_MIN_DIST_MS,
@@ -1355,7 +1356,7 @@ def _run_startstop_analysis(
 
             corrs = []
             valid_flags = []
-            valid_segs: list[np.ndarray] = []
+            valid_items: list[tuple[dict, np.ndarray]] = []
             for e in entries:
                 ep = e["ep"]
                 is_valid = not np.isnan(e["p1"])
@@ -1373,7 +1374,7 @@ def _run_startstop_analysis(
                     corrs.append(c)
 
                 if is_valid and np.std(seg) > 0:
-                    valid_segs.append(seg - np.mean(seg))
+                    valid_items.append((e, seg - np.mean(seg)))
 
             valid_fraction = np.mean(valid_flags) if len(valid_flags) else 0.0
             median_corr = float(np.median(corrs)) if len(corrs) else 0.0
@@ -1382,9 +1383,10 @@ def _run_startstop_analysis(
             # the channel's own valid epochs. Real responses repeat the same
             # shape; channels firing on irregular EMG bursts are inconsistent.
             intertrial_corr = np.nan
-            if len(valid_segs) >= 3:
-                corr_mat = np.corrcoef(np.vstack(valid_segs))
-                iu = np.triu_indices(len(valid_segs), 1)
+            corr_mat = None
+            if len(valid_items) >= 3:
+                corr_mat = np.corrcoef(np.vstack([s for _e, s in valid_items]))
+                iu = np.triu_indices(len(valid_items), 1)
                 pair_vals = corr_mat[iu]
                 pair_vals = pair_vals[np.isfinite(pair_vals)]
                 if pair_vals.size:
@@ -1397,11 +1399,42 @@ def _run_startstop_analysis(
             borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
             reject_intertrial = (
                 STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR is not None
-                and len(valid_segs) >= 3
+                and len(valid_items) >= 3
                 and np.isfinite(intertrial_corr)
                 and intertrial_corr < float(STARTSTOP_CHANNEL_MIN_INTERTRIAL_CORR)
             )
             wiped = bool(low_valid_low_corr or borderline_valid_very_low_corr or reject_intertrial)
+            n_epoch_dropped = 0
+            if wiped:
+                for e in entries:
+                    e["onset"] = np.nan
+                    e["p1"] = np.nan
+                    e["p2"] = np.nan
+                    e["pv1"] = np.nan
+                    e["pv2"] = np.nan
+                    e["ptp"] = np.nan
+            elif (
+                STARTSTOP_EPOCH_MIN_INTERTRIAL_CORR is not None
+                and corr_mat is not None
+                and len(valid_items) >= 3
+            ):
+                # Per-epoch consistency: drop individual detections that do not
+                # correlate with the consensus of the others, so only the
+                # mutually-consistent pattern survives in every output.
+                thr_ep = float(STARTSTOP_EPOCH_MIN_INTERTRIAL_CORR)
+                n_items = len(valid_items)
+                for i, (e, _seg) in enumerate(valid_items):
+                    others = corr_mat[i, np.arange(n_items) != i]
+                    others = others[np.isfinite(others)]
+                    ep_corr = float(np.median(others)) if others.size else 0.0
+                    if ep_corr < thr_ep:
+                        e["onset"] = np.nan
+                        e["p1"] = np.nan
+                        e["p2"] = np.nan
+                        e["pv1"] = np.nan
+                        e["pv2"] = np.nan
+                        e["ptp"] = np.nan
+                        n_epoch_dropped += 1
             channel_qc_rows.append(
                 {
                     "Condition": str(condition),
@@ -1411,7 +1444,8 @@ def _run_startstop_analysis(
                     "valid_fraction": float(valid_fraction),
                     "median_template_corr": float(median_corr),
                     "intertrial_corr": float(intertrial_corr),
-                    "n_intertrial_segs": len(valid_segs),
+                    "n_intertrial_segs": len(valid_items),
+                    "n_epoch_consistency_dropped": int(n_epoch_dropped),
                     "wiped": wiped,
                     "wipe_reason": (
                         "intertrial" if reject_intertrial
@@ -1421,14 +1455,6 @@ def _run_startstop_analysis(
                     ),
                 }
             )
-            if wiped:
-                for e in entries:
-                    e["onset"] = np.nan
-                    e["p1"] = np.nan
-                    e["p2"] = np.nan
-                    e["pv1"] = np.nan
-                    e["pv2"] = np.nan
-                    e["ptp"] = np.nan
 
             for e in entries:
                 latency_markers[ch].append(
