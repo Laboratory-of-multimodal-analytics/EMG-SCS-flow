@@ -532,6 +532,40 @@ def plot_burst_envelopes_overlay(
     plt.close(fig)
 
 
+def plot_burst_envelopes_by_channel(
+    bursts_by_ch: dict[str, list[dict]],
+    out_path: Path,
+    title: str,
+) -> None:
+    """One figure, one subplot per channel; within each, overlay that channel's
+    burst RMS envelopes aligned to burst onset. Only channels with bursts.
+
+    `bursts_by_ch[ch]` is a list of dicts with keys: t_rel (s), env (µV).
+    """
+    channels = [ch for ch, bl in bursts_by_ch.items() if bl]
+    if not channels:
+        return
+    n = len(channels)
+    fig, axes = plt.subplots(n, 1, figsize=(12, 2.2 * n), dpi=300, sharex=True)
+    if n == 1:
+        axes = [axes]
+    cmap = matplotlib.cm.get_cmap("tab10")
+    for ax, ch in zip(axes, channels):
+        for i, b in enumerate(bursts_by_ch[ch]):
+            ax.plot(b["t_rel"], b["env"], color=cmap(i % 10), linewidth=1.6,
+                    label=f"burst {i + 1}")
+        ax.set_title(str(ch), fontsize=9)
+        ax.set_ylabel("RMS µV", fontsize=8)
+        ax.legend(loc="upper right", fontsize=7, frameon=False)
+        ax.grid(False)
+    axes[-1].set_xlabel("Time from burst onset (s)")
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
 def plot_spontaneous_boxplots(
     detailed_df: pd.DataFrame,
     out_path: Path,
