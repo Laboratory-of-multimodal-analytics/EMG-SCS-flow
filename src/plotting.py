@@ -470,6 +470,42 @@ def plot_spontaneous_overview(
     plt.close(fig)
 
 
+def plot_envelopes_per_channel(
+    env_times: np.ndarray,
+    env_by_ch: dict[str, np.ndarray],
+    bursts_by_ch: dict[str, list[tuple[float, float]]],
+    out_path: Path,
+    title: str,
+) -> None:
+    """One subplot per channel (full RMS envelope, µV), burst windows shaded.
+
+    Only the channels present in `env_by_ch` are drawn (caller passes the
+    channels that have bursts).
+    """
+    channels = list(env_by_ch.keys())
+    if not channels:
+        return
+    n = len(channels)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 1.9 * n), dpi=300, sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ax, ch in zip(axes, channels):
+        ax.plot(env_times, env_by_ch[ch], color="tab:red", linewidth=1.4)
+        for bi, (t0, t1) in enumerate(bursts_by_ch.get(ch, [])):
+            ax.axvspan(t0, t1, color="tab:orange", alpha=0.18,
+                       label="burst" if bi == 0 else None)
+        ax.set_ylabel(f"{ch}\nRMS µV", fontsize=8)
+        ax.grid(False)
+        if bursts_by_ch.get(ch):
+            ax.legend(loc="upper right", fontsize=7, frameon=False)
+    axes[-1].set_xlabel("Time (s)")
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
 def plot_burst_envelopes_overlay(
     bursts: list[dict],
     out_path: Path,
