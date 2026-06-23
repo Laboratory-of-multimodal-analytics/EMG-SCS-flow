@@ -68,8 +68,12 @@ SPONTANEOUS_EMG_BURST_MIN_PEAK_UV = 60.0
 # Baseline / peak percentiles of the envelope used for thresholding (robust).
 SPONTANEOUS_EMG_BURST_BASELINE_PCT = 20.0
 SPONTANEOUS_EMG_BURST_PEAK_PCT = 99.0
-# Burst threshold = baseline + frac * (peak - baseline).
+# Burst threshold = baseline + frac * (peak - baseline). Defines burst EXTENT.
 SPONTANEOUS_EMG_BURST_THRESH_FRAC = 0.30
+# Hysteresis: a detected burst is KEPT only if its envelope peak reaches at least
+# baseline + keep_frac * (peak - baseline). Removes weak bumps that briefly cross
+# the (low) extent threshold without standing out. Must be >= THRESH_FRAC.
+SPONTANEOUS_EMG_BURST_KEEP_FRAC = 0.50
 # Minimum burst duration (ms); shorter above-threshold runs are dropped.
 SPONTANEOUS_EMG_BURST_MIN_MS = 300.0
 # Above-threshold runs separated by a gap shorter than this (ms) are merged.
