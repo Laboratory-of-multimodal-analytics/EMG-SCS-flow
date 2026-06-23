@@ -25,6 +25,14 @@ from .constants import (
     SPONTANEOUS_EMG_WINDOW_MS,
     SPONTANEOUS_EMG_ENV_HOP_MS,
     SPONTANEOUS_EMG_UV_SCALE,
+    SPONTANEOUS_EMG_BURST_DETECTION,
+    SPONTANEOUS_EMG_BURST_MIN_SNR,
+    SPONTANEOUS_EMG_BURST_MIN_PEAK_UV,
+    SPONTANEOUS_EMG_BURST_BASELINE_PCT,
+    SPONTANEOUS_EMG_BURST_PEAK_PCT,
+    SPONTANEOUS_EMG_BURST_THRESH_FRAC,
+    SPONTANEOUS_EMG_BURST_MIN_MS,
+    SPONTANEOUS_EMG_BURST_MERGE_MS,
     BASELINE_TMAX,
     BASELINE_TMIN,
     EPOCH_TMAX,
@@ -100,6 +108,8 @@ from .plotting import (
     plot_template_overlay_panel,
     plot_spontaneous_overview,
     plot_envelopes_overlay,
+    plot_burst_envelopes_overlay,
+    plot_spontaneous_boxplots,
 )
 
 
@@ -843,6 +853,55 @@ def _moving_rms_envelope(x: np.ndarray, sfreq: float, window_ms: float, hop_ms: 
     return np.asarray(centers), np.asarray(env)
 
 
+def _detect_bursts_on_envelope(env_times: np.ndarray, env_uv: np.ndarray):
+    """Detect activity bursts on an RMS envelope (µV).
+
+    Returns a list of (t_start, t_end) seconds. Empty when the channel has no
+    clear bursts (envelope peak not sufficiently above baseline).
+    """
+    if env_uv.size < 3:
+        return []
+    baseline = float(np.percentile(env_uv, SPONTANEOUS_EMG_BURST_BASELINE_PCT))
+    peak = float(np.percentile(env_uv, SPONTANEOUS_EMG_BURST_PEAK_PCT))
+    base_floor = max(baseline, 1e-9)
+    if peak < SPONTANEOUS_EMG_BURST_MIN_PEAK_UV:
+        return []  # below absolute amplitude floor — treat as inactive channel
+    if peak < SPONTANEOUS_EMG_BURST_MIN_SNR * base_floor:
+        return []  # no clear excursion above baseline — no bursts
+    thr = baseline + SPONTANEOUS_EMG_BURST_THRESH_FRAC * (peak - baseline)
+
+    above = env_uv > thr
+    if not np.any(above):
+        return []
+    # contiguous above-threshold runs (in envelope-sample units)
+    edges = np.diff(above.astype(int))
+    starts = list(np.where(edges == 1)[0] + 1)
+    ends = list(np.where(edges == -1)[0] + 1)
+    if above[0]:
+        starts = [0] + starts
+    if above[-1]:
+        ends = ends + [above.size]
+    runs = list(zip(starts, ends))  # [start_idx, end_idx)
+
+    # merge runs separated by a gap shorter than merge_ms
+    merge_s = SPONTANEOUS_EMG_BURST_MERGE_MS / 1000.0
+    merged: list[list[int]] = []
+    for s, e in runs:
+        if merged and (env_times[s] - env_times[merged[-1][1] - 1]) <= merge_s:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+
+    min_s = SPONTANEOUS_EMG_BURST_MIN_MS / 1000.0
+    bursts = []
+    for s, e in merged:
+        t0 = float(env_times[s])
+        t1 = float(env_times[min(e, env_times.size) - 1])
+        if (t1 - t0) >= min_s:
+            bursts.append((t0, t1))
+    return bursts
+
+
 def _run_spontaneous_emg_analysis(
     start_raw: mne.io.BaseRaw,
     ch_names: list[str],
@@ -870,12 +929,21 @@ def _run_spontaneous_emg_analysis(
     excel_dir = out_dir / "Excel"
     for d in (plots_dir, env_dir, excel_dir):
         d.mkdir(parents=True, exist_ok=True)
+    # Clear stale per-burst/per-channel outputs from previous runs so the folder
+    # only reflects the current detection.
+    for old in list(env_dir.glob("*.txt")) + list(plots_dir.glob("*.png")):
+        old.unlink()
 
     sig_by_ch: dict[str, np.ndarray] = {}
     env_by_ch: dict[str, np.ndarray] = {}
     env_times = None
     detailed_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
+    bursts_by_ch: dict[str, list[tuple[float, float]]] = {}
+    burst_overlay: list[dict] = []   # per-burst envelopes for the overlay plot
+    burst_rows: list[dict[str, object]] = []
+
+    safe_condition = re.sub(r"[^\w\-\+\. ]", "_", str(condition))
 
     for ci, ch in enumerate(ch_names):
         x = np.asarray(data[ci], dtype=float)
@@ -888,14 +956,31 @@ def _run_spontaneous_emg_analysis(
         env_uv = env * uv
         env_by_ch[ch] = env_uv
         env_times = et
-
-        # Per-channel envelope .txt (time_s, rms_uV) so envelopes can be re-overlaid.
         safe_ch = re.sub(r"[^\w\-_\. ]", "_", str(ch))
-        np.savetxt(
-            env_dir / f"{safe_ch}_rms_envelope.txt",
-            np.column_stack([et, env_uv]),
-            header="time_s\trms_uV", delimiter="\t", comments="",
-        )
+
+        # Burst detection on the envelope. Only channels with bursts get per-burst
+        # envelope .txt files and contribute to the burst overlay.
+        if SPONTANEOUS_EMG_BURST_DETECTION:
+            bursts = _detect_bursts_on_envelope(et, env_uv)
+            if bursts:
+                bursts_by_ch[ch] = bursts
+                for bk, (t0, t1) in enumerate(bursts, start=1):
+                    m = (et >= t0) & (et <= t1)
+                    t_rel = et[m] - t0
+                    seg = env_uv[m]
+                    np.savetxt(
+                        env_dir / f"{safe_ch}_burst{bk}_rms_envelope.txt",
+                        np.column_stack([t_rel, seg]),
+                        header="time_from_onset_s\trms_uV", delimiter="\t", comments="",
+                    )
+                    burst_overlay.append({"label": f"{ch} #{bk}", "t_rel": t_rel, "env": seg})
+                    burst_rows.append({
+                        "Condition": str(condition), "Channel": str(ch), "Burst": bk,
+                        "Start_s": float(t0), "End_s": float(t1),
+                        "Duration_s": float(t1 - t0),
+                        "RMS_mean_uV": float(np.mean(seg)) if seg.size else np.nan,
+                        "RMS_peak_uV": float(np.max(seg)) if seg.size else np.nan,
+                    })
 
         for wi, (tc, r, a) in enumerate(zip(centers, rms_uv, amp_uv)):
             detailed_rows.append({
@@ -909,6 +994,7 @@ def _run_spontaneous_emg_analysis(
         sem_amp = float(np.std(amp_uv, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
         summary_rows.append({
             "Condition": str(condition), "Channel": str(ch), "n_windows": n,
+            "n_bursts": len(bursts_by_ch.get(ch, [])),
             "RMS_mean_uV": float(np.mean(rms_uv)) if n else np.nan,
             "RMS_std_uV": float(np.std(rms_uv, ddof=1)) if n > 1 else np.nan,
             "RMS_sem_uV": sem_rms,
@@ -919,26 +1005,41 @@ def _run_spontaneous_emg_analysis(
 
     summary_df = pd.DataFrame(summary_rows)
     detailed_df = pd.DataFrame(detailed_rows)
-    safe_condition = re.sub(r"[^\w\-\+\. ]", "_", str(condition))
+    bursts_df = pd.DataFrame(burst_rows)
     xlsx_path = excel_dir / f"Spontaneous_EMG_{safe_condition}.xlsx"
     with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
         detailed_df.to_excel(writer, sheet_name="Detailed", index=False)
+        if not bursts_df.empty:
+            bursts_df.to_excel(writer, sheet_name="Bursts", index=False)
     summary_df.to_csv(excel_dir / f"Spontaneous_EMG_summary_{safe_condition}.csv", index=False)
     detailed_df.to_csv(excel_dir / f"Spontaneous_EMG_detailed_{safe_condition}.csv", index=False)
+    if not bursts_df.empty:
+        bursts_df.to_csv(excel_dir / f"Spontaneous_EMG_bursts_{safe_condition}.csv", index=False)
 
     plot_spontaneous_overview(
         times=times, ch_names=ch_names, sig_by_ch=sig_by_ch,
         env_times=env_times if env_times is not None else np.array([]),
         env_by_ch=env_by_ch,
         out_path=plots_dir / "overview_raw_with_envelope.png",
-        title=f"Spontaneous EMG — raw + RMS envelope | {condition}",
+        title=f"Spontaneous EMG — raw + RMS envelope + bursts | {condition}",
+        bursts_by_ch=bursts_by_ch,
     )
     plot_envelopes_overlay(
         env_times=env_times if env_times is not None else np.array([]),
         env_by_ch=env_by_ch,
-        out_path=plots_dir / "envelopes_overlay.png",
-        title=f"Spontaneous EMG — RMS envelopes overlay | {condition}",
+        out_path=plots_dir / "envelopes_overlay_all_channels.png",
+        title=f"Spontaneous EMG — full RMS envelopes (all channels) | {condition}",
+    )
+    plot_burst_envelopes_overlay(
+        bursts=burst_overlay,
+        out_path=plots_dir / "burst_envelopes_overlay.png",
+        title=f"Spontaneous EMG — per-burst RMS envelopes (aligned to onset) | {condition}",
+    )
+    plot_spontaneous_boxplots(
+        detailed_df=detailed_df,
+        out_path=plots_dir / "boxplots_rms_amplitude.png",
+        title=f"Spontaneous EMG — per-window RMS / amplitude by channel | {condition}",
     )
 
 
