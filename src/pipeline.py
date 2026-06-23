@@ -32,6 +32,7 @@ from .constants import (
     SPONTANEOUS_EMG_BURST_BASELINE_PCT,
     SPONTANEOUS_EMG_BURST_PEAK_PCT,
     SPONTANEOUS_EMG_BURST_THRESH_FRAC,
+    SPONTANEOUS_EMG_BURST_KEEP_FRAC,
     SPONTANEOUS_EMG_BURST_MIN_MS,
     SPONTANEOUS_EMG_BURST_MERGE_MS,
     BASELINE_TMAX,
@@ -894,11 +895,16 @@ def _detect_bursts_on_envelope(env_times: np.ndarray, env_uv: np.ndarray):
             merged.append([s, e])
 
     min_s = SPONTANEOUS_EMG_BURST_MIN_MS / 1000.0
+    keep_level = baseline + SPONTANEOUS_EMG_BURST_KEEP_FRAC * (peak - baseline)
     bursts = []
     for s, e in merged:
         t0 = float(env_times[s])
         t1 = float(env_times[min(e, env_times.size) - 1])
-        if (t1 - t0) >= min_s:
+        if (t1 - t0) < min_s:
+            continue
+        seg = env_uv[s:min(e, env_uv.size)]
+        # Hysteresis: keep only bursts whose peak clears the higher keep level.
+        if seg.size and float(np.max(seg)) >= keep_level:
             bursts.append((t0, t1))
     return bursts
 
