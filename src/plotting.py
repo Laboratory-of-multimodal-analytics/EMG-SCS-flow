@@ -446,7 +446,9 @@ def plot_spontaneous_overview(
     """
     bursts_by_ch = bursts_by_ch or {}
     n = len(ch_names)
-    fig, axes = plt.subplots(n, 1, figsize=(14, 1.8 * n), dpi=300, sharex=True)
+    # Very wide so the time axis is stretched out (intended to be viewed
+    # full-screen / scrolled horizontally).
+    fig, axes = plt.subplots(n, 1, figsize=(40, 1.7 * n), dpi=200, sharex=True)
     if n == 1:
         axes = [axes]
     for ax, ch in zip(axes, ch_names):
@@ -546,7 +548,9 @@ def plot_burst_envelopes_by_channel(
     if not channels:
         return
     n = len(channels)
-    fig, axes = plt.subplots(n, 1, figsize=(12, 2.2 * n), dpi=300, sharex=True)
+    # Each channel keeps its own time scale (sharex=False) so short bursts are
+    # not squashed by a long burst on another channel.
+    fig, axes = plt.subplots(n, 1, figsize=(12, 2.4 * n), dpi=300, sharex=False)
     if n == 1:
         axes = [axes]
     cmap = matplotlib.cm.get_cmap("tab10")
@@ -556,10 +560,10 @@ def plot_burst_envelopes_by_channel(
                     label=f"burst {i + 1}")
         ax.set_title(str(ch), fontsize=9)
         ax.set_ylabel("RMS µV", fontsize=8)
+        ax.set_xlabel("Time from burst centre (s)", fontsize=8)
         ax.axvline(0.0, color="0.6", linewidth=0.8, linestyle=":")
         ax.legend(loc="upper right", fontsize=7, frameon=False)
         ax.grid(False)
-    axes[-1].set_xlabel("Time from burst centre (s)")
     plt.suptitle(title)
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     out_path.parent.mkdir(parents=True, exist_ok=True)
