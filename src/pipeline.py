@@ -107,7 +107,7 @@ from .plotting import (
     plot_template_with_markers,
     plot_template_overlay_panel,
     plot_spontaneous_overview,
-    plot_envelopes_overlay,
+    plot_envelopes_per_channel,
     plot_burst_envelopes_overlay,
     plot_spontaneous_boxplots,
 )
@@ -1025,11 +1025,13 @@ def _run_spontaneous_emg_analysis(
         title=f"Spontaneous EMG — raw + RMS envelope + bursts | {condition}",
         bursts_by_ch=bursts_by_ch,
     )
-    plot_envelopes_overlay(
+    env_bursty = {ch: env_by_ch[ch] for ch in ch_names if ch in bursts_by_ch}
+    plot_envelopes_per_channel(
         env_times=env_times if env_times is not None else np.array([]),
-        env_by_ch=env_by_ch,
-        out_path=plots_dir / "envelopes_overlay_all_channels.png",
-        title=f"Spontaneous EMG — full RMS envelopes (all channels) | {condition}",
+        env_by_ch=env_bursty,
+        bursts_by_ch=bursts_by_ch,
+        out_path=plots_dir / "envelopes_by_channel.png",
+        title=f"Spontaneous EMG — RMS envelope per channel (bursty channels) | {condition}",
     )
     plot_burst_envelopes_overlay(
         bursts=burst_overlay,
