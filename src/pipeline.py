@@ -107,8 +107,8 @@ from .plotting import (
     plot_template_with_markers,
     plot_template_overlay_panel,
     plot_spontaneous_overview,
-    plot_envelopes_per_channel,
-    plot_burst_envelopes_overlay,
+    plot_envelopes_overlay,
+    plot_burst_envelopes_by_channel,
     plot_spontaneous_boxplots,
 )
 
@@ -940,7 +940,7 @@ def _run_spontaneous_emg_analysis(
     detailed_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
     bursts_by_ch: dict[str, list[tuple[float, float]]] = {}
-    burst_overlay: list[dict] = []   # per-burst envelopes for the overlay plot
+    burst_env_by_ch: dict[str, list[dict]] = defaultdict(list)  # per-channel burst envelopes
     burst_rows: list[dict[str, object]] = []
 
     safe_condition = re.sub(r"[^\w\-\+\. ]", "_", str(condition))
@@ -973,7 +973,7 @@ def _run_spontaneous_emg_analysis(
                         np.column_stack([t_rel, seg]),
                         header="time_from_onset_s\trms_uV", delimiter="\t", comments="",
                     )
-                    burst_overlay.append({"label": f"{ch} #{bk}", "t_rel": t_rel, "env": seg})
+                    burst_env_by_ch[ch].append({"t_rel": t_rel, "env": seg})
                     burst_rows.append({
                         "Condition": str(condition), "Channel": str(ch), "Burst": bk,
                         "Start_s": float(t0), "End_s": float(t1),
@@ -1025,18 +1025,16 @@ def _run_spontaneous_emg_analysis(
         title=f"Spontaneous EMG — raw + RMS envelope + bursts | {condition}",
         bursts_by_ch=bursts_by_ch,
     )
-    env_bursty = {ch: env_by_ch[ch] for ch in ch_names if ch in bursts_by_ch}
-    plot_envelopes_per_channel(
+    plot_envelopes_overlay(
         env_times=env_times if env_times is not None else np.array([]),
-        env_by_ch=env_bursty,
-        bursts_by_ch=bursts_by_ch,
-        out_path=plots_dir / "envelopes_by_channel.png",
-        title=f"Spontaneous EMG — RMS envelope per channel (bursty channels) | {condition}",
+        env_by_ch=env_by_ch,
+        out_path=plots_dir / "envelopes_overlay_all_channels.png",
+        title=f"Spontaneous EMG — full RMS envelopes (all channels) | {condition}",
     )
-    plot_burst_envelopes_overlay(
-        bursts=burst_overlay,
-        out_path=plots_dir / "burst_envelopes_overlay.png",
-        title=f"Spontaneous EMG — per-burst RMS envelopes (aligned to onset) | {condition}",
+    plot_burst_envelopes_by_channel(
+        bursts_by_ch=dict(burst_env_by_ch),
+        out_path=plots_dir / "burst_envelopes_by_channel.png",
+        title=f"Spontaneous EMG — burst RMS envelopes per channel (aligned to onset) | {condition}",
     )
     plot_spontaneous_boxplots(
         detailed_df=detailed_df,
