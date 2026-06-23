@@ -21,6 +21,10 @@ from .constants import (
     CAR_REREF,
     LATERAL_CAR_REREF,
     MAT_DIVIDE_BY_1000,
+    SPONTANEOUS_EMG_ANALYSIS,
+    SPONTANEOUS_EMG_WINDOW_MS,
+    SPONTANEOUS_EMG_ENV_HOP_MS,
+    SPONTANEOUS_EMG_UV_SCALE,
     BASELINE_TMAX,
     BASELINE_TMIN,
     EPOCH_TMAX,
@@ -94,6 +98,8 @@ from .plotting import (
     plot_grouped_by_amplitude,
     plot_template_with_markers,
     plot_template_overlay_panel,
+    plot_spontaneous_overview,
+    plot_envelopes_overlay,
 )
 
 
@@ -807,6 +813,135 @@ def _detect_template_anchor_samples(
     return selected_anchors, candidates, discarded
 
 
+def _rms_amp_windows(x: np.ndarray, sfreq: float, window_ms: float):
+    """Non-overlapping windows: per-window RMS, mean |amplitude|, centre time."""
+    w = max(1, int(round(window_ms / 1000.0 * sfreq)))
+    n = x.size // w
+    centers, rms, amp = [], [], []
+    for i in range(n):
+        seg = x[i * w:(i + 1) * w]
+        rms.append(float(np.sqrt(np.mean(seg ** 2))))
+        amp.append(float(np.mean(np.abs(seg))))
+        centers.append((i * w + w / 2.0) / sfreq)
+    return np.asarray(centers), np.asarray(rms), np.asarray(amp)
+
+
+def _moving_rms_envelope(x: np.ndarray, sfreq: float, window_ms: float, hop_ms: float):
+    """Smooth RMS envelope: sliding RMS (window_ms) sampled every hop_ms."""
+    w = max(1, int(round(window_ms / 1000.0 * sfreq)))
+    hop = max(1, int(round(hop_ms / 1000.0 * sfreq)))
+    half = w // 2
+    centers, env = [], []
+    for c in range(0, x.size, hop):
+        a = max(0, c - half)
+        b = min(x.size, c + half)
+        seg = x[a:b]
+        if seg.size == 0:
+            continue
+        env.append(float(np.sqrt(np.mean(seg ** 2))))
+        centers.append(c / sfreq)
+    return np.asarray(centers), np.asarray(env)
+
+
+def _run_spontaneous_emg_analysis(
+    start_raw: mne.io.BaseRaw,
+    ch_names: list[str],
+    out_dir: Path,
+    condition: str,
+    window_ms: float = SPONTANEOUS_EMG_WINDOW_MS,
+    hop_ms: float = SPONTANEOUS_EMG_ENV_HOP_MS,
+    uv: float = SPONTANEOUS_EMG_UV_SCALE,
+) -> None:
+    """Doctor-requested spontaneous-EMG metrics for one start-stop segment.
+
+    For every channel: windowed RMS and mean amplitude (in µV) -> Excel
+    (Summary + Detailed sheets, per channel), a smooth RMS envelope -> per-channel
+    .txt, a raw+envelope overview plot, and an all-channel envelope overlay plot.
+    Independent of the single-peak detection.
+    """
+    if not ch_names:
+        return
+    sfreq = float(start_raw.info["sfreq"])
+    data = start_raw.get_data(picks=ch_names)  # Volts
+    times = np.arange(data.shape[1]) / sfreq
+
+    plots_dir = out_dir / "Plots"
+    env_dir = out_dir / "Envelopes"
+    excel_dir = out_dir / "Excel"
+    for d in (plots_dir, env_dir, excel_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    sig_by_ch: dict[str, np.ndarray] = {}
+    env_by_ch: dict[str, np.ndarray] = {}
+    env_times = None
+    detailed_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+
+    for ci, ch in enumerate(ch_names):
+        x = np.asarray(data[ci], dtype=float)
+        sig_by_ch[ch] = x * uv
+
+        centers, rms, amp = _rms_amp_windows(x, sfreq, window_ms)
+        rms_uv, amp_uv = rms * uv, amp * uv
+
+        et, env = _moving_rms_envelope(x, sfreq, window_ms, hop_ms)
+        env_uv = env * uv
+        env_by_ch[ch] = env_uv
+        env_times = et
+
+        # Per-channel envelope .txt (time_s, rms_uV) so envelopes can be re-overlaid.
+        safe_ch = re.sub(r"[^\w\-_\. ]", "_", str(ch))
+        np.savetxt(
+            env_dir / f"{safe_ch}_rms_envelope.txt",
+            np.column_stack([et, env_uv]),
+            header="time_s\trms_uV", delimiter="\t", comments="",
+        )
+
+        for wi, (tc, r, a) in enumerate(zip(centers, rms_uv, amp_uv)):
+            detailed_rows.append({
+                "Condition": str(condition), "Channel": str(ch),
+                "Window": wi, "Window_center_s": float(tc),
+                "RMS_uV": float(r), "MeanAmp_uV": float(a),
+            })
+
+        n = int(rms_uv.size)
+        sem_rms = float(np.std(rms_uv, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+        sem_amp = float(np.std(amp_uv, ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+        summary_rows.append({
+            "Condition": str(condition), "Channel": str(ch), "n_windows": n,
+            "RMS_mean_uV": float(np.mean(rms_uv)) if n else np.nan,
+            "RMS_std_uV": float(np.std(rms_uv, ddof=1)) if n > 1 else np.nan,
+            "RMS_sem_uV": sem_rms,
+            "Amp_mean_uV": float(np.mean(amp_uv)) if n else np.nan,
+            "Amp_std_uV": float(np.std(amp_uv, ddof=1)) if n > 1 else np.nan,
+            "Amp_sem_uV": sem_amp,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    detailed_df = pd.DataFrame(detailed_rows)
+    safe_condition = re.sub(r"[^\w\-\+\. ]", "_", str(condition))
+    xlsx_path = excel_dir / f"Spontaneous_EMG_{safe_condition}.xlsx"
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        detailed_df.to_excel(writer, sheet_name="Detailed", index=False)
+    summary_df.to_csv(excel_dir / f"Spontaneous_EMG_summary_{safe_condition}.csv", index=False)
+    detailed_df.to_csv(excel_dir / f"Spontaneous_EMG_detailed_{safe_condition}.csv", index=False)
+
+    plot_spontaneous_overview(
+        times=times, ch_names=ch_names, sig_by_ch=sig_by_ch,
+        env_times=env_times if env_times is not None else np.array([]),
+        env_by_ch=env_by_ch,
+        out_path=plots_dir / "overview_raw_with_envelope.png",
+        title=f"Spontaneous EMG — raw + RMS envelope | {condition}",
+    )
+    plot_envelopes_overlay(
+        env_times=env_times if env_times is not None else np.array([]),
+        env_by_ch=env_by_ch,
+        out_path=plots_dir / "envelopes_overlay.png",
+        title=f"Spontaneous EMG — RMS envelopes overlay | {condition}",
+    )
+
+
 def _run_startstop_analysis(
     raw: mne.io.BaseRaw,
     startstop_dir: Path,
@@ -872,6 +1007,16 @@ def _run_startstop_analysis(
         start_raw = _concat_segments(raw, start_segments)
         if start_raw is None:
             continue
+
+        # Doctor-requested spontaneous-EMG metrics (RMS / mean amplitude
+        # envelopes), independent of the single-peak detection below.
+        if SPONTANEOUS_EMG_ANALYSIS:
+            _run_spontaneous_emg_analysis(
+                start_raw=start_raw,
+                ch_names=ch_names,
+                out_dir=startstop_dir / "Spontaneous EMG" / safe_condition,
+                condition=str(condition),
+            )
 
         excel_dir = paths["excel_dir"]
         boxplot_dir = paths["boxplot_dir"]

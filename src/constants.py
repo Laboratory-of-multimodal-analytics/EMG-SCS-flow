@@ -32,6 +32,22 @@ LATERAL_CAR_REREF = False
 MAT_DIVIDE_BY_1000 = True
 
 
+# ── Spontaneous EMG analysis (doctor-requested RMS / mean-amplitude envelopes) ──
+# Independent of the single-peak detection. For each start-stop segment it
+# computes windowed RMS and mean amplitude per channel and writes envelope
+# plots/tables to results/StartStop analysis/Spontaneous EMG/.
+SPONTANEOUS_EMG_ANALYSIS = True
+# Window length (ms) for the per-window RMS / mean-amplitude table
+# (recommended 100-200 ms).
+SPONTANEOUS_EMG_WINDOW_MS = 200.0
+# Hop (ms) between successive points of the smooth RMS envelope curve used for
+# plots and the per-channel envelope .txt exports.
+SPONTANEOUS_EMG_ENV_HOP_MS = 25.0
+# Multiply the signal (Volts) by this to report microvolts (µV). The .mat loader
+# already rescales via MAT_DIVIDE_BY_1000; this only sets the reporting unit.
+SPONTANEOUS_EMG_UV_SCALE = 1e6
+
+
 # Reject StartStop channels that look like artifact leakage.
 STARTSTOP_LEAKAGE_CORR_REJECTION = True
 

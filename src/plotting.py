@@ -430,3 +430,57 @@ def plot_template_with_markers(
     plt.close(fig)
 
 
+def plot_spontaneous_overview(
+    times: np.ndarray,
+    ch_names: list[str],
+    sig_by_ch: dict[str, np.ndarray],
+    env_times: np.ndarray,
+    env_by_ch: dict[str, np.ndarray],
+    out_path: Path,
+    title: str,
+) -> None:
+    """Per-channel panel: raw EMG (µV) with its RMS envelope overlaid."""
+    n = len(ch_names)
+    fig, axes = plt.subplots(n, 1, figsize=(14, 1.8 * n), dpi=300, sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ax, ch in zip(axes, ch_names):
+        sig = sig_by_ch.get(ch)
+        if sig is not None:
+            ax.plot(times, sig, color="0.6", linewidth=0.5)
+        env = env_by_ch.get(ch)
+        if env is not None:
+            ax.plot(env_times, env, color="tab:red", linewidth=1.5, label="RMS envelope")
+        ax.set_ylabel(f"{ch}\nµV", fontsize=8)
+        ax.grid(False)
+    axes[0].legend(loc="upper right", fontsize=8, frameon=False)
+    axes[-1].set_xlabel("Time (s)")
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_envelopes_overlay(
+    env_times: np.ndarray,
+    env_by_ch: dict[str, np.ndarray],
+    out_path: Path,
+    title: str,
+) -> None:
+    """All channel RMS envelopes overlaid on one axes (µV) for comparison."""
+    fig, ax = plt.subplots(1, 1, figsize=(14, 6), dpi=300)
+    cmap = matplotlib.cm.get_cmap("tab10")
+    for i, (ch, env) in enumerate(env_by_ch.items()):
+        ax.plot(env_times, env, color=cmap(i % 10), linewidth=1.5, label=ch)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("RMS amplitude (µV)")
+    ax.set_title(title)
+    ax.grid(False)
+    ax.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
