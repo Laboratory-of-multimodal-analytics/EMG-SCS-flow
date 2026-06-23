@@ -46,6 +46,12 @@ SPONTANEOUS_EMG_ENV_HOP_MS = 25.0
 # Multiply the signal (Volts) by this to report microvolts (µV). The .mat loader
 # already rescales via MAT_DIVIDE_BY_1000; this only sets the reporting unit.
 SPONTANEOUS_EMG_UV_SCALE = 1e6
+# High-pass (Hz) applied INSIDE the spontaneous-EMG analysis only, to remove
+# low-frequency baseline drift/motion before RMS/amplitude/envelope/burst
+# computation. Kept separate from the detection preprocessing (which stays
+# notch-only) because a high-pass distorts the stereotyped peak shapes. None
+# to disable.
+SPONTANEOUS_EMG_HP_FREQ = 20.0
 
 # ── Burst detection (within the spontaneous-EMG analysis) ──
 # Detect discrete activity bursts on the RMS envelope. Per-burst envelopes are

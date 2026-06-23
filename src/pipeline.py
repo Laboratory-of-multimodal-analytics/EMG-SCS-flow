@@ -25,6 +25,7 @@ from .constants import (
     SPONTANEOUS_EMG_WINDOW_MS,
     SPONTANEOUS_EMG_ENV_HOP_MS,
     SPONTANEOUS_EMG_UV_SCALE,
+    SPONTANEOUS_EMG_HP_FREQ,
     SPONTANEOUS_EMG_BURST_DETECTION,
     SPONTANEOUS_EMG_BURST_MIN_SNR,
     SPONTANEOUS_EMG_BURST_MIN_PEAK_UV,
@@ -922,6 +923,14 @@ def _run_spontaneous_emg_analysis(
         return
     sfreq = float(start_raw.info["sfreq"])
     data = start_raw.get_data(picks=ch_names)  # Volts
+    # Remove low-frequency baseline drift before RMS/envelope/burst computation
+    # (detection preprocessing is left untouched — see SPONTANEOUS_EMG_HP_FREQ).
+    if SPONTANEOUS_EMG_HP_FREQ is not None:
+        data = mne.filter.filter_data(
+            np.ascontiguousarray(data, dtype=float), sfreq,
+            l_freq=float(SPONTANEOUS_EMG_HP_FREQ), h_freq=None,
+            method="fir", phase="zero", verbose=False,
+        )
     times = np.arange(data.shape[1]) / sfreq
 
     plots_dir = out_dir / "Plots"
