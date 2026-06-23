@@ -438,8 +438,13 @@ def plot_spontaneous_overview(
     env_by_ch: dict[str, np.ndarray],
     out_path: Path,
     title: str,
+    bursts_by_ch: dict[str, list[tuple[float, float]]] | None = None,
 ) -> None:
-    """Per-channel panel: raw EMG (µV) with its RMS envelope overlaid."""
+    """Per-channel panel: raw EMG (µV) with its RMS envelope overlaid.
+
+    Detected bursts (if provided) are shaded so the detection can be verified.
+    """
+    bursts_by_ch = bursts_by_ch or {}
     n = len(ch_names)
     fig, axes = plt.subplots(n, 1, figsize=(14, 1.8 * n), dpi=300, sharex=True)
     if n == 1:
@@ -451,12 +456,85 @@ def plot_spontaneous_overview(
         env = env_by_ch.get(ch)
         if env is not None:
             ax.plot(env_times, env, color="tab:red", linewidth=1.5, label="RMS envelope")
+        for bi, (t0, t1) in enumerate(bursts_by_ch.get(ch, [])):
+            ax.axvspan(t0, t1, color="tab:orange", alpha=0.18,
+                       label="burst" if bi == 0 else None)
         ax.set_ylabel(f"{ch}\nµV", fontsize=8)
         ax.grid(False)
     axes[0].legend(loc="upper right", fontsize=8, frameon=False)
     axes[-1].set_xlabel("Time (s)")
     plt.suptitle(title)
     plt.tight_layout(rect=[0, 0, 1, 0.98])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_burst_envelopes_overlay(
+    bursts: list[dict],
+    out_path: Path,
+    title: str,
+) -> None:
+    """Overlay each detected burst's RMS envelope, aligned to burst onset.
+
+    `bursts` is a list of dicts with keys: label, t_rel (s, from onset), env (µV).
+    """
+    if not bursts:
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6), dpi=300)
+    cmap = matplotlib.cm.get_cmap("tab20")
+    for i, b in enumerate(bursts):
+        ax.plot(b["t_rel"], b["env"], color=cmap(i % 20), linewidth=1.6, label=b["label"])
+    ax.set_xlabel("Time from burst onset (s)")
+    ax.set_ylabel("RMS amplitude (µV)")
+    ax.set_title(title)
+    ax.grid(False)
+    ax.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_spontaneous_boxplots(
+    detailed_df: pd.DataFrame,
+    out_path: Path,
+    title: str,
+) -> None:
+    """Boxplots of per-window RMS and mean amplitude across channels."""
+    metrics = [("RMS_uV", "RMS (µV)"), ("MeanAmp_uV", "Mean amplitude (µV)")]
+    channels = sorted(detailed_df["Channel"].dropna().unique())
+    if not channels:
+        return
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(max(8, 1.0 * len(channels)), 9), dpi=300)
+    if len(metrics) == 1:
+        axes = [axes]
+    rng = np.random.default_rng(0)
+    for ax, (col, ylab) in zip(axes, metrics):
+        data, labels = [], []
+        for ch in channels:
+            vals = pd.to_numeric(detailed_df.loc[detailed_df["Channel"] == ch, col],
+                                 errors="coerce").dropna().values
+            if vals.size == 0:
+                continue
+            data.append(vals)
+            labels.append(ch)
+        if not data:
+            ax.axis("off")
+            continue
+        x = np.arange(1, len(data) + 1)
+        bp = ax.boxplot(data, positions=x, labels=labels, showfliers=False,
+                        whis=(5, 95), patch_artist=True, widths=0.6)
+        for box in bp["boxes"]:
+            box.set_alpha(0.25)
+        for i, vals in enumerate(data):
+            ax.scatter(np.full_like(vals, x[i], dtype=float) + rng.uniform(-0.12, 0.12, vals.size),
+                       vals, s=8, alpha=0.35)
+        ax.set_ylabel(ylab)
+        ax.tick_params(axis="x", labelrotation=90)
+        ax.grid(False)
+    plt.suptitle(title)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path)
     plt.close(fig)

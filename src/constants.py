@@ -47,6 +47,28 @@ SPONTANEOUS_EMG_ENV_HOP_MS = 25.0
 # already rescales via MAT_DIVIDE_BY_1000; this only sets the reporting unit.
 SPONTANEOUS_EMG_UV_SCALE = 1e6
 
+# ── Burst detection (within the spontaneous-EMG analysis) ──
+# Detect discrete activity bursts on the RMS envelope. Per-burst envelopes are
+# overlaid, exported to .txt, and marked on the overview plot. Channels without
+# bursts are skipped.
+SPONTANEOUS_EMG_BURST_DETECTION = True
+# A channel is considered to have bursts only if its envelope peak exceeds this
+# multiple of its baseline (scale-invariant; flat channels have peak ~ baseline).
+SPONTANEOUS_EMG_BURST_MIN_SNR = 3.0
+# ...and only if the envelope peak (µV) exceeds this absolute floor. Needed
+# because the SNR ratio alone does not separate a low-amplitude noisy channel
+# (high ratio, tiny µV) from a genuinely active muscle. Tune per gain/montage.
+SPONTANEOUS_EMG_BURST_MIN_PEAK_UV = 60.0
+# Baseline / peak percentiles of the envelope used for thresholding (robust).
+SPONTANEOUS_EMG_BURST_BASELINE_PCT = 20.0
+SPONTANEOUS_EMG_BURST_PEAK_PCT = 99.0
+# Burst threshold = baseline + frac * (peak - baseline).
+SPONTANEOUS_EMG_BURST_THRESH_FRAC = 0.30
+# Minimum burst duration (ms); shorter above-threshold runs are dropped.
+SPONTANEOUS_EMG_BURST_MIN_MS = 300.0
+# Above-threshold runs separated by a gap shorter than this (ms) are merged.
+SPONTANEOUS_EMG_BURST_MERGE_MS = 300.0
+
 
 # Reject StartStop channels that look like artifact leakage.
 STARTSTOP_LEAKAGE_CORR_REJECTION = True
