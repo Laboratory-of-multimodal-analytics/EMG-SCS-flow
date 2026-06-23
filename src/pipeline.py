@@ -965,21 +965,29 @@ def _run_spontaneous_emg_analysis(
             if bursts:
                 bursts_by_ch[ch] = bursts
                 for bk, (t0, t1) in enumerate(bursts, start=1):
-                    m = (et >= t0) & (et <= t1)
-                    t_rel = et[m] - t0
-                    seg = env_uv[m]
+                    dur = t1 - t0
+                    pad = dur / 2.0          # half-burst baseline on each side
+                    center = (t0 + t1) / 2.0
+                    # Metrics over the burst itself.
+                    mb = (et >= t0) & (et <= t1)
+                    seg_burst = env_uv[mb]
+                    # Plot/txt window: burst + half-length padding, centred so the
+                    # burst middle sits at x = 0 (baseline visible symmetrically).
+                    mp = (et >= t0 - pad) & (et <= t1 + pad)
+                    t_rel = et[mp] - center
+                    seg = env_uv[mp]
                     np.savetxt(
                         env_dir / f"{safe_ch}_burst{bk}_rms_envelope.txt",
                         np.column_stack([t_rel, seg]),
-                        header="time_from_onset_s\trms_uV", delimiter="\t", comments="",
+                        header="time_from_burst_center_s\trms_uV", delimiter="\t", comments="",
                     )
                     burst_env_by_ch[ch].append({"t_rel": t_rel, "env": seg})
                     burst_rows.append({
                         "Condition": str(condition), "Channel": str(ch), "Burst": bk,
                         "Start_s": float(t0), "End_s": float(t1),
-                        "Duration_s": float(t1 - t0),
-                        "RMS_mean_uV": float(np.mean(seg)) if seg.size else np.nan,
-                        "RMS_peak_uV": float(np.max(seg)) if seg.size else np.nan,
+                        "Duration_s": float(dur),
+                        "RMS_mean_uV": float(np.mean(seg_burst)) if seg_burst.size else np.nan,
+                        "RMS_peak_uV": float(np.max(seg_burst)) if seg_burst.size else np.nan,
                     })
 
         for wi, (tc, r, a) in enumerate(zip(centers, rms_uv, amp_uv)):
@@ -1034,7 +1042,7 @@ def _run_spontaneous_emg_analysis(
     plot_burst_envelopes_by_channel(
         bursts_by_ch=dict(burst_env_by_ch),
         out_path=plots_dir / "burst_envelopes_by_channel.png",
-        title=f"Spontaneous EMG — burst RMS envelopes per channel (aligned to onset) | {condition}",
+        title=f"Spontaneous EMG — burst RMS envelopes per channel (centred, ±½-burst baseline) | {condition}",
     )
     plot_spontaneous_boxplots(
         detailed_df=detailed_df,
