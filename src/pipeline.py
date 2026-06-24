@@ -35,6 +35,7 @@ from .constants import (
     SPONTANEOUS_EMG_BURST_KEEP_FRAC,
     SPONTANEOUS_EMG_BURST_MIN_MS,
     SPONTANEOUS_EMG_BURST_MERGE_MS,
+    SPONTANEOUS_EMG_ACTIVE_MAD_K,
     BASELINE_TMAX,
     BASELINE_TMIN,
     EPOCH_TMAX,
@@ -1131,6 +1132,29 @@ def _run_spontaneous_emg_analysis(
             "Amp_std_uV": float(np.std(amp_uv, ddof=1)) if n > 1 else np.nan,
             "Amp_sem_uV": sem_amp,
         })
+
+    # Fallback export: for channels with NO bursts that are significantly more
+    # active than the rest (robust MAD threshold on mean RMS), still save the
+    # whole-segment RMS envelope to .txt so the active channels are captured.
+    if SPONTANEOUS_EMG_ACTIVE_MAD_K is not None and env_times is not None and len(summary_rows) >= 3:
+        rms_means = {r["Channel"]: r["RMS_mean_uV"] for r in summary_rows}
+        vals = np.array([v for v in rms_means.values() if np.isfinite(v)], dtype=float)
+        if vals.size >= 3:
+            med = float(np.median(vals))
+            mad = float(np.median(np.abs(vals - med)))
+            thr = med + SPONTANEOUS_EMG_ACTIVE_MAD_K * 1.4826 * mad if mad > 0 else med
+            for ch in ch_names:
+                if ch in bursts_by_ch:
+                    continue  # bursts already exported per burst
+                x = rms_means.get(ch, np.nan)
+                if not (np.isfinite(x) and x > thr and x > med):
+                    continue
+                safe_ch = re.sub(r"[^\w\-_\. ]", "_", str(ch))
+                np.savetxt(
+                    env_dir / f"{safe_ch}_fullenvelope_rms.txt",
+                    np.column_stack([env_times, env_by_ch[ch]]),
+                    header="time_s\trms_uV", delimiter="\t", comments="",
+                )
 
     summary_df = pd.DataFrame(summary_rows)
     detailed_df = pd.DataFrame(detailed_rows)

@@ -78,6 +78,11 @@ SPONTANEOUS_EMG_BURST_KEEP_FRAC = 0.50
 SPONTANEOUS_EMG_BURST_MIN_MS = 300.0
 # Above-threshold runs separated by a gap shorter than this (ms) are merged.
 SPONTANEOUS_EMG_BURST_MERGE_MS = 300.0
+# When a channel has NO bursts but is significantly more active than the others,
+# still export its whole-segment RMS envelope to .txt. "Significantly more
+# active" = its mean RMS exceeds median + K * (1.4826*MAD) across channels.
+# None disables this fallback export.
+SPONTANEOUS_EMG_ACTIVE_MAD_K = 3.0
 
 
 # Reject StartStop channels that look like artifact leakage.
