@@ -119,7 +119,9 @@ def _normalize_startstop(desc: str) -> str | None:
     return None
 
 
-def extract_start_stop_segments(raw) -> dict[str, dict[str, list[tuple[float, float]]]]:
+def extract_start_stop_segments(
+    raw, default_condition: str | None = None
+) -> dict[str, dict[str, list[tuple[float, float]]]]:
     ann = raw.annotations
     items = []
     for i in range(len(ann)):
@@ -133,6 +135,19 @@ def extract_start_stop_segments(raw) -> dict[str, dict[str, list[tuple[float, fl
     has_markers = False
     last_start: float | None = None
     last_stop: float | None = None
+
+    def _ensure_default(onset: float) -> None:
+        # When start/stop markers appear with no preceding condition label, fall
+        # back to a default condition name (e.g. the file name).
+        nonlocal current_condition, current_onset
+        if current_condition is None and default_condition is not None:
+            current_condition = default_condition
+            current_onset = onset
+            segments.setdefault(current_condition, {"start": [], "stop": []})
+            segment_meta.setdefault(
+                current_condition,
+                {"has_explicit_markers": False, "used_fallback_full_segment": False},
+            )
 
     def _close_open_segment(next_onset: float | None) -> None:
         nonlocal last_start, last_stop, has_markers
@@ -151,6 +166,8 @@ def extract_start_stop_segments(raw) -> dict[str, dict[str, list[tuple[float, fl
         label = _normalize_startstop(desc)
         if label == "start":
             if current_condition is None:
+                _ensure_default(onset)
+            if current_condition is None:
                 continue
             if last_stop is not None and onset > last_stop:
                 segments[current_condition]["stop"].append((last_stop, onset))
@@ -159,6 +176,8 @@ def extract_start_stop_segments(raw) -> dict[str, dict[str, list[tuple[float, fl
             segment_meta[current_condition]["has_explicit_markers"] = True
             continue
         if label == "stop":
+            if current_condition is None:
+                _ensure_default(onset)
             if current_condition is None:
                 continue
             if last_start is not None and onset > last_start:

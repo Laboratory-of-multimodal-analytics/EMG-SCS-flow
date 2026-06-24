@@ -319,8 +319,114 @@ def _match_sir_template(
     return best
 
 
+# MATLAB Level-4 element storage-type (P digit) -> numpy dtype / byte size.
+_MAT4_DTYPE = {0: "<f8", 1: "<f4", 2: "<i4", 3: "<i2", 4: "<u2", 5: "<u1"}
+_MAT4_SIZE = {0: 8, 1: 4, 2: 4, 3: 2, 4: 2, 5: 1}
+_MAT4_VARS = (
+    "data", "datastart", "titles", "rangemin", "rangemax", "unittext",
+    "unittextmap", "blocktimes", "tickrate", "samplerate",
+    "firstsampleoffset", "comtext", "com",
+)
+
+
+def _read_labchart_mat4(mat_path) -> mne.io.Raw:
+    """Fallback reader for malformed/headerless LabChart 'MATLAB Level 4' exports.
+
+    These files lack the 128-byte MAT-file header and `dataend`, so scipy (and
+    pymatreader) only recover `data`/`datastart` and mangle the rest. We locate
+    each LabChart variable by its name token, read its v4 header (5 int32:
+    type, rows, cols, imagf, namelen) and data directly, reconstruct the channel
+    matrix from `data`+`datastart`, and rebuild start/stop annotations from
+    `com`+`comtext`. Channel names are not reliably recoverable from this format,
+    so generic ch1..chN are used (channel order is preserved).
+    """
+    raw_bytes = Path(mat_path).read_bytes()
+    hdr: dict[str, dict] = {}
+    for nm in _MAT4_VARS:
+        i = raw_bytes.find(nm.encode() + b"\x00")
+        if i < 20:
+            continue
+        typ, mr, nc, imag, nl = (
+            int(x) for x in np.frombuffer(raw_bytes, "<i4", count=5, offset=i - 20)
+        )
+        hdr[nm] = {"typ": typ, "mr": mr, "nc": nc, "nl": nl, "doff": i + nl}
+    hdr_starts = sorted(h["doff"] - 20 - h["nl"] for h in hdr.values())
+
+    def _read(nm):
+        h = hdr.get(nm)
+        if h is None:
+            return None
+        P = (h["typ"] % 100) // 10
+        dt = _MAT4_DTYPE.get(P, "<f8")
+        sz = _MAT4_SIZE.get(P, 8)
+        count = h["mr"] * h["nc"]
+        # Clamp so an over-stated dim cannot read into the next variable.
+        nxt = [o for o in hdr_starts if o >= h["doff"]]
+        avail = ((min(nxt) if nxt else len(raw_bytes)) - h["doff"]) // sz
+        count = min(count, max(0, avail))
+        return np.frombuffer(raw_bytes, dt, count=count, offset=h["doff"]).astype(float), h["mr"], h["nc"]
+
+    if "data" not in hdr or "datastart" not in hdr:
+        raise ValueError(f"Cannot recover LabChart MAT structure from {mat_path}")
+
+    data = _read("data")[0]
+    ds = _read("datastart")[0]
+    n_total = data.size
+    starts = sorted({int(round(x)) for x in ds if np.isfinite(x) and 1 <= x <= n_total})
+    ends = starts[1:] + [n_total + 1]  # single block, channels contiguous
+    chans = [data[s - 1:e - 1] for s, e in zip(starts, ends)]
+    min_len = min(len(c) for c in chans)
+    chans = [c[:min_len] for c in chans]
+    data_2d = np.vstack(chans)
+
+    sfreq = 4000.0
+    tick = _read("tickrate")
+    if tick is not None and tick[0].size:
+        sfreq = float(tick[0][0])
+    elif _read("samplerate") is not None:
+        sr = _read("samplerate")[0]
+        sr = sr[np.isfinite(sr) & (sr > 0)]
+        if sr.size:
+            sfreq = float(np.max(sr))
+
+    if MAT_DIVIDE_BY_1000:
+        data_2d = data_2d / 1000.0
+
+    ch_names = [f"ch{i + 1}" for i in range(data_2d.shape[0])]
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=["eeg"] * len(ch_names))
+    raw = mne.io.RawArray(data_2d, info, verbose=False)
+
+    com = _read("com")
+    comtext = _read("comtext")
+    if com is not None and comtext is not None:
+        com_v, cmr, cnc = com
+        ct_v, tmr, tnc = comtext
+        com_m = com_v.reshape((cnc, cmr)).T if com_v.size == cmr * cnc else None
+        ct_m = ct_v.reshape((tnc, tmr)).T if ct_v.size == tmr * tnc else None
+        if com_m is not None and ct_m is not None:
+            labels = [
+                _normalize_text("".join(chr(int(c)) for c in ct_m[r] if 0 < int(c) < 65536)).strip()
+                for r in range(ct_m.shape[0])
+            ]
+            onsets, descs = [], []
+            for r in range(com_m.shape[0]):
+                sample = com_m[r, 2]
+                if not np.isfinite(sample):
+                    continue
+                cid = int(com_m[r, 4]) if np.isfinite(com_m[r, 4]) else 0
+                onsets.append(float(sample) / sfreq)
+                descs.append(labels[cid - 1] if 1 <= cid <= len(labels) else str(cid))
+            if onsets:
+                raw.set_annotations(mne.Annotations(onset=onsets, duration=[0.0] * len(onsets), description=descs))
+    return raw
+
+
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
     mat = loadmat(mat_path)
+    # Malformed/headerless LabChart "MATLAB Level 4" exports lose everything but
+    # data/datastart through scipy (no 'dataend'); handle them separately.
+    if "dataend" not in mat:
+        return _read_labchart_mat4(mat_path)
     data = mat["data"].ravel()
     datastart = mat["datastart"].astype(int)
     dataend = mat["dataend"].astype(int)
@@ -1070,9 +1176,10 @@ def _run_startstop_analysis(
     raw: mne.io.BaseRaw,
     startstop_dir: Path,
     art_chans: list[str],
+    default_condition: str | None = None,
 ) -> None:
     print("[STARTSTOP] Extracting start/stop segments...", flush=True)
-    segments = extract_start_stop_segments(raw)
+    segments = extract_start_stop_segments(raw, default_condition=default_condition)
     if not segments:
         return
 
@@ -2140,7 +2247,7 @@ def run_pipeline(
     raw.save(preproc_path, overwrite=True)
 
     if use_startstop:
-        _run_startstop_analysis(raw, startstop_dir, default_art_chans)
+        _run_startstop_analysis(raw, startstop_dir, default_art_chans, default_condition=edf_path.stem)
         if old_mne_log_level is not None:
             mne.set_log_level(old_mne_log_level)
         return output_root
