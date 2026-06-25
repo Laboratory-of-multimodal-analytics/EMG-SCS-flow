@@ -2297,18 +2297,40 @@ def run_pipeline(
     )
     if mat_blocks is not None and len(mat_blocks) > 1:
         import tempfile
-        print(f"[MAT] {len(mat_blocks)} recording blocks -> processing each separately", flush=True)
-        tmpdir = Path(tempfile.mkdtemp(prefix="labchart_blocks_"))
-        for label, braw in mat_blocks:
-            bfif = tmpdir / f"{edf_path.stem}__{label}_raw.fif"
-            braw.save(bfif, overwrite=True)
-            run_pipeline(
-                bfif, output_dir=output_root / label,
-                startstop_mode=startstop_mode,
-                raw_notch_freq=raw_notch_freq,
-                raw_bandpass_l_freq=raw_bandpass_l_freq,
-                raw_bandpass_h_freq=raw_bandpass_h_freq,
+        # Merge all blocks into one recording so results group by condition, not
+        # by block: pad each block to the max channel count and concatenate in
+        # time, shifting each block's annotations by its time offset. Condition
+        # labels are unique across blocks, so they do not collide; each segment
+        # stays within its own block.
+        print(f"[MAT] {len(mat_blocks)} recording blocks -> merged into one (results by condition)", flush=True)
+        sfreq = float(mat_blocks[0][1].info["sfreq"])
+        max_ch = max(b.info["nchan"] for _, b in mat_blocks)
+        chunks, onsets, descs, t0 = [], [], [], 0.0
+        for _label, braw in mat_blocks:
+            d = braw.get_data()
+            if d.shape[0] < max_ch:
+                d = np.vstack([d, np.zeros((max_ch - d.shape[0], d.shape[1]))])
+            chunks.append(d)
+            for o, de in zip(braw.annotations.onset, braw.annotations.description):
+                onsets.append(t0 + float(o))
+                descs.append(str(de))
+            t0 += d.shape[1] / sfreq
+        info = mne.create_info([f"ch{i + 1}" for i in range(max_ch)], sfreq, ["eeg"] * max_ch)
+        merged = mne.io.RawArray(np.hstack(chunks), info, verbose=False)
+        if onsets:
+            merged.set_annotations(
+                mne.Annotations(onset=onsets, duration=[0.0] * len(onsets), description=descs)
             )
+        tmpdir = Path(tempfile.mkdtemp(prefix="labchart_merged_"))
+        mfif = tmpdir / f"{edf_path.stem}_merged_raw.fif"
+        merged.save(mfif, overwrite=True)
+        run_pipeline(
+            mfif, output_dir=output_root,
+            startstop_mode=startstop_mode,
+            raw_notch_freq=raw_notch_freq,
+            raw_bandpass_l_freq=raw_bandpass_l_freq,
+            raw_bandpass_h_freq=raw_bandpass_h_freq,
+        )
         return output_root
 
     old_mne_log_level = mne.set_log_level("ERROR", return_old_level=True)
