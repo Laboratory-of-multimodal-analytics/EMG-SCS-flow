@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 import re
 
@@ -332,16 +332,20 @@ _MAT4_VARS = (
 )
 
 
-def _read_labchart_mat4(mat_path) -> mne.io.Raw:
-    """Fallback reader for malformed/headerless LabChart 'MATLAB Level 4' exports.
+def _labchart_mat4_blocks(mat_path) -> list[tuple[str, mne.io.Raw]]:
+    """Reconstruct one MNE Raw per recording block from a malformed/headerless
+    LabChart 'MATLAB Level 4' export.
 
-    These files lack the 128-byte MAT-file header and `dataend`, so scipy (and
-    pymatreader) only recover `data`/`datastart` and mangle the rest. We locate
-    each LabChart variable by its name token, read its v4 header (5 int32:
-    type, rows, cols, imagf, namelen) and data directly, reconstruct the channel
-    matrix from `data`+`datastart`, and rebuild start/stop annotations from
-    `com`+`comtext`. Channel names are not reliably recoverable from this format,
-    so generic ch1..chN are used (channel order is preserved).
+    Such files lack the 128-byte MAT-file header (and may have a corrupt
+    `dataend`), so scipy/pymatreader cannot read them. We locate each LabChart
+    variable by its name token, read its v4 header (5 int32: type, rows, cols,
+    imagf, namelen) and data directly. `datastart`/`dataend` are (channels x
+    blocks); a single .mat can hold several recording blocks of differing
+    channel sets / durations. For each block we keep the channels that share the
+    block's modal length (dropping leaked/inconsistent ones), build a Raw, and
+    attach that block's annotations from `com`+`comtext` (onsets within the
+    block). Channel names are not recoverable from this format -> generic
+    ch1..chN (order preserved). Returns one (label, Raw) per non-empty block.
     """
     raw_bytes = Path(mat_path).read_bytes()
     hdr: dict[str, dict] = {}
@@ -363,7 +367,6 @@ def _read_labchart_mat4(mat_path) -> mne.io.Raw:
         dt = _MAT4_DTYPE.get(P, "<f8")
         sz = _MAT4_SIZE.get(P, 8)
         count = h["mr"] * h["nc"]
-        # Clamp so an over-stated dim cannot read into the next variable.
         nxt = [o for o in hdr_starts if o >= h["doff"]]
         avail = ((min(nxt) if nxt else len(raw_bytes)) - h["doff"]) // sz
         count = min(count, max(0, avail))
@@ -373,14 +376,13 @@ def _read_labchart_mat4(mat_path) -> mne.io.Raw:
         raise ValueError(f"Cannot recover LabChart MAT structure from {mat_path}")
 
     data = _read("data")[0]
-    ds = _read("datastart")[0]
     n_total = data.size
-    starts = sorted({int(round(x)) for x in ds if np.isfinite(x) and 1 <= x <= n_total})
-    ends = starts[1:] + [n_total + 1]  # single block, channels contiguous
-    chans = [data[s - 1:e - 1] for s, e in zip(starts, ends)]
-    min_len = min(len(c) for c in chans)
-    chans = [c[:min_len] for c in chans]
-    data_2d = np.vstack(chans)
+    dv, dmr, dnc = _read("datastart")
+    DS = dv.reshape((dnc, dmr)).T if dv.size == dmr * dnc else dv.reshape((1, -1))
+    DEarr = None
+    de = _read("dataend")
+    if de is not None and de[0].size == de[1] * de[2]:
+        DEarr = de[0].reshape((de[2], de[1])).T
 
     sfreq = 4000.0
     tick = _read("tickrate")
@@ -392,36 +394,101 @@ def _read_labchart_mat4(mat_path) -> mne.io.Raw:
         if sr.size:
             sfreq = float(np.max(sr))
 
-    if MAT_DIVIDE_BY_1000:
-        data_2d = data_2d / 1000.0
+    # Channel segments (row, block, start, end). End comes from dataend when
+    # valid, otherwise from the next segment's start (corrupt-dataend fallback).
+    segs: list[list] = []
+    for r in range(DS.shape[0]):
+        for c in range(DS.shape[1]):
+            s = DS[r, c]
+            if not (np.isfinite(s) and 1 <= s <= n_total):
+                continue
+            s = int(round(s))
+            e = None
+            if DEarr is not None:
+                ev = DEarr[r, c]
+                if np.isfinite(ev) and s <= ev <= n_total:
+                    e = int(round(ev))
+            segs.append([r, c, s, e])
+    all_starts = sorted({x[2] for x in segs})
+    next_of = {st: (all_starts[i + 1] if i + 1 < len(all_starts) else n_total + 1)
+               for i, st in enumerate(all_starts)}
+    for x in segs:
+        if x[3] is None:
+            x[3] = next_of[x[2]] - 1
 
-    ch_names = [f"ch{i + 1}" for i in range(data_2d.shape[0])]
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=["eeg"] * len(ch_names))
-    raw = mne.io.RawArray(data_2d, info, verbose=False)
-
+    # Comments.
     com = _read("com")
     comtext = _read("comtext")
-    if com is not None and comtext is not None:
-        com_v, cmr, cnc = com
-        ct_v, tmr, tnc = comtext
-        com_m = com_v.reshape((cnc, cmr)).T if com_v.size == cmr * cnc else None
-        ct_m = ct_v.reshape((tnc, tmr)).T if ct_v.size == tmr * tnc else None
-        if com_m is not None and ct_m is not None:
-            labels = [
-                _normalize_text("".join(chr(int(c)) for c in ct_m[r] if 0 < int(c) < 65536)).strip()
-                for r in range(ct_m.shape[0])
-            ]
+    labels: list[str] = []
+    if comtext is not None and comtext[0].size == comtext[1] * comtext[2]:
+        ct_m = comtext[0].reshape((comtext[2], comtext[1])).T
+        labels = [
+            _normalize_text("".join(chr(int(c)) for c in ct_m[r] if 0 < int(c) < 65536)).strip()
+            for r in range(ct_m.shape[0])
+        ]
+    com_m = None
+    if com is not None and com[0].size == com[1] * com[2]:
+        com_m = com[0].reshape((com[2], com[1])).T
+
+    by_block: dict[int, list] = defaultdict(list)
+    for r, c, s, e in segs:
+        by_block[c].append((r, s, e))
+
+    blocks_out: list[tuple[str, mne.io.Raw]] = []
+    for c in sorted(by_block):
+        chs = by_block[c]
+        lens = [e - s + 1 for _r, s, e in chs]
+        modal = Counter(lens).most_common(1)[0][0]
+        keep = sorted([(r, s, e) for (r, s, e), L in zip(chs, lens) if L == modal], key=lambda t: t[1])
+        if not keep:
+            continue
+        block_2d = np.vstack([data[s - 1:s - 1 + modal] for _r, s, _e in keep])
+        if MAT_DIVIDE_BY_1000:
+            block_2d = block_2d / 1000.0
+        ch_names = [f"ch{i + 1}" for i in range(block_2d.shape[0])]
+        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=["eeg"] * len(ch_names))
+        braw = mne.io.RawArray(block_2d, info, verbose=False)
+        block_dur = block_2d.shape[1] / sfreq
+        if com_m is not None and labels:
             onsets, descs = [], []
-            for r in range(com_m.shape[0]):
-                sample = com_m[r, 2]
-                if not np.isfinite(sample):
+            for rr in range(com_m.shape[0]):
+                if int(com_m[rr, 1]) != c + 1 or not np.isfinite(com_m[rr, 2]):
                     continue
-                cid = int(com_m[r, 4]) if np.isfinite(com_m[r, 4]) else 0
-                onsets.append(float(sample) / sfreq)
+                t = float(com_m[rr, 2]) / sfreq
+                if t > block_dur:
+                    continue
+                cid = int(com_m[rr, 4]) if np.isfinite(com_m[rr, 4]) else 0
+                onsets.append(t)
                 descs.append(labels[cid - 1] if 1 <= cid <= len(labels) else str(cid))
             if onsets:
-                raw.set_annotations(mne.Annotations(onset=onsets, duration=[0.0] * len(onsets), description=descs))
-    return raw
+                braw.set_annotations(mne.Annotations(onset=onsets, duration=[0.0] * len(onsets), description=descs))
+        blocks_out.append((f"block{c + 1}", braw))
+    return blocks_out
+
+
+def _read_labchart_mat4(mat_path) -> mne.io.Raw:
+    """Single-Raw view of a broken LabChart MAT (raises if it has >1 block)."""
+    blocks = _labchart_mat4_blocks(mat_path)
+    if not blocks:
+        raise ValueError(f"Cannot recover any channel from {mat_path}")
+    if len(blocks) > 1:
+        raise ValueError(
+            f"{mat_path} contains {len(blocks)} recording blocks; use run_pipeline "
+            "(which processes each block separately)."
+        )
+    return blocks[0][1]
+
+
+def _labchart_mat4_blocks_if_broken(mat_path):
+    """Return per-block Raws if this .mat is a broken/headerless LabChart export,
+    else None (a normal .mat that scipy can read)."""
+    try:
+        mat = loadmat(mat_path)
+        if "dataend" in mat:
+            return None
+    except Exception:
+        pass
+    return _labchart_mat4_blocks(mat_path)
 
 
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
@@ -2220,6 +2287,30 @@ def run_pipeline(
         output_root = Path(output_dir)
 
     use_startstop = startstop_mode if startstop_mode is not None else STARTSTOP_MODE
+
+    # Malformed/headerless LabChart .mat may hold several recording blocks
+    # (differing channel sets / durations). Process each block as its own
+    # recording under output_root/<block>.
+    mat_blocks = (
+        _labchart_mat4_blocks_if_broken(edf_path)
+        if edf_path.suffix.lower() == ".mat" else None
+    )
+    if mat_blocks is not None and len(mat_blocks) > 1:
+        import tempfile
+        print(f"[MAT] {len(mat_blocks)} recording blocks -> processing each separately", flush=True)
+        tmpdir = Path(tempfile.mkdtemp(prefix="labchart_blocks_"))
+        for label, braw in mat_blocks:
+            bfif = tmpdir / f"{edf_path.stem}__{label}_raw.fif"
+            braw.save(bfif, overwrite=True)
+            run_pipeline(
+                bfif, output_dir=output_root / label,
+                startstop_mode=startstop_mode,
+                raw_notch_freq=raw_notch_freq,
+                raw_bandpass_l_freq=raw_bandpass_l_freq,
+                raw_bandpass_h_freq=raw_bandpass_h_freq,
+            )
+        return output_root
+
     old_mne_log_level = mne.set_log_level("ERROR", return_old_level=True)
     if use_startstop:
         print("[STARTSTOP] Preparing data...", flush=True)
@@ -2238,7 +2329,7 @@ def run_pipeline(
 
     suffix = edf_path.suffix.lower()
     if suffix == ".mat":
-        raw = _load_raw_from_mat(edf_path)
+        raw = mat_blocks[0][1] if mat_blocks else _load_raw_from_mat(edf_path)
     elif suffix == ".fif":
         raw = mne.io.read_raw_fif(edf_path, preload=True)
     else:
