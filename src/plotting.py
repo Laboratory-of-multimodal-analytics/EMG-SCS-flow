@@ -678,8 +678,11 @@ def plot_spontaneous_L_shapes(
                 idx += 1
                 continue
 
-            ax.scatter(pair_df["RMS_A"], pair_df["RMS_B"], s=20, alpha=0.5)
-            max_val = max(pair_df["RMS_A"].max(),pair_df["RMS_B"].max())
+            pair_df["RMS_A_norm"] = pair_df["RMS_A"] / pair_df["RMS_A"].max()
+            pair_df["RMS_B_norm"] = pair_df["RMS_B"] / pair_df["RMS_B"].max()
+
+            ax.scatter(pair_df["RMS_A_norm"], pair_df["RMS_B_norm"], s=20, alpha=0.5)
+            max_val = max(pair_df["RMS_A_norm"].max(),pair_df["RMS_B_norm"].max())
             limit = max_val * 1.05
 
             #ax.plot([0, limit], [0, limit],"k--",lw=1,alpha=0.5)
