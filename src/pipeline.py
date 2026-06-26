@@ -94,6 +94,7 @@ from .constants import (
     THRESH,
     ART_PEAK_WIDTH_MS,
     ART_PEAK_HEIGHT,
+    ANTAGONIST_PAIRS,
 )
 from .detection import (
     add_extra_peak_to_p1,
@@ -115,6 +116,7 @@ from .plotting import (
     plot_envelopes_overlay,
     plot_burst_envelopes_by_channel,
     plot_spontaneous_boxplots,
+    plot_spontaneous_L_shapes,
 )
 
 
@@ -1264,6 +1266,12 @@ def _run_spontaneous_emg_analysis(
         detailed_df=detailed_df,
         out_path=plots_dir / "boxplots_rms_amplitude.png",
         title=f"Spontaneous EMG — per-window RMS / amplitude by channel | {condition}",
+    )
+    plot_spontaneous_L_shapes(
+        detailed_df=detailed_df,
+        available_pairs=ANTAGONIST_PAIRS,
+        out_path=plots_dir / "L-shapes_amlitude_antagonists.png",
+        title=f"Spontaneous EMG — per-window / L-shapes / amplitude by channel | {condition}",
     )
 
 

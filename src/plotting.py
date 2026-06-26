@@ -10,7 +10,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
+from .constants import ANTAGONIST_PAIRS
 matplotlib.use("Agg")
 
 _AMP_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -636,4 +636,65 @@ def plot_envelopes_overlay(
     plt.savefig(out_path)
     plt.close(fig)
 
+def plot_spontaneous_L_shapes(
+    detailed_df: pd.DataFrame,
+    available_pairs: list[tuple[str, str]],
+    title: str,
+    out_path: Path | None = None,
+) -> None:
+
+    available_muscles = set(detailed_df["Channel"])
+    available_pairs = []
+    for muscle_a, muscle_b in ANTAGONIST_PAIRS:
+        if muscle_a in available_muscles and muscle_b in available_muscles:
+            available_pairs.append((muscle_a, muscle_b))       
+    if len(available_pairs) == 0:
+        print("No antagonist pairs found.")
+        return
+
+    n_pairs = len(available_pairs)
+    n_cols = 2
+    n_rows = int(np.ceil(n_pairs / n_cols))
+
+    fig, axes = plt.subplots(n_rows,n_cols,figsize=(12, 5 * n_rows),squeeze=False)
+    idx = 0
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            ax = axes[row, col]
+            if idx >= n_pairs:
+                ax.set_visible(False)
+                continue
+
+            muscle_a, muscle_b = available_pairs[idx]
+            data_a = (detailed_df[detailed_df["Channel"] == muscle_a][["Window", "RMS_uV"]
+                 ].rename(columns={"RMS_uV": "RMS_A"}))
+            data_b = (detailed_df[detailed_df["Channel"] == muscle_b][["Window", "RMS_uV"]
+                ].rename(columns={"RMS_uV": "RMS_B"}) )
+            pair_df = pd.merge(data_a,data_b,on=["Window"], how="inner",)
+
+            if pair_df.empty:
+                ax.set_visible(False)
+                idx += 1
+                continue
+
+            ax.scatter(pair_df["RMS_A"], pair_df["RMS_B"], s=20, alpha=0.5)
+            max_val = max(pair_df["RMS_A"].max(),pair_df["RMS_B"].max())
+            limit = max_val * 1.05
+
+            #ax.plot([0, limit], [0, limit],"k--",lw=1,alpha=0.5)
+            ax.set_xlim(0, limit)
+            ax.set_ylim(0, limit)
+            ax.set_aspect("equal", "box")
+            ax.grid( True,linestyle="--",alpha=0.3)
+            ax.set_xlabel(f"{muscle_a} RMS (µV)")
+            ax.set_ylabel(f"{muscle_b} RMS (µV)")
+            ax.set_title(f"{muscle_a} vs {muscle_b}")
+            idx += 1
+
+    fig.suptitle(title, fontsize=15)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
 
