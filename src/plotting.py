@@ -637,63 +637,59 @@ def plot_envelopes_overlay(
     plt.close(fig)
 
 def plot_spontaneous_L_shapes(
-    detailed_df: pd.DataFrame,
-    available_pairs: list[tuple[str, str]],
+    episodes_df: pd.DataFrame,
     title: str,
     out_path: Path | None = None,
 ) -> None:
-
-    available_muscles = set(detailed_df["Channel"])
-    available_pairs = []
-    for muscle_a, muscle_b in ANTAGONIST_PAIRS:
-        if muscle_a in available_muscles and muscle_b in available_muscles:
-            available_pairs.append((muscle_a, muscle_b))       
-    if len(available_pairs) == 0:
-        print("No antagonist pairs found.")
+    """L-shape antagonist co-activation plot, one point per burst episode.
+    """
+    
+    if episodes_df.empty:
+        print("No antagonist co-activation episodes found.")
         return
 
-    n_pairs = len(available_pairs)
+    pairs = list(dict.fromkeys(episodes_df["Pair"]))  # stable order, de-duplicated
+    n_pairs = len(pairs)
     n_cols = 2
     n_rows = int(np.ceil(n_pairs / n_cols))
 
-    fig, axes = plt.subplots(n_rows,n_cols,figsize=(12, 5 * n_rows),squeeze=False)
-    idx = 0
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 5 * n_rows), squeeze=False)
 
-    for row in range(n_rows):
-        for col in range(n_cols):
-            ax = axes[row, col]
-            if idx >= n_pairs:
-                ax.set_visible(False)
-                continue
+    for idx, pair_name in enumerate(pairs):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row, col]
 
-            muscle_a, muscle_b = available_pairs[idx]
-            data_a = (detailed_df[detailed_df["Channel"] == muscle_a][["Window", "RMS_uV"]
-                 ].rename(columns={"RMS_uV": "RMS_A"}))
-            data_b = (detailed_df[detailed_df["Channel"] == muscle_b][["Window", "RMS_uV"]
-                ].rename(columns={"RMS_uV": "RMS_B"}) )
-            pair_df = pd.merge(data_a,data_b,on=["Window"], how="inner",)
+        pair_df = episodes_df[episodes_df["Pair"] == pair_name].dropna(
+            subset=["RMS_A_uV", "RMS_B_uV"],
+        )
+        if pair_df.empty:
+            ax.set_visible(False)
+            continue
 
-            if pair_df.empty:
-                ax.set_visible(False)
-                idx += 1
-                continue
+        muscle_a = pair_df["Muscle_A"].iloc[0]
+        muscle_b = pair_df["Muscle_B"].iloc[0]
 
-            pair_df["RMS_A_norm"] = pair_df["RMS_A"] / pair_df["RMS_A"].max()
-            pair_df["RMS_B_norm"] = pair_df["RMS_B"] / pair_df["RMS_B"].max()
+        max_a = pair_df["RMS_A_uV"].max()
+        max_b = pair_df["RMS_B_uV"].max()
+        rms_a_norm = pair_df["RMS_A_uV"] / max_a if max_a > 0 else pair_df["RMS_A_uV"] * 0.0
+        rms_b_norm = pair_df["RMS_B_uV"] / max_b if max_b > 0 else pair_df["RMS_B_uV"] * 0.0
 
-            ax.scatter(pair_df["RMS_A_norm"], pair_df["RMS_B_norm"], s=20, alpha=0.5)
-            max_val = max(pair_df["RMS_A_norm"].max(),pair_df["RMS_B_norm"].max())
-            limit = max_val * 1.05
+        for xi, yi in zip(rms_a_norm, rms_b_norm):
+            ax.scatter(xi,yi,s=20,alpha=0.5,color="blue",edgecolors="none")
 
-            #ax.plot([0, limit], [0, limit],"k--",lw=1,alpha=0.5)
-            ax.set_xlim(0, limit)
-            ax.set_ylim(0, limit)
-            ax.set_aspect("equal", "box")
-            ax.grid( True,linestyle="--",alpha=0.3)
-            ax.set_xlabel(f"{muscle_a} RMS (µV)")
-            ax.set_ylabel(f"{muscle_b} RMS (µV)")
-            ax.set_title(f"{muscle_a} vs {muscle_b}")
-            idx += 1
+        max_val = max(rms_a_norm.max(), rms_b_norm.max())
+        limit = max_val * 1.05 if max_val > 0 else 1.0
+        ax.set_xlim(0, limit)
+        ax.set_ylim(0, limit)
+        ax.set_aspect("equal", "box")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.set_xlabel(f"{muscle_a} RMS")
+        ax.set_ylabel(f"{muscle_b} RMS")
+        ax.set_title(f"{muscle_a} vs {muscle_b}")
+
+    for j in range(n_pairs, n_rows * n_cols):
+        row, col = divmod(j, n_cols)
+        axes[row, col].set_visible(False)
 
     fig.suptitle(title, fontsize=15)
     plt.tight_layout()

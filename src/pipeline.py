@@ -1087,6 +1087,60 @@ def _detect_bursts_on_envelope(env_times: np.ndarray, env_uv: np.ndarray):
     return bursts
 
 
+def _merge_time_intervals(
+    intervals: list[tuple[float, float]], merge_s: float,
+) -> list[tuple[float, float]]:
+    
+    if not intervals:
+        return []
+    ivs = sorted((float(s), float(e)) for s, e in intervals)
+    merged: list[list[float]] = [list(ivs[0])]
+    for s, e in ivs[1:]:
+        if s - merged[-1][1] <= merge_s:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _build_coactivation_episodes(
+    bursts_by_ch: dict[str, list[tuple[float, float]]],
+    sig_by_ch: dict[str, np.ndarray],
+    times: np.ndarray,
+    pairs: list[tuple[str, str]],
+    merge_ms: float,
+) -> pd.DataFrame:
+    """Antagonist coactivation episodes: union of each pair's bursts.
+    """
+    
+    merge_s = merge_ms / 1000.0
+    rows: list[dict[str, object]] = []
+    for muscle_a, muscle_b in pairs:
+        bursts_a = bursts_by_ch.get(muscle_a, [])
+        bursts_b = bursts_by_ch.get(muscle_b, [])
+        if not bursts_a and not bursts_b:
+            continue
+        episodes = _merge_time_intervals(list(bursts_a) + list(bursts_b), merge_s)
+        x_a = sig_by_ch.get(muscle_a)
+        x_b = sig_by_ch.get(muscle_b)
+        if x_a is None or x_b is None:
+            continue
+        for ei, (t0, t1) in enumerate(episodes, start=1):
+            mask = (times >= t0) & (times <= t1)
+            if not np.any(mask):
+                continue
+            rms_a = float(np.sqrt(np.mean(x_a[mask] ** 2)))
+            rms_b = float(np.sqrt(np.mean(x_b[mask] ** 2)))
+            rows.append({
+                "Pair": f"{muscle_a} vs {muscle_b}",
+                "Muscle_A": muscle_a, "Muscle_B": muscle_b,
+                "Episode": ei, "Start_s": float(t0), "End_s": float(t1),
+                "Duration_s": float(t1 - t0),
+                "RMS_A_uV": rms_a, "RMS_B_uV": rms_b,
+            })
+    return pd.DataFrame(rows)
+
+
 def _run_spontaneous_emg_analysis(
     start_raw: mne.io.BaseRaw,
     ch_names: list[str],
@@ -1204,6 +1258,16 @@ def _run_spontaneous_emg_analysis(
             "Amp_sem_uV": sem_amp,
         })
 
+    # Antagonist co-activation episodes: union of bursts of each pair's two
+    # muscles, one RMS-per-muscle value per merged episode (see variant B
+    # discussed for the L-shape plot).
+    coact_df = _build_coactivation_episodes(
+        bursts_by_ch=bursts_by_ch,
+        sig_by_ch=sig_by_ch,
+        times=times,
+        pairs=ANTAGONIST_PAIRS,
+        merge_ms=SPONTANEOUS_EMG_BURST_MERGE_MS,
+    )
 
     # Fallback export: for channels with NO bursts that are significantly more
     # active than the rest (robust MAD threshold on mean RMS), still save the
@@ -1238,10 +1302,14 @@ def _run_spontaneous_emg_analysis(
         detailed_df.to_excel(writer, sheet_name="Detailed", index=False)
         if not bursts_df.empty:
             bursts_df.to_excel(writer, sheet_name="Bursts", index=False)
+        if not coact_df.empty:
+            coact_df.to_excel(writer, sheet_name="Coactivation episodes", index=False)
     summary_df.to_csv(excel_dir / f"Spontaneous_EMG_summary_{safe_condition}.csv", index=False)
     detailed_df.to_csv(excel_dir / f"Spontaneous_EMG_detailed_{safe_condition}.csv", index=False)
     if not bursts_df.empty:
         bursts_df.to_csv(excel_dir / f"Spontaneous_EMG_bursts_{safe_condition}.csv", index=False)
+    if not coact_df.empty:
+        coact_df.to_csv(excel_dir / f"Spontaneous_EMG_coactivation_episodes_{safe_condition}.csv", index=False)
 
     plot_spontaneous_overview(
         times=times, ch_names=ch_names, sig_by_ch=sig_by_ch,
@@ -1268,10 +1336,9 @@ def _run_spontaneous_emg_analysis(
         title=f"Spontaneous EMG — per-window RMS / amplitude by channel | {condition}",
     )
     plot_spontaneous_L_shapes(
-        detailed_df=detailed_df,
-        available_pairs=ANTAGONIST_PAIRS,
-        out_path=plots_dir / "L-shapes_amlitude_antagonists.png",
-        title=f"Spontaneous EMG — per-window / L-shapes / amplitude by channel | {condition}",
+        episodes_df=coact_df,
+        out_path=plots_dir / "L-shapes_antagonists.png",
+        title=f"Spontaneous EMG — coactivation episodes of antagonist muscles | {condition}",
     )
 
 
