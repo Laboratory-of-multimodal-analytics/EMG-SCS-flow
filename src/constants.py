@@ -85,6 +85,23 @@ SPONTANEOUS_EMG_BURST_MERGE_MS = 300.0
 # None disables this fallback export.
 SPONTANEOUS_EMG_ACTIVE_MAD_K = 3.0
 
+# -- Assessment of antagonist muscle co-activation (within the spontaneous-EMG analysis) --
+# Add pairs of muscles from the analyzed recording if the required pairs are not in the list.
+ANTAGONIST_PAIRS = [
+# legs
+    ("RF R Filt", "BF R Filt"),("RF L Filt", "BF L Filt"),
+    ("TA R Filt", "GM R Filt"),("TA L Filt", "GM L Filt"),
+
+    ("RF_R", "BF_R"),("TA_R", "GM_R"),
+    ("RF_L", "BF_L"),("TA_L", "GM_L"),
+# arms
+    ("BB R", "TR R"),("BB L", "TR L"),
+    ("FCU R", "ECR R"),("FCU L", "ECR L"),
+
+    ("Bic R", "Trip B"),("Bic L", "Tric L"),
+    ("Flex U R", "Ext U R"),("Flex U L", "Ext U L"),
+]
+
 
 # Reject StartStop channels that look like artifact leakage.
 STARTSTOP_LEAKAGE_CORR_REJECTION = True
