@@ -52,6 +52,11 @@ class Session:
     mode: str = "sir"  # "sir" | "startstop"
     settings: dict[str, Any] = field(default_factory=dict)
 
+    # Session-local template bank (set when the user makes a template from a selection).
+    # None = the stock bank shipped with the repo.
+    template_dir: Path | None = None
+    template_only_user: bool = False
+
     # ---- manual edits (SIR) — the force/suppress/exclude system ----
     force_pos_p1: dict[ForceKey, Any] = field(default_factory=dict)
     force_neg_p1: dict[ForceKey, Any] = field(default_factory=dict)
@@ -200,6 +205,13 @@ class Session:
         P.SIR_EXCLUDE_CHANNELS = set(self.exclude_channels)
         P.SIR_EXCLUDE_CONFIGS = set(self.exclude_configs)
 
+        # Point both modes at a session-local template bank. `_resolve_startstop_template_dir`
+        # is looked up as a module global at call time, so replacing it is enough — no edit
+        # to src/ needed.
+        if self.template_dir is not None:
+            tdir = Path(self.template_dir)
+            P._resolve_startstop_template_dir = lambda _d=tdir: _d
+
     # ------------------------------------------------------------------ #
     # Persistence / reproducibility
     # ------------------------------------------------------------------ #
@@ -208,6 +220,8 @@ class Session:
             "input_path": str(self.input_path) if self.input_path else None,
             "output_dir": str(self.output_dir) if self.output_dir else None,
             "mode": self.mode,
+            "template_dir": str(self.template_dir) if self.template_dir else None,
+            "template_only_user": self.template_only_user,
             "settings": {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.settings.items()},
             "force_pos_p1": [[list(k), v] for k, v in self.force_pos_p1.items()],
             "force_neg_p1": [[list(k), v] for k, v in self.force_neg_p1.items()],
@@ -224,6 +238,8 @@ class Session:
             output_dir=Path(d["output_dir"]) if d.get("output_dir") else None,
             mode=d.get("mode", "sir"),
             settings=dict(d.get("settings", {})),
+            template_dir=Path(d["template_dir"]) if d.get("template_dir") else None,
+            template_only_user=bool(d.get("template_only_user", False)),
         )
         s.force_pos_p1 = {tuple(k): (tuple(v) if isinstance(v, list) else v)
                           for k, v in d.get("force_pos_p1", [])}
@@ -274,6 +290,13 @@ class Session:
             f"P.SIR_EXCLUDE_CHANNELS = {set(self.exclude_channels) or set()!r}",
             f"P.SIR_EXCLUDE_CONFIGS = {set(self.exclude_configs) or set()!r}",
         ]
+
+        if self.template_dir is not None:
+            edit_lines.append(
+                "\n# --- session-local template bank (built from a selected response) ---\n"
+                f"from pathlib import Path as _Path\n"
+                f"P._resolve_startstop_template_dir = lambda: _Path(r\"{self.template_dir}\")"
+            )
 
         kw = self.kwargs()
         kw_lines = [f"    {k}={v!r}," for k, v in sorted(kw.items())]

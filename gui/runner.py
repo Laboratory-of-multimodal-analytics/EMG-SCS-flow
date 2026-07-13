@@ -1,14 +1,27 @@
-"""Background execution of the real pipeline, with its log streamed to the UI."""
+"""Background execution of the real pipeline, with its log and progress streamed to the UI."""
 
 from __future__ import annotations
 
 import io
 import logging
+import re
 import traceback
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
+
+# The pipeline drives two tqdm loops, one per mode:
+#   SIR mode:       "PASS 2: detect epochs"          (over crops)
+#   StartStop mode: "STARTSTOP: detect by condition" (over conditions)
+# tqdm renders to stderr and rewrites the line with \r, so we parse the carriage-return
+# fragments rather than whole lines.
+# The desc itself contains a colon ("STARTSTOP: detect by condition"), so match everything
+# up to the percentage rather than stopping at the first colon.
+_TQDM_RE = re.compile(r"^(?P<desc>.*?)\s*:?\s*\d+%\|.*?\|\s*(?P<n>\d+)/(?P<total>\d+)")
+
+# Coarse stage messages the pipeline prints, so the bar means something before the loop starts.
+_STAGE_RE = re.compile(r"^\[(SIR|STARTSTOP)\]\s*(?P<msg>.+?)\.{0,3}$")
 
 
 class _LogStream(io.TextIOBase):
@@ -33,6 +46,41 @@ class _LogStream(io.TextIOBase):
         self._buf = ""
 
 
+class _ProgressStream(io.TextIOBase):
+    """Parse tqdm's stderr chatter into (phase, n, total) progress updates."""
+
+    def __init__(self, emit_progress, emit_log) -> None:
+        super().__init__()
+        self._progress = emit_progress
+        self._log = emit_log
+        self._buf = ""
+        self._last: tuple[str, int] | None = None
+
+    def write(self, text: str) -> int:  # noqa: D102
+        self._buf += text
+        # tqdm redraws with \r; split on both so we see every refresh.
+        parts = re.split(r"[\r\n]", self._buf)
+        self._buf = parts.pop()
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            m = _TQDM_RE.search(part)
+            if m:
+                phase = m.group("desc").strip().rstrip(":") or "Working"
+                n, total = int(m.group("n")), int(m.group("total"))
+                if self._last != (phase, n):
+                    self._last = (phase, n)
+                    self._progress(phase, n, total)
+                continue
+            if not part.startswith(("  ", "Reading", "Isotrak", "Adding", "Ready")):
+                self._log(part)
+        return len(text)
+
+    def flush(self) -> None:  # noqa: D102
+        self._buf = ""
+
+
 class _QtLogHandler(logging.Handler):
     def __init__(self, emit) -> None:
         super().__init__()
@@ -53,6 +101,7 @@ class PipelineWorker(QObject):
     """
 
     log = Signal(str)
+    progress = Signal(str, int, int)  # phase, n, total
     finished = Signal(object)   # Path to the output root
     failed = Signal(str)
 
@@ -73,16 +122,21 @@ class PipelineWorker(QObject):
             root.addHandler(handler)
 
             self.log.emit(f"Running {self.session.mode.upper()} mode on {self.session.input_path}")
-            stream = _LogStream(self.log.emit)
+            if self.session.template_dir is not None:
+                self.log.emit(f"Template bank: {self.session.template_dir}")
+
+            out_stream = _LogStream(self.log.emit)
+            err_stream = _ProgressStream(self.progress.emit, self.log.emit)
             try:
-                with redirect_stdout(stream):
+                with redirect_stdout(out_stream), redirect_stderr(err_stream):
                     out = run_pipeline(
                         self.session.input_path,
                         output_dir=self.session.output_dir,
                         startstop_mode=(self.session.mode == "startstop"),
                         **self.session.kwargs(),
                     )
-                stream.flush()
+                out_stream.flush()
+                err_stream.flush()
             finally:
                 root.removeHandler(handler)
 
@@ -96,6 +150,7 @@ class RunController(QObject):
     """Owns the worker thread and keeps the UI from launching two runs at once."""
 
     log = Signal(str)
+    progress = Signal(str, int, int)
     finished = Signal(object)
     failed = Signal(str)
     busy_changed = Signal(bool)
@@ -118,6 +173,7 @@ class RunController(QObject):
 
         self._thread.started.connect(self._worker.run)
         self._worker.log.connect(self.log)
+        self._worker.progress.connect(self.progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._thread.start()

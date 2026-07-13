@@ -20,40 +20,75 @@ interactive edit is stored as the same module globals the pipeline already reads
 why **File → Export runner script** can emit a standalone `.py` that reproduces the session
 headlessly.
 
+## Opening work
+
+- **Open recording…** — pick a `.mat` / `.fif` / `.edf`, choose the mode, **Run**. The progress
+  bar is driven by the pipeline's own tqdm loops (crops in SIR, conditions in StartStop), so it
+  shows real counts rather than spinning.
+- **Open results folder…** — open an output root that already has results, **without re-running**.
+  The mode is detected from the *content* (both mode folders exist on every run, so an empty
+  `Stimulation-induced responses/` proves nothing). If the GUI produced the run, its
+  `review/session.json` is restored with it, edits and all.
+- **Processed recordings…** — scan a folder (e.g. `Coding/results/`) and list every run that
+  already has results: mode, crops or conditions, metrics-table size, whether spontaneous EMG
+  ran, and when. Double-click to open. The scan runs in the background; the *first* scan of a
+  Google Drive folder is slow because Drive fetches every directory listing over the network,
+  after which it is instant.
+
 ## The three surfaces
 
 | Tab | Mode | What you do |
 |---|---|---|
-| **Crop review (SIR)** | Stimulation-induced | Walk the `(config, amplitude)` crops. Crops with **0 detections are red** in the list. Click a peak to force P1 onto it. |
+| **Crop review (SIR)** | Stimulation-induced | Walk the `(config, amplitude)` crops. Crops with **0 detections are red**. Click a peak to force P1; reject false positives; drag out a response and turn it into a template. |
 | **Epoch browser (StartStop)** | StartStop | Walk the detected responses, flag bad / false-positive / complex ones, drag out a window and annotate it, export the waveform to CSV for the stimulator. |
 | **Spontaneous EMG** | StartStop | RMS envelopes with the detected bursts; export a burst envelope. |
 
 `Settings` is generated from the lever registry, grouped as in `constants.py`, and swaps
 its contents with the mode.
 
-### Crop review — mouse map
+### Crop review — Markers mode
 
 | Action | Effect | Global it writes |
 |---|---|---|
 | click a peak | force P1 onto it, polarity from the dropdown (or the sign under the cursor) | `SIR_FORCE_POS_P1_AFTER` / `SIR_FORCE_NEG_P1_AFTER` |
-| Shift+click | suppress this detection | `SIR_SUPPRESS_KEYS` |
+| Shift+click, or double-click a table row | reject as a false positive | `SIR_SUPPRESS_KEYS` |
 | Ctrl+click | whitelist — bypass the consistency gates | `SIR_FORCE_KEYS` |
 | Alt+click | exclude the whole channel | `SIR_EXCLUDE_CHANNELS` |
 | right-click | clear the forced marker | — |
 
-Edits are written at the most specific `(config, amp, channel)` precedence level, so they are
-**additive**: forcing a peak on one crop cannot alter a crop you did not name. Clicking left of
-`t = 0` forces a peak *before* the stimulus, which is allowed and sometimes correct.
+**Rejection is immediate and everywhere at once**: the markers vanish from the plot, the channel
+row in the table drops to 0 detections and reads `rejected`, the crop's count in the list falls,
+and the recruitment table and the exported metrics agree. No re-run needed for the numbers to
+match what you see — and because it is stored as `SIR_SUPPRESS_KEYS`, the next real run
+reproduces the same decision.
 
-“Bind P1 to a ±3 ms window” writes `(min_lat, max_lat)` so P1 cannot drift to a stronger later
-peak; unchecked, it writes a bare `min_lat` and P1 becomes the dominant deflection at or after
-the click.
+Edits are written at the most specific `(config, amp, channel)` precedence level, so they are
+**additive**: forcing or rejecting on one crop cannot alter a crop you did not name. Clicking left
+of `t = 0` forces a peak *before* the stimulus, which is allowed and sometimes correct.
+
+“Bind P1 to ±3 ms” writes `(min_lat, max_lat)` so P1 cannot drift to a stronger later peak;
+unchecked, it writes a bare `min_lat` and P1 becomes the dominant deflection at or after the click.
+
+### Crop review — Template mode
+
+Switch to **Template**, drag over the response you want found, and press *Make template from
+selection*. The selected span of the epoch mean is resampled onto the bank's native 2 kHz grid
+(index 200 = `t = 0`), flattened outside the selection, and its onset / P1 / P2 are marked with
+the same rule the pipeline's forced-marker logic uses. It is written into a session-local bank
+under `<output>/templates/` and the pipeline is pointed at it — **both modes** load their bank
+through the same function, so a template made here drives StartStop matching too.
+
+*Detect by my templates only* gives a bank containing nothing but your templates — that is how you
+say “find me this response and nothing else”. Unchecked, yours are added on top of the 26 stock
+ones. The bank path is carried in `session.json` and in the exported runner script, so a run made
+with a custom template stays reproducible.
 
 ## Re-running
 
 “Apply edits and re-run” re-runs **the whole file**. The pipeline has no per-crop entry point,
 so a genuinely incremental re-run would need `src/pipeline.py` refactored — this is the honest
-limitation of v1, not a stub.
+limitation, not a stub. (Rejecting a false positive does *not* need a re-run; making a template
+does, since detection itself changes.)
 
 ## Files it writes
 
@@ -77,6 +112,9 @@ Inside the output root, in a `review/` folder that is never touched by the pipel
   the constant→parameter map, since the names differ: `window_ms`, `hop_ms`, `uv`).
 - The leakage thresholds (±40 ms, corr 0.7, >3 channels) and the `borderline_valid_very_low_corr`
   rule are hardcoded locals in `pipeline.py`, so they are **not** exposed as controls.
+- The metrics CSVs run to **50–120 MB** because of the `Time series` column. The scanner never
+  reads them (it works from directory metadata alone), and loading one skips that column at parse
+  time — waveforms come from the epoch `.fif` files instead.
 - `STARTSTOP_ONSET_TMIN` / `_ONSET_TMAX` / `_RESP_TMAX` are imported by the pipeline but never
   read — deliberately not shown, since a control for them would be a lie.
 - `Detections raw/<cond>_detections_raw.fif` holds the concatenated start segment, but its
@@ -90,13 +128,15 @@ Inside the output root, in a `review/` folder that is never touched by the pipel
 gui/
 ├── settings_spec.py   # the lever registry: every knob, its type, group, and HOW it reaches the pipeline
 ├── session.py         # settings + edits; applies them; JSON round-trip; runner-script export
-├── runner.py          # runs run_pipeline off the UI thread, streams its log
-├── results.py         # reads what the pipeline wrote (crops, detections, envelopes, QC tables)
+├── runner.py          # runs run_pipeline off the UI thread; streams its log and tqdm progress
+├── results.py         # reads what the pipeline wrote; finds already-processed runs on disk
+├── templates.py       # builds a bank-format template from a selected response
 ├── review_store.py    # clinician flags / annotations / CSV export (JSON sidecar)
-├── main_window.py     # shell: file, mode switch, tabs, log
+├── main_window.py     # shell: file, mode switch, tabs, progress, log
 └── widgets/
     ├── settings_panel.py
     ├── sir_viewer.py
     ├── startstop_viewer.py
-    └── spontaneous_viewer.py
+    ├── spontaneous_viewer.py
+    └── database_dialog.py
 ```

@@ -126,6 +126,41 @@ class ReviewStore:
                 fh.write(f"# note: {note}\n")
             df.to_csv(fh, index=False)
 
+    @staticmethod
+    def augment_sir_metrics(metrics: pd.DataFrame, session) -> pd.DataFrame:
+        """SIR metrics with the manual rejections applied.
+
+        A rejected (config, amp, channel) has its detections blanked and is labelled, so the
+        exported table says exactly what the plots and the recruitment view say. Returns a
+        NEW frame: the pipeline's own CSV stays untouched and reproducible.
+        """
+        if metrics.empty:
+            return metrics
+        out = metrics.copy()
+
+        def _status(cfg: str, amp: str, ch: str) -> str:
+            key = (str(cfg), str(amp), str(ch))
+            if str(ch) in session.exclude_channels:
+                return "excluded channel"
+            if str(cfg) in session.exclude_configs:
+                return "excluded config"
+            if key in session.suppress_keys:
+                return "false positive"
+            if key in session.force_keys:
+                return "whitelisted"
+            return ""
+
+        out["Review status"] = [
+            _status(c, a, ch)
+            for c, a, ch in zip(out["Configuration"], out["Stim. amplitude"], out["Channel"])
+        ]
+        dropped = out["Review status"].isin(["false positive", "excluded channel", "excluded config"])
+        for col in ("Onset latency", "Peak1 latency", "Peak2 latency",
+                    "Peak1 value", "Peak2 value", "PTP amplitude"):
+            if col in out.columns:
+                out.loc[dropped, col] = np.nan
+        return out
+
     def augment_metrics(self, metrics: pd.DataFrame, condition_col: str = "Configuration") -> pd.DataFrame:
         """Add the manual review columns to the pipeline's metrics table.
 

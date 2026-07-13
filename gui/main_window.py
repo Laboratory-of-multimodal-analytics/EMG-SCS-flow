@@ -11,10 +11,11 @@ from PySide6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QWidget, QVBoxLayout,
 )
 
-from .results import SIRResults, SpontaneousResults, StartStopResults
+from .results import SIRResults, SpontaneousResults, StartStopResults, detect_mode
 from .review_store import ReviewStore
 from .runner import RunController
 from .session import Session
+from .widgets.database_dialog import DatabaseDialog
 from .widgets.settings_panel import SettingsPanel
 from .widgets.sir_viewer import SIRViewer
 from .widgets.spontaneous_viewer import SpontaneousViewer
@@ -32,10 +33,12 @@ class MainWindow(QMainWindow):
         self.session = Session()
         self.controller = RunController()
         self.controller.log.connect(self._log)
+        self.controller.progress.connect(self._on_progress)
         self.controller.finished.connect(self._on_finished)
         self.controller.failed.connect(self._on_failed)
         self.controller.busy_changed.connect(self._on_busy)
         self.store: ReviewStore | None = None
+        self.last_scan_dir: Path | None = None
 
         # ---- top bar ----
         self.file_label = QLabel("No file loaded")
@@ -43,6 +46,9 @@ class MainWindow(QMainWindow):
 
         open_btn = QPushButton("Open recording…")
         open_btn.clicked.connect(self.open_file)
+        browse_btn = QPushButton("Processed recordings…")
+        browse_btn.setToolTip("Scan a folder for runs that already have results and open one.")
+        browse_btn.clicked.connect(self.browse_database)
 
         self.mode_box = QComboBox()
         self.mode_box.addItems([m[0] for m in MODES])
@@ -53,12 +59,13 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(False)
 
         self.progress = QProgressBar()
-        self.progress.setRange(0, 0)  # indeterminate
+        self.progress.setTextVisible(True)
         self.progress.hide()
-        self.progress.setMaximumWidth(160)
+        self.progress.setMinimumWidth(260)
 
         top = QHBoxLayout()
         top.addWidget(open_btn)
+        top.addWidget(browse_btn)
         top.addWidget(self.file_label, 1)
         top.addWidget(QLabel("Mode:"))
         top.addWidget(self.mode_box)
@@ -101,11 +108,17 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         for text, slot in (
             ("Open recording…", self.open_file),
+            ("Open results folder…", self.open_results),
+            ("Browse processed recordings…", self.browse_database),
+            (None, None),
             ("Load session…", self.load_session),
             ("Save session…", self.save_session),
             ("Export runner script…", self.export_runner),
             ("Export reviewed metrics…", self.export_reviewed_metrics),
         ):
+            if text is None:
+                file_menu.addSeparator()
+                continue
             act = QAction(text, self)
             act.triggered.connect(slot)
             file_menu.addAction(act)
@@ -144,10 +157,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(1, sir)
         self.tabs.setTabEnabled(2, not sir)
         self.tabs.setTabEnabled(3, not sir)  # spontaneous only runs inside StartStop
-        self.tabs.setCurrentIndex(0 if not self._has_results() else (1 if sir else 2))
-
-    def _has_results(self) -> bool:
-        return self.session.output_dir is not None and Path(self.session.output_dir).exists()
+        if not self.tabs.isTabEnabled(self.tabs.currentIndex()):
+            self.tabs.setCurrentIndex(0)
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
@@ -163,6 +174,22 @@ class MainWindow(QMainWindow):
     def _on_busy(self, busy: bool) -> None:
         self.run_btn.setEnabled(not busy and self.session.input_path is not None)
         self.progress.setVisible(busy)
+        if busy:
+            # Until the first tqdm tick arrives we do not know the total, so stay busy-looking.
+            self.progress.setRange(0, 0)
+            self.progress.setFormat("starting…")
+
+    def _on_progress(self, phase: str, n: int, total: int) -> None:
+        """Determinate progress, driven by the pipeline's own tqdm loops.
+
+        SIR ticks over crops ("PASS 2: detect epochs"), StartStop over conditions
+        ("STARTSTOP: detect by condition").
+        """
+        if total <= 0:
+            return
+        self.progress.setRange(0, total)
+        self.progress.setValue(n)
+        self.progress.setFormat(f"{phase} — %v/%m")
 
     def _on_failed(self, tb: str) -> None:
         self._log(tb)
@@ -170,12 +197,17 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, output_root: Path) -> None:
         self.session.output_dir = output_root
-        self.store = ReviewStore(output_root)
-
         # Persist the exact settings that produced these outputs, next to them.
         self.session.save_json(Path(output_root) / "review" / "session.json")
+        self.show_results(output_root, self.session.mode)
 
-        if self.session.mode == "sir":
+    # ------------------------------------------------------------------ #
+    def show_results(self, output_root: Path, mode: str) -> None:
+        """Populate the review surfaces from an output root — freshly produced or loaded."""
+        output_root = Path(output_root)
+        self.store = ReviewStore(output_root)
+
+        if mode == "sir":
             results = SIRResults(output_root)
             if not results.ok:
                 self._log("No crops found — check the annotations.")
@@ -192,6 +224,61 @@ class MainWindow(QMainWindow):
                 self.spontaneous_viewer.load(sp)
             self.tabs.setCurrentIndex(2)
 
+    def open_results(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Open an output folder")
+        if path:
+            self.load_results(Path(path))
+
+    def load_results(self, root: Path) -> None:
+        """Open results that already exist on disk, without re-running anything."""
+        mode = detect_mode(root)
+        if mode is None:
+            QMessageBox.warning(
+                self, "No results here",
+                f"{root}\n\ndoes not contain pipeline results.\n\n"
+                "Note that the pipeline creates both mode folders on every run, so an empty "
+                "'Stimulation-induced responses' folder does not mean SIR results exist.",
+            )
+            return
+
+        # Re-use the settings that produced this run, if the GUI wrote them.
+        sess_file = root / "review" / "session.json"
+        if sess_file.exists():
+            try:
+                self.session = Session.load_json(sess_file)
+                self._rebind_session()
+                self._log(f"Restored the session that produced these results: {sess_file}")
+            except Exception as exc:
+                self._log(f"Could not restore session.json ({exc}); using defaults.")
+
+        self.session.output_dir = root
+        self.session.set_mode(mode)
+        self.mode_box.blockSignals(True)
+        self.mode_box.setCurrentIndex(0 if mode == "sir" else 1)
+        self.mode_box.blockSignals(False)
+        self.settings_panel.rebuild()
+        self._sync_tabs()
+
+        self.file_label.setText(f"{root.name}   (loaded results)")
+        self.run_btn.setEnabled(self.session.input_path is not None)
+        self._log(f"Loaded {mode.upper()} results from {root}")
+        self.show_results(root, mode)
+
+    def browse_database(self) -> None:
+        base = self.last_scan_dir
+        if base is None and self.session.output_dir is not None:
+            base = Path(self.session.output_dir).parent
+        dlg = DatabaseDialog(self, base)
+        if dlg.exec() and dlg.selected is not None:
+            self.last_scan_dir = Path(dlg.path_label.text())
+            self.load_results(dlg.selected.root)
+
+    def _rebind_session(self) -> None:
+        """Point the widgets at a freshly loaded Session object."""
+        self.settings_panel.session = self.session
+        for w in (self.sir_viewer, self.startstop_viewer, self.spontaneous_viewer):
+            w.session = self.session
+
     # ------------------------------------------------------------------ #
     def save_session(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save session", "session.json", "JSON (*.json)")
@@ -205,10 +292,8 @@ class MainWindow(QMainWindow):
             return
         self.session = Session.load_json(Path(path))
         # Rebuild the widgets that hold a reference to the old session object.
-        self.settings_panel.session = self.session
+        self._rebind_session()
         self.settings_panel.rebuild()
-        for w in (self.sir_viewer, self.startstop_viewer, self.spontaneous_viewer):
-            w.session = self.session
         self.mode_box.setCurrentIndex(0 if self.session.mode == "sir" else 1)
         self.file_label.setText(str(self.session.input_path or "No file loaded"))
         self.run_btn.setEnabled(self.session.input_path is not None)
@@ -236,13 +321,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No results", "Run the pipeline first.")
             return
         if self.session.mode == "sir":
-            QMessageBox.information(
-                self, "StartStop only",
-                "The manual review layer applies to the StartStop epoch browser.",
-            )
-            return
-        results = StartStopResults(self.session.output_dir)
-        augmented = self.store.augment_metrics(results.metrics)
+            results = SIRResults(self.session.output_dir)
+            augmented = self.store.augment_sir_metrics(results.metrics, self.session)
+        else:
+            results = StartStopResults(self.session.output_dir)
+            augmented = self.store.augment_metrics(results.metrics)
         if augmented.empty:
             QMessageBox.information(self, "Nothing to export", "The metrics table is empty.")
             return
