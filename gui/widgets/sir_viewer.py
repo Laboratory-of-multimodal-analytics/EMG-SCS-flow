@@ -18,17 +18,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSplitter,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSlider,
+    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..results import Crop, SIRResults
+from .plot_canvas import VerticalPlotCanvas, style_channel_axis
 
 # P1 is drawn red and P2 green — the convention the whole project reads by.
 C_P1, C_P2, C_ONSET = "#d62728", "#2ca02c", "#7f7f7f"
@@ -92,6 +91,15 @@ class SIRViewer(QWidget):
             lambda v: setattr(self.session, "template_only_user", bool(v))
         )
 
+        # One tall row per channel, scrolled — as in the pipeline's own panels. A slider
+        # trades rows-on-screen against row height.
+        self.zoom = QSlider(Qt.Horizontal)
+        self.zoom.setRange(9, 40)      # tenths of an inch per channel row
+        self.zoom.setValue(20)
+        self.zoom.setFixedWidth(110)
+        self.zoom.setToolTip("Height of each channel row")
+        self.zoom.valueChanged.connect(lambda v: self.plot.set_row_height(v / 10.0))
+
         bar = QHBoxLayout()
         bar.addWidget(QLabel("Mode:"))
         bar.addWidget(self.mode_markers)
@@ -103,10 +111,11 @@ class SIRViewer(QWidget):
         bar.addWidget(self.make_template_btn)
         bar.addWidget(self.only_user_templates)
         bar.addStretch()
+        bar.addWidget(QLabel("Row height:"))
+        bar.addWidget(self.zoom)
 
-        self.fig = Figure(figsize=(8, 7), layout="constrained")
-        self.canvas = FigureCanvasQTAgg(self.fig)
-        self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.plot = VerticalPlotCanvas(row_inches=2.0)
+        self.plot.canvas.mpl_connect("button_press_event", self._on_click)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -131,7 +140,7 @@ class SIRViewer(QWidget):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.addLayout(bar)
-        rv.addWidget(self.canvas, 1)
+        rv.addWidget(self.plot, 1)
         rv.addWidget(self.hint)
         rv.addWidget(self.table)
         rv.addWidget(self.rerun_btn)
@@ -201,21 +210,18 @@ class SIRViewer(QWidget):
     def _draw(self) -> None:
         if self.results is None or self.crop is None:
             return
-        self.fig.clear()
         self._axes.clear()
         self._selectors.clear()
 
         try:
             epochs = self.results.load_epochs(self.crop)
         except Exception as exc:  # a crop can exist without a readable epoch file
-            ax = self.fig.add_subplot(111)
-            ax.text(0.5, 0.5, f"Cannot read epochs:\n{exc}", ha="center", va="center")
-            self.canvas.draw_idle()
+            self.plot.message(f"Cannot read epochs:\n{exc}")
             return
 
         chans = [c for c in epochs.ch_names if "art" not in c.lower()]
         if not chans:
-            self.canvas.draw_idle()
+            self.plot.message("This crop has no EMG channels.")
             return
 
         times = epochs.times
@@ -223,27 +229,38 @@ class SIRViewer(QWidget):
         mean = data.mean(axis=0)
         template_mode = self.mode_template.isChecked()
 
-        axes = self.fig.subplots(len(chans), 1, sharex=True, squeeze=False)[:, 0]
+        axes = self.plot.make_axes(len(chans))
         for ax, ch, idx in zip(axes, chans, range(len(chans))):
             self._axes[ch] = ax
             state = self.session.edit_state(self.crop.config, self.crop.amp, ch)
             rejected = state["suppressed"] or state["channel_excluded"] or state["config_excluded"]
 
-            ax.plot(times, data[:, idx, :].T, color="0.8", lw=0.4, zorder=1)
-            ax.plot(times, mean[idx], color="black", lw=1.4, zorder=3)
-            ax.axvline(0.0, color="0.5", lw=0.8, ls=":", zorder=2)
+            ax.plot(times, data[:, idx, :].T, color="0.82", lw=0.5, zorder=1)
+            ax.plot(times, mean[idx], color="black", lw=1.6, zorder=3)
+            ax.axvline(0.0, color="0.45", lw=0.9, ls=":", zorder=2)
+            ax.axhline(0.0, color="0.85", lw=0.6, zorder=1)
+
+            # Scale each row to its own RESPONSE, not to the whole epoch: the stimulus
+            # artifact and pre-stimulus drift are often an order of magnitude larger and
+            # would flatten the very deflection being judged.
+            resp = mean[idx][times > 0]
+            span = float(np.nanmax(np.abs(resp))) if resp.size and np.isfinite(resp).any() else 0.0
+            if span > 0:
+                ax.set_ylim(-1.6 * span, 1.6 * span)
 
             # Markers vanish the moment a detection is rejected — the plot and the table
             # must never disagree about what counts as detected.
             m = self.results.markers(self.crop, ch)
             if not m.empty and not rejected:
-                for col, colour in (
-                    ("Onset latency", C_ONSET), ("Peak1 latency", C_P1), ("Peak2 latency", C_P2)
+                for col, colour, name in (
+                    ("Onset latency", C_ONSET, "onset"),
+                    ("Peak1 latency", C_P1, "P1"),
+                    ("Peak2 latency", C_P2, "P2"),
                 ):
                     lat = m[col].to_numpy(dtype=float)
                     lat = lat[~np.isnan(lat)]
                     if lat.size:
-                        ax.axvline(float(np.median(lat)), color=colour, lw=1.2, alpha=0.9, zorder=4)
+                        ax.axvline(float(np.median(lat)), color=colour, lw=1.4, alpha=0.9, zorder=4)
 
             tags = []
             if state["forced"]:
@@ -254,11 +271,14 @@ class SIRViewer(QWidget):
                 tags.append("whitelisted")
             if state["channel_excluded"]:
                 tags.append("EXCLUDED")
-            ax.set_ylabel(ch + (f"\n[{', '.join(tags)}]" if tags else ""),
-                          rotation=0, ha="right", va="center", fontsize=8)
-            ax.tick_params(labelsize=7)
+            style_channel_axis(
+                ax,
+                ch + (f"\n[{', '.join(tags)}]" if tags else ""),
+                bold=bool(m["Peak1 latency"].notna().any()) if not m.empty else False,
+                muted=rejected,
+            )
             if rejected:
-                ax.set_facecolor("#f5f0f0")
+                ax.set_facecolor("#f7f0f0")
 
             if self._selection and self._selection[0] == ch:
                 ax.axvspan(self._selection[1], self._selection[2],
@@ -270,13 +290,14 @@ class SIRViewer(QWidget):
                     useblit=True, props=dict(alpha=0.3, facecolor="#ffb703"),
                 ))
 
-        axes[-1].set_xlabel("time (s)")
+        axes[-1].set_xlabel("time (s)", fontsize=10)
         axes[-1].set_xlim(times[0], times[-1])
-        self.fig.suptitle(
+        self.plot.fig.suptitle(
             f"{self.crop.label}   —   {len(epochs)} epochs   "
-            f"(red = P1, green = P2, grey = onset)", fontsize=10,
+            f"(red = P1, green = P2, grey = onset; each row scaled to its own response)",
+            fontsize=11,
         )
-        self.canvas.draw_idle()
+        self.plot.draw()
 
         self._refresh_table()
         excluded = self.crop.config in self.session.exclude_configs
@@ -288,7 +309,11 @@ class SIRViewer(QWidget):
     def _refresh_table(self) -> None:
         if self.results is None or self.crop is None:
             return
-        df = self.results.channel_summary(self.crop, self.session)
+        # Pass the plotted channels so quiet muscles get a row too, not just the ones the
+        # pipeline emitted metrics for.
+        df = self.results.channel_summary(
+            self.crop, self.session, channels=list(self._axes) or None
+        )
         self.table.setRowCount(len(df))
         for r, (_, row) in enumerate(df.iterrows()):
             for c, key in enumerate(["Channel", "Detections", "Epochs", "P1 (ms)", "PTP (µV)", "Status"]):

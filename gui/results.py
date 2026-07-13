@@ -258,23 +258,40 @@ class SIRResults:
             or config in session.exclude_configs
         )
 
-    def channel_summary(self, crop: Crop, session=None) -> pd.DataFrame:
-        """Per-channel view of one crop, for the live table under the plot."""
-        if self.metrics.empty:
-            return pd.DataFrame()
+    def channel_summary(
+        self, crop: Crop, session=None, channels: list[str] | None = None
+    ) -> pd.DataFrame:
+        """Per-channel view of one crop, for the live table under the plot.
+
+        `channels` (the crop's actual EMG channels) makes silent channels appear too: the
+        pipeline only writes metric rows for channels it detected something on, so without
+        this the table would simply omit the muscles that stayed quiet.
+        """
         m = self.metrics
         sel = (
             (m["Configuration"].astype(str) == crop.config)
             & (m["Stim. amplitude"].astype(str) == crop.amp)
-        )
+        ) if not m.empty else None
+        groups = dict(list(m[sel].groupby("Channel"))) if sel is not None else {}
+
+        names = channels if channels is not None else sorted(groups)
         rows = []
-        for ch, grp in m[sel].groupby("Channel"):
+        for ch in names:
+            grp = groups.get(ch)
             rejected = session is not None and self._is_rejected(session, crop.config, crop.amp, str(ch))
+            if grp is None:
+                rows.append({
+                    "Channel": str(ch), "Detections": 0, "Epochs": 0,
+                    "P1 (ms)": np.nan, "PTP (µV)": np.nan,
+                    "Status": "rejected" if rejected else "no response",
+                })
+                continue
             det = 0 if rejected else int(grp["Peak1 latency"].notna().sum())
             p1 = grp["Peak1 latency"].to_numpy(dtype=float)
-            ptp = grp["PTP amplitude"].to_numpy(dtype=float)
-            status = "rejected" if rejected else ("detected" if det else "—")
-            if session is not None and (crop.config, crop.amp, str(ch)) in session.force_keys:
+            # Amplitudes are stored in VOLTS; the column header promises µV.
+            ptp = grp["PTP amplitude"].to_numpy(dtype=float) * 1e6
+            status = "rejected" if rejected else ("detected" if det else "no response")
+            if not rejected and session is not None and (crop.config, crop.amp, str(ch)) in session.force_keys:
                 status = "whitelisted"
             rows.append({
                 "Channel": str(ch),
@@ -309,7 +326,8 @@ class SIRResults:
                 detections=("detected", "sum"),
                 epochs=("detected", "size"),
                 p1_lat_ms=("Peak1 latency", lambda s: 1000 * np.nanmean(s) if s.notna().any() else np.nan),
-                ptp_uv=("PTP amplitude", lambda s: np.nanmean(s) if s.notna().any() else np.nan),
+                # stored in volts
+                ptp_uv=("PTP amplitude", lambda s: 1e6 * np.nanmean(s) if s.notna().any() else np.nan),
             )
             .reset_index()
         )

@@ -10,17 +10,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..results import Detection, StartStopResults
 from ..review_store import STATUS_LABEL, STATUSES, Annotation, ReviewStore
+from .plot_canvas import VerticalPlotCanvas, style_channel_axis
 
 STATUS_COLOUR = {
     "ok": None,
@@ -66,14 +65,22 @@ class StartStopViewer(QWidget):
         lv.addWidget(why)
 
         # ---- right ----
-        self.fig = Figure(figsize=(9, 7), layout="constrained")
-        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.plot = VerticalPlotCanvas(row_inches=1.8)
+
+        self.zoom = QSlider(Qt.Horizontal)
+        self.zoom.setRange(9, 40)
+        self.zoom.setValue(18)
+        self.zoom.setFixedWidth(110)
+        self.zoom.setToolTip("Height of each channel row")
+        self.zoom.valueChanged.connect(lambda v: self.plot.set_row_height(v / 10.0))
 
         bar = QHBoxLayout()
         self.window_label = QLabel("Drag over the plot to select a window.")
         self.window_label.setStyleSheet("color: gray;")
         bar.addWidget(self.window_label)
         bar.addStretch()
+        bar.addWidget(QLabel("Row height:"))
+        bar.addWidget(self.zoom)
         self.annotate_btn = QPushButton("Annotate selection")
         self.annotate_btn.clicked.connect(self._annotate)
         self.export_btn = QPushButton("Export selection to CSV")
@@ -88,7 +95,7 @@ class StartStopViewer(QWidget):
 
         right = QWidget()
         rv = QVBoxLayout(right)
-        rv.addWidget(self.canvas, 1)
+        rv.addWidget(self.plot, 1)
         rv.addLayout(bar)
         rv.addWidget(QLabel("Annotations (double-click to delete)"))
         rv.addWidget(self.ann_list)
@@ -139,12 +146,11 @@ class StartStopViewer(QWidget):
 
     # ------------------------------------------------------------------ #
     def _draw(self) -> None:
-        self.fig.clear()
         self._span = None
         self.window_label.setText("Drag over the plot to select a window.")
         det = self._current()
         if det is None or self.results is None:
-            self.canvas.draw_idle()
+            self.plot.message("No detection selected.")
             return
 
         # Sync the status box without re-triggering it.
@@ -165,24 +171,22 @@ class StartStopViewer(QWidget):
         data = raw.get_data(picks=chans, start=s0, stop=s1) * 1e6
         times = np.arange(s0, s1) / sfreq
 
-        axes = self.fig.subplots(len(chans), 1, sharex=True, squeeze=False)[:, 0]
+        axes = self.plot.make_axes(len(chans))
         for ax, ch, row in zip(axes, chans, range(len(chans))):
             responding = ch in det.channels
-            ax.plot(times, data[row], lw=0.6,
-                    color="#1f77b4" if responding else "0.75", zorder=2)
-            ax.axvline(det.time, color="#d62728", lw=1.0, zorder=3)
-            ax.set_ylabel(ch, rotation=0, ha="right", va="center", fontsize=8,
-                          fontweight="bold" if responding else "normal")
-            ax.tick_params(labelsize=7)
+            ax.plot(times, data[row], lw=0.7,
+                    color="#1f77b4" if responding else "0.72", zorder=2)
+            ax.axvline(det.time, color="#d62728", lw=1.2, zorder=3)
+            style_channel_axis(ax, ch, bold=responding, muted=not responding)
 
             for ann in (self.store.review.annotations_for(self.condition) if self.store else []):
                 if ann.tmax >= t0 and ann.tmin <= t1:
                     ax.axvspan(ann.tmin, ann.tmax, color="#ffd27f", alpha=0.35, zorder=1)
 
-        axes[-1].set_xlabel("time (s)")
-        self.fig.suptitle(
+        axes[-1].set_xlabel("time (s)", fontsize=10)
+        self.plot.fig.suptitle(
             f"{self.condition} — detection {det.index + 1}/{len(self.detections)} "
-            f"on {'+'.join(det.channels)}  (bold = responding muscle)", fontsize=10,
+            f"on {'+'.join(det.channels)}  (bold = responding muscle)", fontsize=11,
         )
 
         self._selector = SpanSelector(
@@ -193,7 +197,7 @@ class StartStopViewer(QWidget):
         # shared x-axis back to the origin and squashes the response into a corner. Pin the
         # limits to the window we actually drew.
         axes[-1].set_xlim(t0, t1)
-        self.canvas.draw_idle()
+        self.plot.draw()
         self._refresh_annotations()
 
     def _on_span(self, tmin: float, tmax: float) -> None:
