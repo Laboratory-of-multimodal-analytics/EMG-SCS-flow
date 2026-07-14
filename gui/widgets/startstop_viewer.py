@@ -47,6 +47,7 @@ class StartStopViewer(QWidget):
         self._span: tuple[float, float] | None = None
         self._span_det: int | None = None       # which detection the span belongs to
         self._selectors: list[SpanSelector] = []
+        self._seg_selectors: list[SpanSelector] = []
 
         # ---- left ----
         self.cond_box = QComboBox()
@@ -88,7 +89,7 @@ class StartStopViewer(QWidget):
         self.views.addTab(self.segment, "Segment (bursts + envelopes)")
         self.views.currentChanged.connect(lambda _: self._redraw())
 
-        self.window_label = QLabel("Drag over the Detection view to select a window.")
+        self.window_label = QLabel("Drag over any channel — in Detection or in Segment — to select a window.")
         self.window_label.setStyleSheet("color: gray;")
         self.annotate_btn = QPushButton("Annotate selection")
         self.annotate_btn.clicked.connect(self._annotate)
@@ -196,11 +197,12 @@ class StartStopViewer(QWidget):
             self.detail.message("No detection selected.")
             return
 
-        # The span survives a redraw (that is how it stays on screen after the drag), but it
-        # belongs to one detection — moving to another clears it.
-        if self._span_det != det.index:
+        # The span survives a redraw (that is how it stays on screen after the drag). A span
+        # drawn on THIS detection is cleared only when you move to another one; a span drawn
+        # on the whole segment (_span_det is None) is not owned by any detection, so it stays.
+        if self._span_det is not None and self._span_det != det.index:
             self._span = None
-            self._span_det = det.index
+            self._span_det = None
             self.window_label.setText("Drag over any channel to select a window.")
 
         status = self.store.review.status(self.condition, det.index) if self.store else "ok"
@@ -341,6 +343,10 @@ class StartStopViewer(QWidget):
             for ann in (self.store.review.annotations_for(self.condition) if self.store else []):
                 ax.axvspan(ann.tmin, ann.tmax, color="#ffd27f", alpha=0.3, lw=0, zorder=0)
 
+            if self._span is not None:
+                ax.axvspan(self._span[0], self._span[1],
+                           facecolor="#ffb703", alpha=0.3, lw=0, zorder=5)
+
             has = (len(bursts) and (bursts["Channel"].astype(str) == ch).any()) or \
                   any(ch in d.channels for d in self.detections)
             style_channel_axis(ax, ch, bold=bool(has), muted=not has, compact=True)
@@ -351,7 +357,26 @@ class StartStopViewer(QWidget):
             f"{self.condition} — whole segment  "
             f"(orange = burst, red = RMS envelope, red line = detection)", fontsize=10,
         )
+        # Selecting a window on the whole segment is the natural way to annotate a stretch of
+        # activity, so this view gets the same drag as the Detection view — on every channel.
+        self._seg_selectors = [
+            SpanSelector(
+                ax, self._on_span_segment, "horizontal", useblit=False,
+                props=dict(alpha=0.3, facecolor="#ffb703"), drag_from_anywhere=True,
+            )
+            for ax in axes
+        ]
         self.segment.draw()
+
+    def _on_span_segment(self, tmin: float, tmax: float) -> None:
+        if abs(tmax - tmin) < 1e-6:
+            return
+        self._span = (float(tmin), float(tmax))
+        self._span_det = None      # a segment-wide window is not tied to one detection
+        self.window_label.setText(
+            f"Selected {tmin:.3f} – {tmax:.3f} s  ({tmax - tmin:.2f} s) — annotate or export it"
+        )
+        self._draw_segment()
 
     def _selected_burst(self):
         b = self._bursts()
