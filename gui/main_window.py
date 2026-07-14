@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QComboBox, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
+    QApplication, QComboBox, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QWidget, QVBoxLayout,
 )
 
@@ -40,6 +40,8 @@ class MainWindow(QMainWindow):
         self.controller.busy_changed.connect(self._on_busy)
         self.store: ReviewStore | None = None
         self.last_scan_dir: Path | None = None
+        self._raw_source = None
+        self._raw_loaded = None
 
         # ---- top bar ----
         self.file_label = QLabel("No file loaded")
@@ -89,6 +91,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.startstop_viewer, "Epoch browser (StartStop)")
         self.tabs.addTab(self.spontaneous_viewer, "Spontaneous EMG")
         self.tabs.addTab(self.raw_browser, "Raw")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         central = QWidget()
         cv = QVBoxLayout(central)
@@ -97,12 +100,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         # ---- log dock ----
+        # Kept deliberately short: the channel stack needs the vertical space far more than
+        # the log does. Toggle it from View, or drag the splitter if you want it taller.
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
-        dock = QDockWidget("Log", self)
-        dock.setWidget(self.log_view)
-        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self.log_view.setMaximumHeight(70)
+        self.log_dock = QDockWidget("Log", self)
+        self.log_dock.setWidget(self.log_view)
+        self.log_dock.setFeatures(
+            QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable
+        )
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()  # shown automatically while a run is going
 
         self._build_menu()
         self._sync_tabs()
@@ -128,9 +138,14 @@ class MainWindow(QMainWindow):
             file_menu.addAction(act)
 
         view_menu = self.menuBar().addMenu("&View")
-        act = QAction("Recruitment table", self)
-        act.triggered.connect(self.sir_viewer.show_recruitment)
-        view_menu.addAction(act)
+        log_act = QAction("Show log", self)
+        log_act.setCheckable(True)
+        log_act.setChecked(False)
+        log_act.toggled.connect(self.log_dock.setVisible)
+        self.log_dock.visibilityChanged.connect(
+            lambda v: log_act.setChecked(bool(v))
+        )
+        view_menu.addAction(log_act)
 
     def _log(self, line: str) -> None:
         self.log_view.appendPlainText(line)
@@ -174,6 +189,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Busy", "A run is already in progress.")
             return
         self.log_view.clear()
+        self.log_dock.show()  # the log matters while a run is going; it is hidden otherwise
         self.controller.start(self.session)
 
     def _on_busy(self, busy: bool) -> None:
@@ -217,29 +233,56 @@ class MainWindow(QMainWindow):
             if not results.ok:
                 self._log("No crops found — check the annotations.")
             self.sir_viewer.load(results)
-            self._load_raw_sir(results)
             self.tabs.setCurrentIndex(1)
         else:
             ss = StartStopResults(output_root)
             sp = SpontaneousResults(output_root)
             if ss.ok:
                 self.startstop_viewer.load(ss, self.store, sp if sp.ok else None)
-                self._load_raw_startstop(ss, sp)
             else:
                 self._log("No detections saved — is 'Save annotated .fif of detections' on?")
             if sp.ok:
                 self.spontaneous_viewer.load(sp)
             self.tabs.setCurrentIndex(2)
 
+        # The raw recording is read only when the Raw tab is actually opened: on a network
+        # drive a preprocessed .fif is hundreds of MB, and loading it eagerly stalled the
+        # window for minutes after every open.
+        self._raw_source = (mode, output_root)
+        self._raw_loaded = None
+
+    # ------------------------------------------------------------------ #
+    def _on_tab_changed(self, index: int) -> None:
+        if index == 4:
+            self._ensure_raw_loaded()
+
+    def _ensure_raw_loaded(self) -> None:
+        src = getattr(self, "_raw_source", None)
+        if src is None or self._raw_loaded == src:
+            return
+        mode, root = src
+        self.raw_browser.plot.message("Loading the recording…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if mode == "sir":
+                self._load_raw_sir(SIRResults(root))
+            else:
+                self._load_raw_startstop(StartStopResults(root), SpontaneousResults(root))
+            self._raw_loaded = src
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def _load_raw_sir(self, results: SIRResults) -> None:
         """The raw tab shows the preprocessed recording the crops were cut from."""
         path = results.raw_path()
         if path is None:
+            self.raw_browser.plot.message("This run saved no raw recording.")
             return
         try:
             import mne
             raw = mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
         except Exception as exc:
+            self.raw_browser.plot.message(f"Raw view unavailable:\n{exc}")
             self._log(f"Raw view unavailable: {exc}")
             return
         self.raw_browser.set_recording(raw, title=path.stem)
@@ -248,12 +291,13 @@ class MainWindow(QMainWindow):
         """Raw view of the first condition, with its detections, bursts and envelopes."""
         conds = ss.conditions()
         if not conds:
+            self.raw_browser.plot.message("This run saved no annotated recording.")
             return
         cond = conds[0]
         try:
             raw = ss.raw(cond)
         except Exception as exc:
-            self._log(f"Raw view unavailable: {exc}")
+            self.raw_browser.plot.message(f"Raw view unavailable:\n{exc}")
             return
         dets = [(d.time, "+".join(d.channels)) for d in ss.detections(cond)]
         self.raw_browser.set_recording(

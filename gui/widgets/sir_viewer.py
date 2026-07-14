@@ -77,17 +77,10 @@ class SIRViewer(QWidget):
             "Off: writes a bare min_lat — P1 = the dominant deflection at or after the click."
         )
 
-        mode_bar = QHBoxLayout()
-        mode_bar.addWidget(self.mode_markers)
-        mode_bar.addWidget(self.mode_template)
-        mode_bar.addWidget(self.polarity)
-        mode_bar.addWidget(self.bind_window)
-        mode_bar.addStretch()
-
-        self.make_template_btn = QPushButton("Make template from selection…")
+        self.make_template_btn = QPushButton("Make template…")
         self.make_template_btn.setEnabled(False)
         self.make_template_btn.clicked.connect(self._make_template)
-        self.only_user_templates = QCheckBox("Detect by my templates only")
+        self.only_user_templates = QCheckBox("mine only")
         self.only_user_templates.setToolTip(
             "On: the next run matches against YOUR templates alone.\n"
             "Off: your templates are added on top of the 26 stock ones."
@@ -95,23 +88,28 @@ class SIRViewer(QWidget):
         self.only_user_templates.toggled.connect(
             lambda v: setattr(self.session, "template_only_user", bool(v))
         )
-        tpl_bar = QHBoxLayout()
-        tpl_bar.addWidget(self.make_template_btn)
-        tpl_bar.addWidget(self.only_user_templates)
-        tpl_bar.addStretch()
+
+        # One compact row: every pixel spent here is a pixel the channel stack loses.
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        for wdg in (self.mode_markers, self.mode_template, self.polarity,
+                    self.bind_window, self.make_template_btn, self.only_user_templates):
+            bar.addWidget(wdg)
+        bar.addStretch()
 
         self.plot = FitPlotCanvas()
         self.plot.mpl_connect("button_press_event", self._on_click)
 
         self.hint = QLabel()
         self.hint.setWordWrap(True)
-        self.hint.setStyleSheet("color: gray; font-size: 11px;")
+        self.hint.setStyleSheet("color: gray; font-size: 10px;")
+        self.hint.setMaximumHeight(28)
 
         middle = QWidget()
         mv = QVBoxLayout(middle)
-        mv.setContentsMargins(4, 4, 4, 4)
-        mv.addLayout(mode_bar)
-        mv.addLayout(tpl_bar)
+        mv.setContentsMargins(2, 2, 2, 2)
+        mv.setSpacing(2)
+        mv.addLayout(bar)
         mv.addWidget(self.plot, 1)
         mv.addWidget(self.hint)
 
@@ -271,9 +269,8 @@ class SIRViewer(QWidget):
         axes[-1].set_xlabel("time (s)", fontsize=8)
         axes[-1].set_xlim(times[0], times[-1])
         self.plot.fig.suptitle(
-            f"{self.crop.label} — {len(epochs)} epochs\n"
-            "onset • blue   P1 • red   P2 • green",
-            fontsize=9,
+            f"{self.crop.label} · {len(epochs)} epochs · onset•blue P1•red P2•green",
+            fontsize=8,
         )
         self.plot.refresh()
         self._refresh_table()

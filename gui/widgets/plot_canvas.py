@@ -30,6 +30,9 @@ class FitPlotCanvas(FigureCanvasQTAgg):
 
     def __init__(self) -> None:
         self.fig = Figure(dpi=DPI, layout="constrained")
+        # Squeeze the padding: with many channels in a fixed height, the default margins
+        # eat a visible slice of every row.
+        self.fig.get_layout_engine().set(h_pad=0.01, hspace=0.02, w_pad=0.02, wspace=0.0)
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumWidth(280)

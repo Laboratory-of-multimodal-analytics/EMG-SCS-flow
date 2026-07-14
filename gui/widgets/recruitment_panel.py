@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 
 class RecruitmentPanel(QWidget):
@@ -22,20 +22,15 @@ class RecruitmentPanel(QWidget):
         self.df = None
         self.highlight: str | None = None
 
-        self.kind = QComboBox()
-        self.kind.addItems(["Curves (mean ± 95 % CI)", "Histogram (per amplitude)"])
-        self.kind.currentIndexChanged.connect(self._draw)
-
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("<b>Recruitment</b>"))
-        bar.addStretch()
-        bar.addWidget(self.kind)
+        title = QLabel("<b>Recruitment</b> — peak-to-peak vs amplitude, mean ± 95 % CI")
+        title.setStyleSheet("font-size: 11px;")
 
         self.fig = Figure(figsize=(5, 3), layout="constrained")
         self.canvas = FigureCanvasQTAgg(self.fig)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(bar)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(title)
         layout.addWidget(self.canvas, 1)
 
     # ------------------------------------------------------------------ #
@@ -72,42 +67,19 @@ class RecruitmentPanel(QWidget):
         channels = sorted(usable["Channel"].unique())
         colors = plt.get_cmap("tab10")
 
-        if self.kind.currentIndex() == 0:
-            for i, ch in enumerate(channels):
-                g = usable[usable["Channel"] == ch].sort_values("amp_value")
-                x = g["amp_value"].to_numpy(float)
-                y = g["mean_ptp_uv"].to_numpy(float)
-                ci = g["ci95"].to_numpy(float)
-                focused = (self.highlight is None) or (ch == self.highlight)
-                col = colors(i % 10)
-                ax.plot(x, y, "-o", ms=4, lw=1.8 if focused else 0.9, color=col,
-                        alpha=1.0 if focused else 0.25, label=ch, zorder=3 if focused else 2)
-                ax.fill_between(x, y - ci, y + ci, color=col,
-                                alpha=0.22 if focused else 0.06, lw=0, zorder=1)
-            ax.set_ylabel("peak-to-peak (µV)")
-        else:
-            width = 0.8 / max(len(channels), 1)
-            amps = sorted(usable["amp_value"].unique())
-            pos = np.arange(len(amps))
-            for i, ch in enumerate(channels):
-                g = usable[usable["Channel"] == ch]
-                vals = [
-                    float(g[g["amp_value"] == a]["mean_ptp_uv"].iloc[0])
-                    if (g["amp_value"] == a).any() else 0.0
-                    for a in amps
-                ]
-                errs = [
-                    float(g[g["amp_value"] == a]["ci95"].iloc[0])
-                    if (g["amp_value"] == a).any() else 0.0
-                    for a in amps
-                ]
-                focused = (self.highlight is None) or (ch == self.highlight)
-                ax.bar(pos + i * width, vals, width, yerr=errs, capsize=2, label=ch,
-                       color=colors(i % 10), alpha=1.0 if focused else 0.25)
-            ax.set_xticks(pos + 0.4 - width / 2)
-            ax.set_xticklabels([f"{a:g}" for a in amps], fontsize=7)
-            ax.set_ylabel("peak-to-peak (µV)")
+        for i, ch in enumerate(channels):
+            g = usable[usable["Channel"] == ch].sort_values("amp_value")
+            x = g["amp_value"].to_numpy(float)
+            y = g["mean_ptp_uv"].to_numpy(float)
+            ci = g["ci95"].to_numpy(float)
+            focused = (self.highlight is None) or (ch == self.highlight)
+            col = colors(i % 10)
+            ax.plot(x, y, "-o", ms=4, lw=1.8 if focused else 0.9, color=col,
+                    alpha=1.0 if focused else 0.25, label=ch, zorder=3 if focused else 2)
+            ax.fill_between(x, y - ci, y + ci, color=col,
+                            alpha=0.22 if focused else 0.06, lw=0, zorder=1)
 
+        ax.set_ylabel("peak-to-peak (µV)")
         ax.set_xlabel("stimulation amplitude")
         ax.set_title(f"{self.config}", fontsize=10)
         ax.grid(True, color="0.92", lw=0.6)
