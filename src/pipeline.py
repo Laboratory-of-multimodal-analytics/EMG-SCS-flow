@@ -656,6 +656,303 @@ def _apply_car_reref(raw: mne.io.BaseRaw, art_chans: list[str]) -> None:
             raw._data[ch_idx, :] = raw._data[ch_idx, :] - mean_other
 
 
+# When True, P1 is redefined as the DOMINANT (largest-|amplitude|) response peak and
+# P2 as the next significant opposite-polarity peak after it, instead of the template's
+# first/second markers. Set per-file via P.SIR_P1_DOMINANT for recordings whose response
+# leads with a small artifact-ish bump before the true (larger) main deflection.
+SIR_P1_DOMINANT = False
+# Amplitude fraction for _dominant_p1_p2: P1 = the EARLIEST response peak whose |amp| >= this
+# fraction of the window max. Lower it (per-file) so a slightly-smaller EARLIER deflection can
+# be P1 — a down-then-up biphasic then pairs as P1=down, P2=up, instead of P1=big-2nd-peak with
+# a weak (later) "next opposite" P2 that fails require-3-points.
+SIR_P1_DOMINANT_FRAC = 0.85
+
+# Per-file manual blocklist: force-drop detections for specific (config, amp_str, channel)
+# combos. Used for the cringe-artifact pig SCEMP files where a loosened consistency gate lets
+# a genuinely-noise channel slip through on a handful of crops while the same gate is needed
+# elsewhere. Populate via P.SIR_SUPPRESS_KEYS in the runner, e.g.
+# {("1+8", "14", "GM left"), ("5+8", "8", "GM left")}.
+SIR_SUPPRESS_KEYS: set[tuple[str, str, str]] = set()
+
+# Per-file: whole channels that must never carry detections (still plotted, no markers).
+# e.g. a limb that is not recruited at a given timepoint. Set via P.SIR_EXCLUDE_CHANNELS.
+SIR_EXCLUDE_CHANNELS: set[str] = set()
+
+# Per-file: whole configs that must never carry detections (still plotted). e.g. electrode
+# configs with no real response at a timepoint. Set via P.SIR_EXCLUDE_CONFIGS.
+SIR_EXCLUDE_CONFIGS: set[str] = set()
+
+# Per-file: {channel: min_latency_s} — force P1 onto the dominant NEGATIVE deflection at/after
+# min_latency and P2 onto the strongest positive deflection, overriding the template markers.
+# For SCS crops where the physiological red peak is a late negative dip, not an early +bump.
+SIR_FORCE_NEG_P1_AFTER: dict[str, float] = {}
+# Mirror of the above for a POSITIVE red peak (P1 = dominant positive deflection).
+SIR_FORCE_POS_P1_AFTER: dict[str, float] = {}
+# Forced-P1 P2 search half-window (ms) around P1: keeps the green P2 adjacent to the red P1
+# instead of jumping to a larger late component. Default ~large = whole response window.
+SIR_FORCE_P2_WIN_MS: float = 999.0
+# Per-file whitelist: (config, amp_str, channel) crops that BYPASS the channel-consistency
+# gates (low median-corr / low inter-trial / hard-valid) — for weak but genuine responses the
+# user explicitly wants kept. Per-epoch P1 must still be detectable; this only skips the gates.
+SIR_FORCE_KEYS: set[tuple[str, str, str]] = set()
+
+# When True, _align_events_to_artifact centres each config on the artifact's FIRST-PEAK
+# APEX located by ONSET (first threshold crossing above the pre-stim baseline, then walk to
+# the first apex) instead of the amplitude-fraction `_first_peak_index`. Onset is an
+# unambiguous, shape-independent landmark, so it centres every crop of a config on the same
+# morphological element (fixes the under-/over-shoot that `_first_peak_index` produces when
+# the biggest peak differs between crops).
+SIR_ALIGN_ONSET = False
+
+
+def _artifact_first_peak_by_onset(median, win, sfreq, k=4.0, min_frac=0.12):
+    """Index of the FIRST-peak apex of an artifact median, found via onset.
+
+    Baseline = first 3 ms of the window (pre-artifact). Onset = first sample whose
+    deviation from baseline exceeds max(k·baseline_std, min_frac·max_deviation). From the
+    onset, walk forward while the deviation keeps growing in the onset's direction → the
+    first apex. Returns `win` (no shift) if no clear onset.
+    """
+    med = np.asarray(median, dtype=float)
+    base_n = max(3, int(round(sfreq * 0.003)))
+    if base_n >= len(med):
+        return win
+    bmean = float(np.mean(med[:base_n]))
+    bstd = float(np.std(med[:base_n]))
+    dev = med - bmean
+    peak_dev = float(np.abs(dev).max())
+    if peak_dev <= 0:
+        return win
+    thr = max(k * bstd, min_frac * peak_dev)
+    above = np.where(np.abs(dev) > thr)[0]
+    if len(above) == 0:
+        return win
+    onset = int(above[0])
+    sgn = 1.0 if dev[onset] >= 0 else -1.0
+    i = onset
+    while i + 1 < len(dev) and sgn * dev[i + 1] >= sgn * dev[i]:
+        i += 1
+    return int(i)
+
+
+# When True, _align_events_to_artifact SKIPS the cross-correlation loop and only does
+# first-peak re-centring. The xcorr locks every event onto the dominant (largest) artifact
+# peak, which smears a small leading bump below the first-peak detection threshold so the
+# re-centring can't find it; skipping xcorr keeps find_peaks' own (main-peak) centring —
+# consistent across events — so the median shows a clean first bump to lock onto.
+SIR_ALIGN_SKIP_XCORR = False
+
+
+def _dominant_p1_p2(tmpl, times, baseline_mask, resp_tmin, resp_tmax, frac=None):
+    """Return (p1_t, p2_t). P1 = the EARLIEST peak in the response window whose
+    |amplitude| is >= *frac* of the window maximum (so a small leading bump is skipped
+    but a genuine first large deflection is kept even if a later one ties it); P2 = the
+    strongest opposite-polarity deflection AFTER P1. NaN if none."""
+    if frac is None:
+        frac = SIR_P1_DOMINANT_FRAC
+    base = float(np.mean(tmpl[baseline_mask])) if np.any(baseline_mask) else 0.0
+    tw = np.asarray(tmpl, dtype=float) - base
+    w = (times >= max(float(resp_tmin), 0.0)) & (times <= float(resp_tmax))
+    idxs = np.where(w)[0]
+    if len(idxs) == 0:
+        return np.nan, np.nan
+    seg = np.abs(tw[idxs])
+    amax = float(seg.max())
+    if amax <= 0:
+        return np.nan, np.nan
+    pk, _ = find_peaks(seg, height=frac * amax)
+    dom = int(idxs[pk[0]]) if len(pk) else int(idxs[int(np.argmax(seg))])
+    p1_t = float(times[dom])
+    pol1 = 1.0 if tw[dom] >= 0 else -1.0
+    after = idxs[idxs > dom]
+    p2_t = np.nan
+    if len(after):
+        opp = -pol1 * tw[after]           # >0 where opposite polarity to P1
+        if np.any(opp > 0):
+            p2_t = float(times[int(after[int(np.argmax(opp))])])
+    return p1_t, p2_t
+
+
+def _forced_p1_p2(tmpl, times, baseline_mask, resp_tmin, resp_tmax, min_lat, want_pos=False, max_lat=None):
+    """Per-file hack: force P1 onto the dominant deflection of a chosen polarity in
+    [*min_lat*, *max_lat*] (want_pos=False → the physiological negative dip; True → the positive
+    peak; max_lat defaults to resp_tmax, pass a small value to target an EARLY near-zero peak
+    instead of a stronger later one), P2 onto the strongest opposite-polarity deflection, and
+    ONSET onto the foot of P1. Returns (onset_t, p1_t, p2_t); NaN p1 if no such deflection."""
+    base = float(np.mean(tmpl[baseline_mask])) if np.any(baseline_mask) else 0.0
+    tw = np.asarray(tmpl, dtype=float) - base
+    s = 1.0 if want_pos else -1.0                    # sign of the wanted P1
+    _hi = float(resp_tmax) if max_lat is None else float(max_lat)
+    w = (times >= float(min_lat)) & (times <= _hi)
+    iw = np.where(w)[0]
+    if len(iw) == 0 or float((s * tw[iw]).max()) <= 0:
+        return np.nan, np.nan, np.nan
+    dom = int(iw[int(np.argmax(s * tw[iw]))])        # most-extreme sample of wanted polarity
+    p1_t = float(times[dom])
+    # Onset = FOOT of the deflection (where the signal leaves baseline on its way to P1): walk
+    # back from P1 until it drops below ~20% of the peak amplitude. This sits clearly LEFT of a
+    # sharp red peak, not on it. Bounded to ~12 ms of look-back; works for pre-0 peaks too.
+    lo = max(int(np.searchsorted(times, p1_t - 0.012)), 0)
+    thr = 0.2 * s * float(tw[dom])
+    i = dom
+    while i - 1 >= lo and s * tw[i - 1] >= thr:
+        i -= 1
+    onset_t = float(times[i])
+    # P2 (green) = strongest OPPOSITE-polarity rebound AFTER P1. Search strictly after P1 (a P2
+    # before the red peak is not a rebound) with a look-ahead of up to 12 ms PAST resp_tmax, so a
+    # late forced P1 (e.g. a +peak at ~26 ms) still gets its dip at ~31 ms marked instead of being
+    # dropped as monophasic. Capped by SIR_FORCE_P2_WIN_MS half-window around P1.
+    _hw = float(SIR_FORCE_P2_WIN_MS) / 1000.0
+    _p2_hi = max(float(resp_tmax), p1_t + 0.012)
+    wp = (times > p1_t) & (times <= _p2_hi) & (times <= p1_t + _hw)
+    ip = np.where(wp)[0]
+    p2_t = np.nan
+    if len(ip) and float((-s * tw[ip]).max()) > 0:
+        p2_t = float(times[int(ip[int(np.argmax(-s * tw[ip]))])])
+    return onset_t, p1_t, p2_t
+
+
+def _first_peak_index(
+    median_wave: np.ndarray,
+    default_idx: int,
+    first_peak_frac: float,
+    sfreq: float,
+    max_lead_ms: float = 3.0,
+) -> int:
+    """Index of the FIRST phase of the negative artifact complex in a median snippet.
+
+    Single-peak artifacts return that peak; biphasic/double artifacts return the
+    earlier dip even when shallower than the later (deeper) one. Only dips within
+    *max_lead_ms* BEFORE the deepest dip count as the artifact's first phase — this
+    ignores small pre-artifact noise wiggles (which would otherwise be mistaken for
+    the first peak and shift every epoch off the real artifact). Falls back to the
+    deepest dip, then to *default_idx*.
+    """
+    neg = -(median_wave - float(np.median(median_wave)))
+    depth = float(neg.max())
+    if depth <= 0:
+        return default_idx
+    pk_idx, _ = find_peaks(neg, height=first_peak_frac * depth)
+    return int(pk_idx[0]) if len(pk_idx) else default_idx
+
+
+def _build_config_art_ref(
+    art: np.ndarray,
+    peaks: np.ndarray,
+    sfreq: float,
+    win_ms: float = 8.0,
+    max_shift_ms: float = 6.0,
+    first_peak_frac: float = 0.4,
+) -> tuple[np.ndarray, int] | None:
+    """Build a config-level artifact reference: (within-crop-aligned median snippet,
+    index of its first prominent negative peak). Used to centre EVERY amplitude of a
+    config onto the same feature (see _align_events_to_artifact ``ref``)."""
+    win = int(round(sfreq * win_ms / 1000.0))
+    aligned = _align_events_to_artifact(
+        art, peaks, sfreq, win_ms=win_ms, max_shift_ms=max_shift_ms, center_on_first_peak=False,
+    )
+    n = len(art)
+    snips = [art[pk - win:pk + win + 1] for pk in aligned if pk - win >= 0 and pk + win + 1 <= n]
+    if len(snips) < 3:
+        return None
+    med = np.median(np.asarray(snips), axis=0)
+    return med, _first_peak_index(med, win, first_peak_frac, sfreq)
+
+
+def _align_events_to_artifact(
+    art: np.ndarray,
+    peaks: np.ndarray,
+    sfreq: float,
+    win_ms: float = 8.0,
+    max_shift_ms: float = 6.0,
+    n_iter: int = 2,
+    center_on_first_peak: bool = False,
+    first_peak_frac: float = 0.4,
+    ref: tuple[np.ndarray, int] | None = None,
+) -> np.ndarray:
+    """Cross-correlation realignment of stimulus events to a common artifact shape.
+
+    Multiphasic / "wandering" stim artifacts make find_peaks latch onto different
+    phases across trials, so epochs centre on different features and the evoked
+    response smears out (double-hump mean, lost per-epoch detections). Each event's
+    artifact snippet is cross-correlated against a median-artifact reference and
+    shifted (bounded by max_shift_ms) to lock every epoch onto the same feature.
+
+    When *ref* = (ref_median, ref_first_peak_idx) is given (a CONFIG-level shared
+    reference), every event is aligned to that shared shape and centred on the
+    shared first-peak index — so all amplitudes of a config end up centred on the
+    SAME artifact feature (required for the single config template to match them
+    all). Single-peak artifacts: ref_first_peak_idx is that peak → events centre on
+    it, no spurious shift.
+    """
+    win = int(round(sfreq * win_ms / 1000.0))
+    max_shift = int(round(sfreq * max_shift_ms / 1000.0))
+    n = len(art)
+    cur = np.asarray(peaks, dtype=int)
+    if win < 2 or max_shift < 1:
+        return cur
+
+    # ── Shared config-level reference: align each event to it, centre on its first peak ──
+    if ref is not None:
+        ref_med, ref_fp = ref
+        L = len(ref_med)
+        if L != 2 * win + 1:
+            ref = None  # geometry mismatch → fall back to per-crop
+        else:
+            rc = ref_med - float(np.mean(ref_med))
+            lags = np.arange(-L + 1, L)
+            m = np.abs(lags) <= max_shift
+            aligned = []
+            for pk in cur:
+                a, b = pk - win, pk + win + 1
+                if a < 0 or b > n:
+                    continue
+                snip = art[a:b]
+                cc = np.correlate(snip - float(np.mean(snip)), rc, mode="full")
+                best = int(lags[m][int(np.argmax(cc[m]))])
+                aligned.append(pk + best + (ref_fp - win))
+            return np.array(sorted(set(aligned)), dtype=int) if aligned else cur
+
+    for _ in range(0 if SIR_ALIGN_SKIP_XCORR else max(1, n_iter)):
+        snips, keep = [], []
+        for pk in cur:
+            a, b = pk - win, pk + win + 1
+            if a >= 0 and b <= n:
+                snips.append(art[a:b]); keep.append(int(pk))
+        if len(snips) < 3:
+            return cur
+        snips = np.asarray(snips)
+        ref_c = np.median(snips, axis=0)
+        ref_c = ref_c - ref_c.mean()
+        L = snips.shape[1]
+        lags = np.arange(-L + 1, L)
+        m = np.abs(lags) <= max_shift
+        aligned = []
+        for pk, snip in zip(keep, snips):
+            cc = np.correlate(snip - snip.mean(), ref_c, mode="full")
+            aligned.append(pk + int(lags[m][int(np.argmax(cc[m]))]))
+        cur = np.array(sorted(set(aligned)), dtype=int)
+
+    # Re-centre onto the FIRST prominent negative artifact peak (biphasic/double
+    # artifacts otherwise centre on the deepest = later dip, shifting response
+    # latencies onto the wrong morphological element).
+    if center_on_first_peak and len(cur) >= 3:
+        snips = []
+        for pk in cur:
+            a, b = pk - win, pk + win + 1
+            if a >= 0 and b <= n:
+                snips.append(art[a:b])
+        if len(snips) >= 3:
+            med = np.median(np.asarray(snips), axis=0)
+            if SIR_ALIGN_ONSET:
+                offset = _artifact_first_peak_by_onset(med, win, sfreq) - win
+            else:
+                offset = _first_peak_index(med, win, first_peak_frac, sfreq) - win
+            if offset != 0:
+                cur = np.array(sorted(set(int(pk + offset) for pk in cur)), dtype=int)
+    return cur
+
+
 def _apply_special_crops(raw: mne.io.BaseRaw, file_name: str) -> None:
     if file_name in ["1+2-_9.fif"]:
         raw.crop(0, raw.times.max() - 10)
@@ -2354,6 +2651,17 @@ def run_pipeline(
     raw_notch_freq: float | None = RAW_NOTCH_FREQ,
     raw_bandpass_l_freq: float | None = RAW_BANDPASS_L_FREQ,
     raw_bandpass_h_freq: float | None = RAW_BANDPASS_H_FREQ,
+    sir_require_both_peaks: bool = False,
+    sir_align_artifact: bool = False,
+    sir_align_win_ms: float = 8.0,
+    sir_align_max_shift_ms: float = 6.0,
+    sir_align_first_peak: bool = False,
+    sir_align_first_peak_frac: float = 0.4,
+    sir_ref_exclude_top: int = 0,
+    sir_ref_method: str = "single",
+    sir_hard_min_valid_frac: float = 0.0,
+    sir_template_ref: str = "max_amp",
+    sir_min_rel_to_template: float = 0.1,
 ) -> Path:
     edf_path = Path(edf_path)
     if output_dir is None:
@@ -2485,6 +2793,87 @@ def run_pipeline(
     create_annotation_crops(raw, crops_dir, overwrite=True)
     file_list = list_crop_files(crops_dir)
 
+    # ── Config-level artifact reference: one shared shape per configuration so
+    # EVERY amplitude is centred on the SAME artifact feature (the first dip). The
+    # reference is a CONSENSUS artifact — the mutually-aligned mean of every crop's
+    # within-aligned artifact median — so one atypical crop (e.g. a saturated max
+    # amplitude with a broad-hump artifact) cannot skew it. Without a shared ref,
+    # per-crop alignment locks different amplitudes onto different dips of a double
+    # artifact and the single config template only matches some of them. ──
+    config_art_ref: dict[str, tuple[np.ndarray, int]] = {}
+    if sir_align_artifact and sir_ref_method != "per_crop":
+        by_cfg: dict[str, list[str]] = defaultdict(list)
+        for fn in file_list:
+            by_cfg[fn.split("-")[0]].append(fn)
+        for cfg, fns in by_cfg.items():
+            medians: list[np.ndarray] = []
+            amps: list[float] = []
+            sf = None
+            for fn in fns:
+                try:
+                    rf = mne.io.read_raw_fif(crops_dir / fn, preload=True, verbose=False)
+                    ac = _resolve_art_channels(rf, ARTCHAN, fallback_chans=default_art_chans)
+                    a = _get_art_signal(rf, ac)
+                    sf = float(rf.info["sfreq"])
+                    mind = sf * art_min_distance_ms / 1000.0
+                    if art_peak_height is not None:
+                        fpk = {"height": art_peak_height, "distance": mind}
+                        if art_peak_width_ms is not None:
+                            fpk["width"] = (art_peak_width_ms[0] / 1000.0 * sf, art_peak_width_ms[1] / 1000.0 * sf)
+                        pk, _ = find_peaks(-a, **fpk)
+                    else:
+                        pk, _ = find_peaks(-a, height=THRESH * np.std(a), distance=mind)
+                    if len(pk) < 3:
+                        continue
+                    r = _build_config_art_ref(
+                        a, pk, sf, win_ms=sir_align_win_ms,
+                        max_shift_ms=sir_align_max_shift_ms, first_peak_frac=sir_align_first_peak_frac,
+                    )
+                    if r is not None:
+                        amp_s = fn.split("_", 1)[1].split(".fif")[0] if "_" in fn else ""
+                        medians.append(r[0]); amps.append(amp_to_number(amp_s))
+                except Exception:
+                    pass
+            if not medians or sf is None:
+                continue
+            L = len(medians[0])
+            keep = [i for i in range(len(medians)) if len(medians[i]) == L]
+            if not keep:
+                continue
+            win = int(round(sf * sir_align_win_ms / 1000.0))
+            if sir_ref_method == "consensus":
+                # Consensus = mutually-aligned mean of every crop's within-aligned
+                # artifact median. Needed when weak low-amplitude crops (e.g. 3.7 mA)
+                # cross-correlate poorly to any single strong crop but well to the
+                # group average (which includes their own shape).
+                seed = medians[keep[0]]
+                seed_c = seed - float(np.mean(seed))
+                max_sh = int(round(sf * sir_align_max_shift_ms / 1000.0))
+                lags = np.arange(-L + 1, L)
+                msk = np.abs(lags) <= max_sh
+                stack = []
+                for i in keep:
+                    m = medians[i]
+                    cc = np.correlate(m - float(np.mean(m)), seed_c, mode="full")
+                    lag = int(lags[msk][int(np.argmax(cc[msk]))])
+                    d = -lag  # shift m by -lag to bring its feature onto the seed's
+                    shifted = np.zeros_like(m)
+                    if d > 0:
+                        shifted[d:] = m[: L - d]
+                    elif d < 0:
+                        shifted[: L + d] = m[-d:]
+                    else:
+                        shifted = m.copy()
+                    stack.append(shifted)
+                ref_median = np.mean(np.asarray(stack), axis=0)
+            else:
+                # Reference = highest-amplitude crop's median, after dropping the top
+                # `sir_ref_exclude_top` amplitudes (escape hatch for a saturated top crop).
+                ranked = sorted(keep, key=lambda i: (amps[i] if np.isfinite(amps[i]) else -np.inf), reverse=True)
+                pool = ranked[int(sir_ref_exclude_top):] or ranked
+                ref_median = medians[pool[0]]
+            config_art_ref[cfg] = (ref_median, _first_peak_index(ref_median, win, sir_align_first_peak_frac, sf))
+
     # ── PASS 1: collect per-config channel means across all amplitudes ──
     # Each entry: (amp_num, amp_str, trial_mean). Keep amp_str so per-amp
     # templates can be looked up by file_name parsing in PASS 2.
@@ -2512,6 +2901,14 @@ def run_pipeline(
         else:
             threshold = THRESH * np.std(art)
             peaks, _ = find_peaks(-art, height=threshold, distance=min_dist_samples)
+        if sir_align_artifact and len(peaks) >= 3:
+            peaks = _align_events_to_artifact(
+                art, peaks, sfreq,
+                win_ms=sir_align_win_ms, max_shift_ms=sir_align_max_shift_ms,
+                center_on_first_peak=sir_align_first_peak,
+                first_peak_frac=sir_align_first_peak_frac,
+                ref=config_art_ref.get(file_name.split("-")[0]),
+            )
         if len(peaks) <= MIN_VALID_EPOCHS:
             continue
 
@@ -2566,11 +2963,28 @@ def run_pipeline(
                 config_template_markers[configuration][ch_name] = dict(onset=np.nan, p1=np.nan, p2=np.nan)
                 continue
 
-            # Fit on the maximum-amplitude file's trial-mean. Low-amp files
-            # without responses dilute the shape and shift template markers.
+            # Fit on the strongest-RESPONSE trial-mean (largest peak-to-peak in the
+            # response window), not merely the highest amplitude number: the top
+            # amplitude can be saturated/artifact-laden while a mid amplitude carries
+            # the cleanest supra-threshold response. Low-amp files without responses
+            # would otherwise dilute the shape and shift template markers.
+            _resp_mask = (times >= resp_tmin) & (times <= resp_tmax)
+
+            def _resp_strength(w):
+                seg = w[_resp_mask] - float(np.mean(w[baseline_mask]))
+                return float(np.ptp(seg)) if seg.size else 0.0
+
             valid = [(a, s, w) for a, s, w in waves if np.isfinite(a)]
             if valid:
-                _, _, tmpl_global = max(valid, key=lambda x: x[0])
+                if sir_template_ref == "max_resp":
+                    _, _, tmpl_global = max(valid, key=lambda x: _resp_strength(x[2]))
+                elif sir_template_ref == "top3_resp":
+                    ranked = sorted(valid, key=lambda x: _resp_strength(x[2]), reverse=True)
+                    tmpl_global = np.mean(
+                        np.stack([w for _, _, w in ranked[: min(3, len(ranked))]], axis=0), axis=0
+                    )
+                else:  # "max_amp" (default): highest amplitude number
+                    _, _, tmpl_global = max(valid, key=lambda x: x[0])
             else:
                 tmpl_global = np.mean(np.stack([w for _, _, w in waves], axis=0), axis=0)
 
@@ -2721,6 +3135,15 @@ def run_pipeline(
             threshold = THRESH * np.std(art)
             peaks, _ = find_peaks(-art, height=threshold, distance=min_dist_samples)
 
+        if sir_align_artifact and len(peaks) >= 3:
+            peaks = _align_events_to_artifact(
+                art, peaks, sfreq,
+                win_ms=sir_align_win_ms, max_shift_ms=sir_align_max_shift_ms,
+                center_on_first_peak=sir_align_first_peak,
+                first_peak_frac=sir_align_first_peak_frac,
+                ref=config_art_ref.get(file_name.split("-")[0]),
+            )
+
         if len(peaks) <= MIN_VALID_EPOCHS:
             continue
 
@@ -2766,9 +3189,66 @@ def run_pipeline(
             tmpl_cfg = dict(config_templates.get(configuration, {}))
             markers_cfg = dict(config_template_markers.get(configuration, {}))
 
+        if SIR_P1_DOMINANT:
+            # Redefine P1 = dominant response deflection, P2 = next opposite-polarity
+            # peak after it (per-file hack for lead-with-small-bump responses). Dominance
+            # is judged on this crop's ACTUAL epoch-mean waveform, not the synthesized
+            # template (whose relative peak sizes can differ).
+            _chname_to_idx = {c: i for i, c in enumerate(epochs.ch_names)}
+            for _ch, _tm in tmpl_cfg.items():
+                if _tm is None or _ch not in markers_cfg or _ch not in _chname_to_idx:
+                    continue
+                _mw = data_epoched[:, _chname_to_idx[_ch], :].mean(axis=0)
+                _p1t, _p2t = _dominant_p1_p2(_mw, times, baseline_mask, resp_tmin, resp_tmax)
+                if np.isfinite(_p1t):
+                    m = dict(markers_cfg[_ch]); m["p1"] = _p1t; m["p2"] = _p2t
+                    markers_cfg[_ch] = m
+
+        _forced_here: set[str] = set()   # channels force-polarised in THIS config
+        if SIR_FORCE_NEG_P1_AFTER or SIR_FORCE_POS_P1_AFTER:
+            # Per-file: force P1 = dominant deflection of a chosen polarity (>= min_lat),
+            # P2 = strongest opposite. Negative dict → red dip; positive dict → red peak.
+            # Dict keys may be a bare channel name (all configs) OR a (config, channel) tuple
+            # (that config only); a matching (config, channel) key overrides the bare key.
+            _c2i = {c: i for i, c in enumerate(epochs.ch_names)}
+            _specs: dict[str, tuple[float, bool]] = {}   # ch -> (min_lat, want_pos)
+            # Precedence (low→high): bare 'ch' | ('config','ch') | ('config','amp','ch').
+            for _src, _pos in [(SIR_FORCE_NEG_P1_AFTER, False), (SIR_FORCE_POS_P1_AFTER, True)]:
+                for _key, _ml in _src.items():          # bare-channel keys
+                    if not isinstance(_key, tuple):
+                        _specs[_key] = (_ml, _pos)
+                for _key, _ml in _src.items():          # (config, channel)
+                    if isinstance(_key, tuple) and len(_key) == 2 and _key[0] == configuration:
+                        _specs[_key[1]] = (_ml, _pos)
+                for _key, _ml in _src.items():          # (config, amp, channel) — most specific
+                    if (isinstance(_key, tuple) and len(_key) == 3
+                            and _key[0] == configuration and _key[1] == stim_amp_raw):
+                        _specs[_key[2]] = (_ml, _pos)
+            for _ch, (_minlat, _pos) in _specs.items():
+                if _ch not in _c2i:
+                    continue
+                _maxlat = None
+                if isinstance(_minlat, tuple):     # (min_lat, max_lat) → cap P1 search (early peak)
+                    _minlat, _maxlat = _minlat
+                _mw = data_epoched[:, _c2i[_ch], :].mean(axis=0)
+                _ont, _p1t, _p2t = _forced_p1_p2(_mw, times, baseline_mask, resp_tmin, resp_tmax, _minlat, want_pos=_pos, max_lat=_maxlat)
+                if not np.isfinite(_p1t):
+                    continue
+                m = dict(markers_cfg.get(_ch, {})); m["p1"] = _p1t; m["p2"] = _p2t
+                m["onset"] = _ont if np.isfinite(_ont) else m.get("onset", np.nan)
+                markers_cfg[_ch] = m
+                # Use the actual epoch-mean as the template so per-epoch polarity/scaling match
+                # the real response, AND so amps whose bank match failed (tmpl=None) still get a
+                # forced template from their own mean instead of being dropped as ineligible.
+                # Pure-noise low amps stay out via the median-corr / inter-trial gates.
+                tmpl_cfg[_ch] = np.asarray(_mw, dtype=float)
+                _forced_here.add(_ch)
+
         eligible_channels = [
             ch for ch in epochs.ch_names
             if ch not in art_set
+            and ch not in SIR_EXCLUDE_CHANNELS
+            and configuration not in SIR_EXCLUDE_CONFIGS
             and tmpl_cfg.get(ch) is not None
             and np.isfinite(markers_cfg.get(ch, {}).get("p1", np.nan))
         ]
@@ -2827,7 +3307,7 @@ def run_pipeline(
                         win_ms=5.0, polarity=pol1,
                         amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
                         choose="nearest",
-                        template_peak_val=tmpl_p1_val, min_rel_to_template=0.1,
+                        template_peak_val=tmpl_p1_val, min_rel_to_template=sir_min_rel_to_template,
                         t_min=resp_tmin, t_max=resp_tmax,
                     )
                 else:
@@ -2845,7 +3325,7 @@ def run_pipeline(
                         win_ms=12.0, polarity=pol2,
                         amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
                         choose="nearest",
-                        template_peak_val=tmpl_p2_val, min_rel_to_template=0.1,
+                        template_peak_val=tmpl_p2_val, min_rel_to_template=sir_min_rel_to_template,
                         t_min=resp_tmin, t_max=resp_tmax,
                     )
                 else:
@@ -2883,6 +3363,17 @@ def run_pipeline(
                     onset_latency = peak1_latency = peak2_latency = np.nan
                     peak1_value = peak2_value = ptp_amp = np.nan
                 if np.isnan(peak1_value) and np.isnan(peak2_value):
+                    onset_latency = peak1_latency = peak2_latency = np.nan
+                    peak1_value = peak2_value = ptp_amp = np.nan
+                # Require all three markers (onset + P1 + P2); drop if any is missing.
+                # EXCEPTION: forced-polarity channels are near-monophasic — their companion
+                # opposite-polarity P2 is weak/unreliable — for them require only onset + P1.
+                _need_p2 = ch_name not in _forced_here
+                if sir_require_both_peaks and (
+                    np.isnan(onset_latency)
+                    or np.isnan(peak1_value)
+                    or (_need_p2 and np.isnan(peak2_value))
+                ):
                     onset_latency = peak1_latency = peak2_latency = np.nan
                     peak1_value = peak2_value = ptp_amp = np.nan
 
@@ -2973,13 +3464,23 @@ def run_pipeline(
                 STIM_MIN_INTER_TRIAL_CORR is not None
                 and inter_trial_corr < float(STIM_MIN_INTER_TRIAL_CORR)
             )
-            if (
+            # Hard gate: drop the channel unless most epochs carry a detection.
+            hard_low_valid = (
+                sir_hard_min_valid_frac > 0.0
+                and valid_fraction < sir_hard_min_valid_frac
+            )
+            # Manual per-file suppression for known false positives on specific crops.
+            manually_suppressed = (configuration, stim_amp_raw, ch) in SIR_SUPPRESS_KEYS
+            # Whitelist: named crops bypass the consistency gates (weak but genuine responses).
+            force_kept = (configuration, stim_amp_raw, ch) in SIR_FORCE_KEYS
+            if manually_suppressed or (not force_kept and (
                 artifact_like_channel
                 or low_median_corr
                 or low_valid_low_corr
                 or borderline_valid_very_low_corr
                 or low_inter_trial_corr
-            ):
+                or hard_low_valid
+            )):
                 for e in entries:
                     e["onset"] = e["p1"] = e["p2"] = np.nan
                     e["pv1"] = e["pv2"] = e["ptp"] = np.nan
