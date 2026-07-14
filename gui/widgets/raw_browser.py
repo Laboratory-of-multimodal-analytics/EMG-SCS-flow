@@ -24,6 +24,41 @@ ENV_COLOUR = "#c1121f"
 DET_COLOUR = "#d62728"
 
 
+def _minmax_decimate(data: np.ndarray, times: np.ndarray, target: int = 4000):
+    """Thin a (channels, samples) block to ~`target` points per channel, keeping extremes.
+
+    Each bin contributes its own minimum and maximum, in time order, so a spike survives the
+    thinning — subsampling every Nth sample would silently drop it. Every channel keeps ITS
+    own extrema (and therefore its own time points), so a spike on one muscle is not lost
+    because another muscle was flat there.
+
+    Returns (data, times) both shaped (channels, points).
+    """
+    n_ch, n = data.shape
+    if n <= target:
+        return data, np.broadcast_to(times, (n_ch, n))
+
+    n_bins = max(target // 2, 1)
+    per = n // n_bins
+    if per < 2:
+        return data, np.broadcast_to(times, (n_ch, n))
+    usable = n_bins * per
+
+    block = data[:, :usable].reshape(n_ch, n_bins, per)
+    tblock = times[:usable].reshape(n_bins, per)
+
+    lo = block.argmin(axis=2)                      # (n_ch, n_bins)
+    hi = block.argmax(axis=2)
+    first = np.minimum(lo, hi)                     # keep chronological order within the bin
+    second = np.maximum(lo, hi)
+
+    ch = np.arange(n_ch)[:, None]
+    b = np.arange(n_bins)[None, :]
+    out_d = np.stack([block[ch, b, first], block[ch, b, second]], axis=2).reshape(n_ch, -1)
+    out_t = np.stack([tblock[b, first], tblock[b, second]], axis=2).reshape(n_ch, -1)
+    return out_d, out_t
+
+
 class RawBrowser(QWidget):
     """Scroll through a raw recording with the pipeline's findings drawn on top."""
 
@@ -179,9 +214,15 @@ class RawBrowser(QWidget):
         data = raw.get_data(picks=chans, start=s0, stop=s1) * 1e6
         times = np.arange(s0, s1) / sf
 
+        # A whole-recording window can hold tens of millions of samples per channel — far more
+        # than there are pixels, and drawing them all freezes the window. Decimate by min/max
+        # per bin rather than by taking every Nth sample: keeping both extremes preserves the
+        # spikes, which plain subsampling would silently drop.
+        data, times = _minmax_decimate(data, times, target=4000)
+
         axes = self.plot.make_axes(len(chans))
         for ax, ch, row in zip(axes, chans, range(len(chans))):
-            ax.plot(times, data[row], lw=0.6, color="#1f77b4", zorder=2)
+            ax.plot(times[row], data[row], lw=0.6, color="#1f77b4", zorder=2)
 
             if self.show_bursts.isChecked() and self.bursts is not None and len(self.bursts):
                 b = self.bursts[self.bursts["Channel"].astype(str) == ch]

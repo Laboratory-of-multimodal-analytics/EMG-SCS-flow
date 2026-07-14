@@ -280,7 +280,10 @@ class MainWindow(QMainWindow):
             return
         try:
             import mne
-            raw = mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
+            # preload=False: these files run to ~1 GB (a 97-minute recording at 4 kHz).
+            # Preloading pulled the whole thing over the network — 116 s on a Drive path —
+            # when the browser only ever draws the visible window, which reads in ~10 ms.
+            raw = mne.io.read_raw_fif(path, preload=False, verbose="ERROR")
         except Exception as exc:
             self.raw_browser.plot.message(f"Raw view unavailable:\n{exc}")
             self._log(f"Raw view unavailable: {exc}")
