@@ -35,16 +35,34 @@ headlessly.
   Google Drive folder is slow because Drive fetches every directory listing over the network,
   after which it is instant.
 
-## The three surfaces
+## The surfaces
 
 | Tab | Mode | What you do |
 |---|---|---|
-| **Crop review (SIR)** | Stimulation-induced | Walk the `(config, amplitude)` crops. Crops with **0 detections are red**. Click a peak to force P1; reject false positives; drag out a response and turn it into a template. |
-| **Epoch browser (StartStop)** | StartStop | Walk the detected responses, flag bad / false-positive / complex ones, drag out a window and annotate it, export the waveform to CSV for the stimulator. |
+| **Crop review (SIR)** | Stimulation-induced | Walk the `(config, amplitude)` crops. Crops with **0 detections are red**. Click a peak to force P1; reject false positives; drag out a response and turn it into a template. Recruitment curves sit beside the plot. |
+| **Epoch browser (StartStop)** | StartStop | Three views of a condition: **Detection** (one response in context), **Overlay** (all detections of a channel superimposed, as in SIR — that is how you see whether a response is stereotyped or the detector is firing on noise), and **Segment** (the whole condition with bursts shaded and their RMS envelopes drawn on top). Flag, annotate, export. |
 | **Spontaneous EMG** | StartStop | RMS envelopes with the detected bursts; export a burst envelope. |
+| **Raw** | any | Scroll through the whole recording. Overlay protocol annotations, detections, bursts and envelopes; jump straight to any detection or burst; or fit the entire segment into one window. |
 
 `Settings` is generated from the lever registry, grouped as in `constants.py`, and swaps
 its contents with the mode.
+
+### How things are drawn
+
+Markers are **points, one per epoch, on that epoch's own trace** — onset blue, P1 red, P2
+green, exactly as `plotting.plot_epochs_panel` draws them. A line at the median would hide
+how consistent the detection actually was across trials. (If a run leaves `Onset latency`
+empty, as SIR runs currently do, there are simply no blue points.)
+
+The SIR channel column **fits every channel on screen without scrolling**: SIR epochs are
+short, so the time axis can be squeezed and the column kept narrow. Each row is scaled to
+its own post-stimulus response, because the stimulus artifact and pre-stimulus drift are
+often an order of magnitude larger and would flatten the deflection being judged.
+
+Recruitment is shown as **curves, not a table**: peak-to-peak against amplitude, one line
+per channel, with a 95 % CI band across the epochs of each crop (a single-trial point gets
+a zero-width band rather than a fabricated interval). A histogram view is a dropdown away.
+The pipeline still writes its own summary tables — this is for looking.
 
 ### Crop review — Markers mode
 
@@ -69,13 +87,20 @@ of `t = 0` forces a peak *before* the stimulus, which is allowed and sometimes c
 “Bind P1 to ±3 ms” writes `(min_lat, max_lat)` so P1 cannot drift to a stronger later peak;
 unchecked, it writes a bare `min_lat` and P1 becomes the dominant deflection at or after the click.
 
+A forced marker is drawn explicitly: the bound window (or the minimum latency) is shaded in
+purple, labelled with the latency in ms, and an arrow shows which way P1 was forced to point.
+
 ### Crop review — Template mode
 
-Switch to **Template**, drag over the response you want found, and press *Make template from
-selection*. The selected span of the epoch mean is resampled onto the bank's native 2 kHz grid
-(index 200 = `t = 0`), flattened outside the selection, and its onset / P1 / P2 are marked with
-the same rule the pipeline's forced-marker logic uses. It is written into a session-local bank
-under `<output>/templates/` and the pipeline is pointed at it — **both modes** load their bank
+Switch to **Template**, drag over the response you want found (the selection stays on screen),
+and press *Make template from selection…*. An editor opens showing the template with its
+auto-placed onset / P1 / P2 — **click anywhere on the trace to move whichever marker is
+selected**, since the whole point of drawing a template by hand is that you disagree with the
+automatic answer somewhere. It warns if the markers fall out of order.
+
+The selected span of the epoch mean is resampled onto the bank's native 2 kHz grid
+(index 200 = `t = 0`), flattened outside the selection, and saved into a session-local bank
+under `<output>/templates/`; the pipeline is pointed at it — **both modes** load their bank
 through the same function, so a template made here drives StartStop matching too.
 
 *Detect by my templates only* gives a bank containing nothing but your templates — that is how you

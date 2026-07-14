@@ -16,6 +16,7 @@ from .review_store import ReviewStore
 from .runner import RunController
 from .session import Session
 from .widgets.database_dialog import DatabaseDialog
+from .widgets.raw_browser import RawBrowser
 from .widgets.settings_panel import SettingsPanel
 from .widgets.sir_viewer import SIRViewer
 from .widgets.spontaneous_viewer import SpontaneousViewer
@@ -80,11 +81,14 @@ class MainWindow(QMainWindow):
         self.spontaneous_viewer = SpontaneousViewer(self.session)
         self.spontaneous_viewer.rerun_requested.connect(self.run)
 
+        self.raw_browser = RawBrowser()
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self.settings_panel, "Settings")
         self.tabs.addTab(self.sir_viewer, "Crop review (SIR)")
         self.tabs.addTab(self.startstop_viewer, "Epoch browser (StartStop)")
         self.tabs.addTab(self.spontaneous_viewer, "Spontaneous EMG")
+        self.tabs.addTab(self.raw_browser, "Raw")
 
         central = QWidget()
         cv = QVBoxLayout(central)
@@ -152,11 +156,12 @@ class MainWindow(QMainWindow):
         self._sync_tabs()
 
     def _sync_tabs(self) -> None:
-        """Grey out the surfaces the current mode cannot produce."""
+        """Grey out the surfaces the current mode cannot produce. Raw always stays open."""
         sir = self.session.mode == "sir"
         self.tabs.setTabEnabled(1, sir)
         self.tabs.setTabEnabled(2, not sir)
         self.tabs.setTabEnabled(3, not sir)  # spontaneous only runs inside StartStop
+        self.tabs.setTabEnabled(4, True)     # raw view works for any recording
         if not self.tabs.isTabEnabled(self.tabs.currentIndex()):
             self.tabs.setCurrentIndex(0)
 
@@ -212,17 +217,50 @@ class MainWindow(QMainWindow):
             if not results.ok:
                 self._log("No crops found — check the annotations.")
             self.sir_viewer.load(results)
+            self._load_raw_sir(results)
             self.tabs.setCurrentIndex(1)
         else:
             ss = StartStopResults(output_root)
+            sp = SpontaneousResults(output_root)
             if ss.ok:
-                self.startstop_viewer.load(ss, self.store)
+                self.startstop_viewer.load(ss, self.store, sp if sp.ok else None)
+                self._load_raw_startstop(ss, sp)
             else:
                 self._log("No detections saved — is 'Save annotated .fif of detections' on?")
-            sp = SpontaneousResults(output_root)
             if sp.ok:
                 self.spontaneous_viewer.load(sp)
             self.tabs.setCurrentIndex(2)
+
+    def _load_raw_sir(self, results: SIRResults) -> None:
+        """The raw tab shows the preprocessed recording the crops were cut from."""
+        path = results.raw_path()
+        if path is None:
+            return
+        try:
+            import mne
+            raw = mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
+        except Exception as exc:
+            self._log(f"Raw view unavailable: {exc}")
+            return
+        self.raw_browser.set_recording(raw, title=path.stem)
+
+    def _load_raw_startstop(self, ss: StartStopResults, sp: SpontaneousResults) -> None:
+        """Raw view of the first condition, with its detections, bursts and envelopes."""
+        conds = ss.conditions()
+        if not conds:
+            return
+        cond = conds[0]
+        try:
+            raw = ss.raw(cond)
+        except Exception as exc:
+            self._log(f"Raw view unavailable: {exc}")
+            return
+        dets = [(d.time, "+".join(d.channels)) for d in ss.detections(cond)]
+        self.raw_browser.set_recording(
+            raw, title=cond, detections=dets,
+            bursts=sp.bursts(cond) if sp.ok else None,
+            envelopes=sp.envelopes_on_segment(cond) if sp.ok else None,
+        )
 
     def open_results(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Open an output folder")

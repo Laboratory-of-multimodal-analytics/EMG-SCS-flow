@@ -207,6 +207,15 @@ class SIRResults:
     def ok(self) -> bool:
         return bool(self.crops)
 
+    def raw_path(self) -> Path | None:
+        """The preprocessed recording the run was built from — what the raw browser shows."""
+        d = self.root / "data" / SIR_DIR
+        for pattern in ("*_preprocessed_raw.fif", "*_original_raw.fif"):
+            hits = sorted(d.glob(pattern))
+            if hits:
+                return hits[0]
+        return None
+
     def channels(self) -> list[str]:
         if not self.metrics.empty:
             return sorted(self.metrics["Channel"].dropna().unique().tolist())
@@ -333,6 +342,56 @@ class SIRResults:
         )
         return g
 
+    def recruitment_curves(self, config: str, session=None) -> pd.DataFrame:
+        """Amplitude -> response size per channel, with a 95 % CI across epochs.
+
+        The x value is the amplitude label parsed as a number (`9,5` -> 9.5); labels that
+        are not numeric are dropped from the curve but keep their row in the table. The
+        label itself is never rewritten — `2` and `2,0` remain different crops.
+        """
+        if self.metrics.empty:
+            return pd.DataFrame()
+        m = self.metrics
+        sub = m[m["Configuration"].astype(str) == str(config)].copy()
+        if sub.empty:
+            return pd.DataFrame()
+
+        if session is not None:
+            rejected = np.array([
+                self._is_rejected(session, str(config), str(a), str(ch))
+                for a, ch in zip(sub["Stim. amplitude"], sub["Channel"])
+            ], dtype=bool)
+            sub.loc[rejected, ["Peak1 latency", "PTP amplitude"]] = np.nan
+
+        def _amp(label) -> float:
+            try:
+                return float(str(label).replace(",", "."))
+            except ValueError:
+                return np.nan
+
+        sub["amp_value"] = [_amp(a) for a in sub["Stim. amplitude"]]
+        sub["ptp_uv"] = sub["PTP amplitude"].astype(float) * 1e6  # stored in volts
+
+        rows = []
+        for (amp_label, ch), grp in sub.groupby(["Stim. amplitude", "Channel"], dropna=False):
+            vals = grp["ptp_uv"].to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            n = int(vals.size)
+            mean = float(np.mean(vals)) if n else 0.0
+            # No CI from a single trial; a zero-width band is the honest rendering.
+            sem = float(np.std(vals, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+            rows.append({
+                "Channel": str(ch),
+                "amp_label": str(amp_label),
+                "amp_value": float(grp["amp_value"].iloc[0]),
+                "n": n,
+                "mean_ptp_uv": mean,
+                "ci95": 1.96 * sem,
+                "values": vals,
+            })
+        out = pd.DataFrame(rows)
+        return out.sort_values(["Channel", "amp_value"], na_position="last")
+
     def mean_wave(self, crop: Crop, channel: str) -> tuple[np.ndarray, np.ndarray]:
         """Times (s) and the mean epoch waveform (µV) — the curve a template is built from."""
         epochs = self.load_epochs(crop)
@@ -441,6 +500,52 @@ class SpontaneousResults:
     def envelope_files(self, condition: str) -> list[Path]:
         d = self.base / condition / "Envelopes"
         return sorted(d.glob("*.txt")) if d.exists() else []
+
+    def envelopes_on_segment(self, condition: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """Per-channel RMS envelopes placed back on the segment's own timeline.
+
+        Two kinds of export exist and they use different time bases:
+          * `<ch>_fullenvelope_rms.txt`  — already in segment time;
+          * `<ch>_burst<k>_rms_envelope.txt` — re-centred on the burst midpoint (that is the
+            form the stimulator wants), so it has to be shifted back by that midpoint before
+            it can be drawn over the recording.
+        """
+        bursts = self.bursts(condition)
+        out: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
+
+        for f in self.envelope_files(condition):
+            stem = f.stem
+            try:
+                t, v = self.read_envelope(f)
+            except Exception:
+                continue
+
+            if "_fullenvelope" in stem:
+                ch = stem.split("_fullenvelope")[0]
+                out.setdefault(ch, []).append((t, v))
+                continue
+
+            if "_burst" in stem:
+                ch = stem.split("_burst")[0]
+                try:
+                    k = int(stem.split("_burst")[1].split("_")[0])
+                except (IndexError, ValueError):
+                    continue
+                if bursts.empty:
+                    continue
+                row = bursts[(bursts["Channel"].astype(str) == ch) & (bursts["Burst"] == k)]
+                if row.empty:
+                    continue
+                mid = 0.5 * (float(row.iloc[0]["Start_s"]) + float(row.iloc[0]["End_s"]))
+                out.setdefault(ch, []).append((t + mid, v))
+
+        merged: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for ch, parts in out.items():
+            t = np.concatenate([p[0] for p in parts])
+            v = np.concatenate([p[1] for p in parts])
+            order = np.argsort(t)
+            merged[ch] = (t[order], v[order])
+        return merged
 
     @staticmethod
     def read_envelope(path: Path) -> tuple[np.ndarray, np.ndarray]:
