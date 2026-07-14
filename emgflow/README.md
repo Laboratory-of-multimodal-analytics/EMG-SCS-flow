@@ -7,7 +7,7 @@ Interactive front end for the pipeline. Replaces the two manual loops:
 
 ```bash
 cd /path/to/EMG-SCS-flow
-python -m gui
+python -m emgflow
 ```
 
 Needs `PySide6` on top of `requirements.txt`.
@@ -150,7 +150,7 @@ Inside the output root, in a `review/` folder that is never touched by the pipel
 ## Layout
 
 ```
-gui/
+emgflow/
 ├── settings_spec.py   # the lever registry: every knob, its type, group, and HOW it reaches the pipeline
 ├── session.py         # settings + edits; applies them; JSON round-trip; runner-script export
 ├── runner.py          # runs run_pipeline off the UI thread; streams its log and tqdm progress

@@ -1,4 +1,4 @@
-"""Entry point:  python -m gui   (from the repository root)"""
+"""Entry point:  python -m emgflow   (from the repository root)"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from PySide6.QtWidgets import QApplication
 
-from gui.main_window import MainWindow
+from emgflow.main_window import MainWindow
 
 
 def main() -> None:

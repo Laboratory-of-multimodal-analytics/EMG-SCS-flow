@@ -313,7 +313,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import src.pipeline as P
-from gui import session as gui_session
+from emgflow import session as gui_session
 from src import run_pipeline
 
 # --- settings (module globals: pipeline.py binds constants by value at import) ---
@@ -362,7 +362,7 @@ def rebind_default(P, func_name: str, const_name: str, value: Any) -> None:
     if arg_name not in names[offset:]:
         raise RuntimeError(
             f"{func_name} has no default argument {arg_name!r} — pipeline.py changed; "
-            "update gui/session.py:DEFAULT_ARG_FOR."
+            "update emgflow/session.py:DEFAULT_ARG_FOR."
         )
     defaults[names[offset:].index(arg_name)] = value
     fn.__defaults__ = tuple(defaults)
