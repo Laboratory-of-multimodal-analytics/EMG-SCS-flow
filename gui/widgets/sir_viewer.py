@@ -150,6 +150,12 @@ class SIRViewer(QWidget):
     # ------------------------------------------------------------------ #
     def load(self, results: SIRResults) -> None:
         self.results = results
+        # A template selection belongs to the crop it was drawn on; carrying it into the next
+        # recording would leave a yellow window sitting over unrelated data.
+        self._selection = None
+        self._selectors = []
+        self.make_template_btn.setEnabled(False)
+        self.make_template_btn.setText("Make template…")
         self._refresh_crop_list()
         if results.crops:
             self.crop_list.setCurrentRow(0)

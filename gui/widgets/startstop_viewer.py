@@ -129,6 +129,9 @@ class StartStopViewer(QWidget):
         self.results = results
         self.store = store
         self.spont = spont
+        # A selection belongs to the recording it was drawn on: carrying it into the next
+        # file would leave a yellow window sitting over unrelated data.
+        self._clear_selection()
         self.cond_box.blockSignals(True)
         self.cond_box.clear()
         self.cond_box.addItems(results.conditions())
@@ -136,9 +139,20 @@ class StartStopViewer(QWidget):
         if results.conditions():
             self._on_condition(results.conditions()[0])
 
+    def _clear_selection(self) -> None:
+        self._span = None
+        self._span_det = None
+        self._selectors = []
+        self._seg_selectors = []
+        self.window_label.setText(
+            "Drag over any channel — in Detection or in Segment — to select a window."
+        )
+
     def _on_condition(self, condition: str) -> None:
         if not condition or self.results is None:
             return
+        if condition != self.condition:
+            self._clear_selection()   # the window meant something in the old condition only
         self.condition = condition
         self.detections = self.results.detections(condition)
 
