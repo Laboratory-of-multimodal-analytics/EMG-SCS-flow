@@ -45,7 +45,8 @@ class StartStopViewer(QWidget):
         self.detections: list[Detection] = []
         self.condition = ""
         self._span: tuple[float, float] | None = None
-        self._selector: SpanSelector | None = None
+        self._span_det: int | None = None       # which detection the span belongs to
+        self._selectors: list[SpanSelector] = []
 
         # ---- left ----
         self.cond_box = QComboBox()
@@ -190,12 +191,17 @@ class StartStopViewer(QWidget):
 
     # ------------------------------------------------------------------ #
     def _draw_detection(self) -> None:
-        self._span = None
-        self.window_label.setText("Drag over the plot to select a window.")
         det = self._current()
         if det is None or self.results is None:
             self.detail.message("No detection selected.")
             return
+
+        # The span survives a redraw (that is how it stays on screen after the drag), but it
+        # belongs to one detection — moving to another clears it.
+        if self._span_det != det.index:
+            self._span = None
+            self._span_det = det.index
+            self.window_label.setText("Drag over any channel to select a window.")
 
         status = self.store.review.status(self.condition, det.index) if self.store else "ok"
         self.status_box.blockSignals(True)
@@ -223,18 +229,27 @@ class StartStopViewer(QWidget):
             for ann in (self.store.review.annotations_for(self.condition) if self.store else []):
                 if ann.tmax >= t0 and ann.tmin <= t1:
                     ax.axvspan(ann.tmin, ann.tmax, color="#ffd27f", alpha=0.35, zorder=1)
+            # Keep the current selection visible on every channel, not only where it was drawn.
+            if self._span is not None:
+                ax.axvspan(self._span[0], self._span[1],
+                           facecolor="#ffb703", alpha=0.3, lw=0, zorder=1)
 
         axes[-1].set_xlabel("time (s)")
         self.detail.fig.suptitle(
             f"{self.condition} — detection {det.index + 1}/{len(self.detections)} "
             f"on {'+'.join(det.channels)}  (bold = responding muscle)", fontsize=10,
         )
-        self._selector = SpanSelector(
-            axes[-1], self._on_span, "horizontal", useblit=True,
-            props=dict(alpha=0.3, facecolor="#ffb703"), interactive=True,
-        )
-        # An interactive SpanSelector seeds a zero-width span at x=0, which would autoscale
-        # the shared axis back to the origin; pin it to the window we drew.
+
+        # A selector on EVERY channel: dragging over any muscle must select, not only over
+        # the bottom row. useblit=False because blitting does not survive the redraws and the
+        # scroll-area resizes this canvas goes through — with it on, the drag drew nothing.
+        self._selectors = [
+            SpanSelector(
+                ax, self._on_span, "horizontal", useblit=False,
+                props=dict(alpha=0.3, facecolor="#ffb703"), drag_from_anywhere=True,
+            )
+            for ax in axes
+        ]
         axes[-1].set_xlim(t0, t1)
         self.detail.draw()
 
@@ -347,10 +362,16 @@ class StartStopViewer(QWidget):
 
     # ------------------------------------------------------------------ #
     def _on_span(self, tmin: float, tmax: float) -> None:
+        if abs(tmax - tmin) < 1e-6:   # a plain click, not a drag
+            return
         self._span = (float(tmin), float(tmax))
+        det = self._current()
+        self._span_det = det.index if det else None
         self.window_label.setText(
-            f"Selected {tmin:.3f} – {tmax:.3f} s  ({1000 * (tmax - tmin):.0f} ms)"
+            f"Selected {tmin:.3f} – {tmax:.3f} s  ({1000 * (tmax - tmin):.0f} ms)  "
+            "— annotate or export it"
         )
+        self._draw_detection()   # paint the selection across every channel
 
     def _on_status(self, idx: int) -> None:
         det = self._current()
