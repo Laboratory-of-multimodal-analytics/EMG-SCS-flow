@@ -13,6 +13,12 @@ import pandas as pd
 
 matplotlib.use("Agg")
 
+# DPI for the per-crop epoch panels (the bulk of PASS-2 wall-clock). 500 gives
+# 5000x8750 px files that are slow to render/write; drop to ~160 for fast review
+# runs and bump back to 500 only for final figure delivery. Set via
+# `import src.plotting as PL; PL.EPOCHS_PANEL_DPI = 160` in the runner.
+EPOCHS_PANEL_DPI = 500
+
 _AMP_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 
@@ -50,7 +56,7 @@ def plot_epochs_panel(
     epochs_to_plot: dict[str, list[int]] | None = None,
 ) -> None:
     n_channels = len(ch_names)
-    fig, axes = plt.subplots(n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=500)
+    fig, axes = plt.subplots(n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=EPOCHS_PANEL_DPI)
     if n_channels == 1:
         axes = [axes]
 
@@ -343,7 +349,7 @@ def plot_template_overlay_panel(
     drawn as coloured dots on the mean waveform.
     """
     n_channels = len(ch_names)
-    fig, axes = plt.subplots(n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=500)
+    fig, axes = plt.subplots(n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=EPOCHS_PANEL_DPI)
     if n_channels == 1:
         axes = [axes]
 
