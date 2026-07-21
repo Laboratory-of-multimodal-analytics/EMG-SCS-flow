@@ -86,6 +86,16 @@ SPONTANEOUS_EMG_BURST_MERGE_MS = 300.0
 SPONTANEOUS_EMG_ACTIVE_MAD_K = 3.0
 
 # -- Assessment of antagonist muscle co-activation (within the spontaneous-EMG analysis) --
+# Gap (ms) allowed between a burst on one muscle of an antagonist pair and a
+# burst on the other muscle for both to be folded into one co-activation
+# episode (_build_coactivation_episodes). Deliberately separate from
+# SPONTANEOUS_EMG_BURST_MERGE_MS: that constant only bridges gaps WITHIN a
+# single channel's own repeated bursts, and reusing it across channels forces
+# same-channel burst separation and cross-channel reciprocal-handoff grouping
+# to share one number even though they describe different things (e.g. a
+# muscle repeating every 300ms vs. an agonist->antagonist handoff ~200ms
+# later would otherwise need contradictory merge windows).
+ANTAGONIST_COACTIVATION_MERGE_MS = 300.0
 # Add pairs of muscles from the analyzed recording if the required pairs are not in the list.
 ANTAGONIST_PAIRS = [
 # legs

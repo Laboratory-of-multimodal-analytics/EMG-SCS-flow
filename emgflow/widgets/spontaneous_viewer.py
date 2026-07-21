@@ -1,9 +1,13 @@
-"""Spontaneous-EMG review: RMS envelopes with detected bursts.
+"""Spontaneous-EMG review: RMS envelopes with detected bursts, and antagonist co-activation.
 
 A separate review surface, not a variant of the crop viewer: here the object of interest is
 a burst on the envelope, not an evoked peak. The burst thresholds — above all the absolute
 floor in µV, which is what separates an active muscle from a noisy low-amplitude channel —
 are the knobs you drag while watching the shading update.
+
+Two sub-tabs share one condition selector: "Envelopes" (per-channel RMS envelope with its
+bursts) and "Antagonist co-activation" (the L-shape plots, one point per merged burst
+episode of an antagonist pair — click a point to see that episode's envelope chunk).
 """
 
 from __future__ import annotations
@@ -15,10 +19,11 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..results import SpontaneousResults
+from .coactivation_viewer import CoactivationViewer
 
 
 class SpontaneousViewer(QWidget):
@@ -38,8 +43,6 @@ class SpontaneousViewer(QWidget):
 
         left = QWidget()
         lv = QVBoxLayout(left)
-        lv.addWidget(QLabel("<b>Condition</b>"))
-        lv.addWidget(self.cond_box)
         lv.addWidget(QLabel("<b>Exported envelopes</b>"))
         lv.addWidget(self.env_list, 1)
         self.summary_btn = QPushButton("Per-channel summary")
@@ -74,12 +77,30 @@ class SpontaneousViewer(QWidget):
         split.addWidget(left)
         split.addWidget(right)
         split.setSizes([300, 900])
+        envelopes_tab = QWidget()
+        ev_layout = QVBoxLayout(envelopes_tab)
+        ev_layout.setContentsMargins(0, 0, 0, 0)
+        ev_layout.addWidget(split)
+
+        self.coactivation_viewer = CoactivationViewer(session)
+
+        self.inner_tabs = QTabWidget()
+        self.inner_tabs.addTab(envelopes_tab, "Envelopes")
+        self.inner_tabs.addTab(self.coactivation_viewer, "Antagonist co-activation")
+
+        cond_bar = QHBoxLayout()
+        cond_bar.addWidget(QLabel("<b>Condition</b>"))
+        cond_bar.addWidget(self.cond_box)
+        cond_bar.addStretch()
+
         root = QVBoxLayout(self)
-        root.addWidget(split)
+        root.addLayout(cond_bar)
+        root.addWidget(self.inner_tabs, 1)
 
     # ------------------------------------------------------------------ #
     def load(self, results: SpontaneousResults) -> None:
         self.results = results
+        self.coactivation_viewer.load(results)
         self.cond_box.blockSignals(True)
         self.cond_box.clear()
         self.cond_box.addItems(results.conditions())
@@ -99,6 +120,7 @@ class SpontaneousViewer(QWidget):
             self.env_list.setCurrentRow(0)
         else:
             self._draw()
+        self.coactivation_viewer.set_condition(condition)
 
     def _current_file(self) -> Path | None:
         if self.results is None:

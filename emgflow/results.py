@@ -497,6 +497,11 @@ class SpontaneousResults:
         p = self.base / condition / "Excel" / f"Spontaneous_EMG_summary_{condition}.csv"
         return _read_csv(p) if p.exists() else pd.DataFrame()
 
+    def coactivation_episodes(self, condition: str) -> pd.DataFrame:
+        """Antagonist-pair burst episodes behind the L-shape plot (one row per episode)."""
+        p = self.base / condition / "Excel" / f"Spontaneous_EMG_coactivation_episodes_{condition}.csv"
+        return _read_csv(p) if p.exists() else pd.DataFrame()
+
     def envelope_files(self, condition: str) -> list[Path]:
         d = self.base / condition / "Envelopes"
         return sorted(d.glob("*.txt")) if d.exists() else []
