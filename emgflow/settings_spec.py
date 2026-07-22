@@ -211,6 +211,11 @@ SPONTANEOUS: list[Lever] = [
           "A burst is kept only if its peak reaches this fraction. Must be >= extent fraction."),
     Lever("SPONTANEOUS_EMG_BURST_MIN_MS", "Min burst duration (ms)", "float", 300.0, "Bursts", "startstop", "global", ""),
     Lever("SPONTANEOUS_EMG_BURST_MERGE_MS", "Merge gaps shorter than (ms)", "float", 300.0, "Bursts", "startstop", "global", ""),
+    Lever("ANTAGONIST_COACTIVATION_MERGE_MS", "Antagonist co-activation merge gap (ms)", "float", 300.0, "Bursts", "startstop", "global",
+          "Gap allowed between a burst on one antagonist-pair muscle and a burst on the other "
+          "before both fold into one co-activation episode (_build_coactivation_episodes). "
+          "Separate from SPONTANEOUS_EMG_BURST_MERGE_MS, which only merges gaps within a "
+          "single channel's own repeated bursts."),
     Lever("SPONTANEOUS_EMG_ACTIVE_MAD_K", "Active-channel MAD k", "opt_float", 3.0, "Bursts", "startstop", "global",
           "A burst-less channel whose mean RMS exceeds median + k*MAD still gets its envelope "
           "exported. Empty disables."),

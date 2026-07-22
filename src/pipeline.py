@@ -37,6 +37,7 @@ from .constants import (
     SPONTANEOUS_EMG_BURST_MERGE_MS,
 
     SPONTANEOUS_EMG_ACTIVE_MAD_K,
+    ANTAGONIST_COACTIVATION_MERGE_MS,
 
     BASELINE_TMAX,
     BASELINE_TMIN,
@@ -1563,7 +1564,7 @@ def _run_spontaneous_emg_analysis(
         sig_by_ch=sig_by_ch,
         times=times,
         pairs=ANTAGONIST_PAIRS,
-        merge_ms=SPONTANEOUS_EMG_BURST_MERGE_MS,
+        merge_ms=ANTAGONIST_COACTIVATION_MERGE_MS,
     )
 
     # Fallback export: for channels with NO bursts that are significantly more
