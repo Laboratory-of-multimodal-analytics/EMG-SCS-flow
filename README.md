@@ -6,7 +6,7 @@ epoch files.
 
 It runs two ways:
 
-- **`python3 -m emgflow`** — the interactive toolbox (see [emgflow/README.md](emgflow/README.md)).
+- **`python3 -m emgflow`** — the interactive toolbox
 - **`python3 run.py <file>`** — the scripted pipeline, for reproducible batch runs.
 
 The GUI does not reimplement anything: it calls the same `run_pipeline(...)`, renders the
