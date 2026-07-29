@@ -16,6 +16,7 @@ import pandas as pd
 
 SIR_DIR = "Stimulation-induced responses"
 SS_DIR = "StartStop analysis"
+COND_DIR = "Condition test"
 
 METRIC_COLS = [
     "Configuration", "Stim. amplitude", "Epoch", "Channel",
@@ -71,6 +72,13 @@ def detect_mode(root: Path) -> str | None:
     'Stimulation-induced responses/' folder proves nothing.
     """
     root = Path(root)
+    # Condition test is a distinct output tree (no SIR epochs, no StartStop fif),
+    # so probe it first by its own summary CSV / plots.
+    cond_csv = root / "results" / COND_DIR / "Excel" / "condition_summary.csv"
+    cond_wf = root / "results" / COND_DIR / "Waterfall"
+    if cond_csv.exists() or (cond_wf.exists() and any(cond_wf.glob("*.png"))):
+        return "condition"
+
     sir_epochs = root / "results" / SIR_DIR / "Stimulus-centered epochs"
     sir_csv = root / "results" / SIR_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv"
     if (sir_epochs.exists() and any(sir_epochs.glob("*-epo.fif"))) or sir_csv.exists():
@@ -89,6 +97,7 @@ _PRUNE = {
     "data", "results", "review", "templates", "Excel", "Boxplots", "Envelopes",
     "Plots", "Raw epochs", "Templates", "Detections raw", "Spontaneous EMG",
     "Stimulus-centered epochs", "Template overlays", "annot_crops_fif", "__pycache__",
+    "Condition test", "Waterfall", "Amplitude vs condition", "Recruitment", "arrays",
 }
 
 

@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QWidget, QVBoxLayout,
 )
 
+from src.text_curves import is_text_curves_file, text_curves_window_defaults
+
 from .results import SIRResults, SpontaneousResults, StartStopResults, detect_mode
 from .review_store import ReviewStore
 from .runner import RunController
@@ -21,8 +23,14 @@ from .widgets.settings_panel import SettingsPanel
 from .widgets.sir_viewer import SIRViewer
 from .widgets.spontaneous_viewer import SpontaneousViewer
 from .widgets.startstop_viewer import StartStopViewer
+from .widgets.plot_gallery import ConditionViewer, RecruitmentViewer
 
-MODES = [("Stimulation-induced (SIR)", "sir"), ("StartStop", "startstop")]
+MODES = [("Stimulation-induced (SIR)", "sir"), ("StartStop", "startstop"),
+         ("Condition test", "condition")]
+# combobox index per mode
+_MODE_INDEX = {m[1]: i for i, m in enumerate(MODES)}
+# tab indices (kept in one place so the sync logic below stays readable)
+TAB_SETTINGS, TAB_SIR, TAB_RECRUIT, TAB_STARTSTOP, TAB_SPONT, TAB_COND, TAB_RAW = range(7)
 
 
 class MainWindow(QMainWindow):
@@ -79,18 +87,22 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel(self.session)
         self.sir_viewer = SIRViewer(self.session)
         self.sir_viewer.rerun_requested.connect(self.run)
+        self.recruitment_viewer = RecruitmentViewer(self.session)
         self.startstop_viewer = StartStopViewer(self.session)
         self.spontaneous_viewer = SpontaneousViewer(self.session)
         self.spontaneous_viewer.rerun_requested.connect(self.run)
+        self.condition_viewer = ConditionViewer(self.session)
 
         self.raw_browser = RawBrowser()
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.settings_panel, "Settings")
-        self.tabs.addTab(self.sir_viewer, "Crop review (SIR)")
-        self.tabs.addTab(self.startstop_viewer, "Epoch browser (StartStop)")
-        self.tabs.addTab(self.spontaneous_viewer, "Spontaneous EMG")
-        self.tabs.addTab(self.raw_browser, "Raw")
+        self.tabs.addTab(self.settings_panel, "Settings")            # TAB_SETTINGS
+        self.tabs.addTab(self.sir_viewer, "Crop review (SIR)")        # TAB_SIR
+        self.tabs.addTab(self.recruitment_viewer, "Recruitment")      # TAB_RECRUIT
+        self.tabs.addTab(self.startstop_viewer, "Epoch browser (StartStop)")  # TAB_STARTSTOP
+        self.tabs.addTab(self.spontaneous_viewer, "Spontaneous EMG")  # TAB_SPONT
+        self.tabs.addTab(self.condition_viewer, "Condition test")     # TAB_COND
+        self.tabs.addTab(self.raw_browser, "Raw")                     # TAB_RAW
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         central = QWidget()
@@ -153,7 +165,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def open_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open recording", "", "Recordings (*.mat *.fif *.edf);;All files (*)"
+            self, "Open recording", "", "Recordings (*.mat *.fif *.edf *.txt);;All files (*)"
         )
         if not path:
             return
@@ -164,6 +176,30 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self._log(f"Loaded {path}")
         self._log(f"Outputs will go to {self.session.output_dir}")
+        self._adapt_to_text_curves(Path(path))
+
+    def _adapt_to_text_curves(self, path: Path) -> None:
+        """Show the windows a pre-epoched text export actually runs with.
+
+        run_pipeline adapts these windows itself for this format (the file has no
+        pre-stimulus data, so the standard windows do not fit). Mirroring them
+        into the settings keeps the panel honest: what is on screen is what runs,
+        and the user can still override any of them by hand.
+        """
+        if not is_text_curves_file(path):
+            return
+        try:
+            adapted = text_curves_window_defaults(path)
+        except (OSError, ValueError) as exc:
+            self._log(f"Could not read text curves windows: {exc}")
+            return
+        for name, value in adapted.items():
+            self.session.set(name, value)
+        self.settings_panel.rebuild()
+        self._log(
+            "Pre-cut epochs: artifact search and epoching are skipped; windows set to "
+            + ", ".join(f"{k}={v:g}" for k, v in adapted.items())
+        )
 
     def _on_mode(self, idx: int) -> None:
         self.session.set_mode(MODES[idx][1])
@@ -171,12 +207,17 @@ class MainWindow(QMainWindow):
         self._sync_tabs()
 
     def _sync_tabs(self) -> None:
-        """Grey out the surfaces the current mode cannot produce. Raw always stays open."""
-        sir = self.session.mode == "sir"
-        self.tabs.setTabEnabled(1, sir)
-        self.tabs.setTabEnabled(2, not sir)
-        self.tabs.setTabEnabled(3, not sir)  # spontaneous only runs inside StartStop
-        self.tabs.setTabEnabled(4, True)     # raw view works for any recording
+        """Grey out the surfaces the current mode cannot produce."""
+        mode = self.session.mode
+        sir = mode == "sir"
+        startstop = mode == "startstop"
+        condition = mode == "condition"
+        self.tabs.setTabEnabled(TAB_SIR, sir)
+        self.tabs.setTabEnabled(TAB_RECRUIT, sir)         # recruitment lives in SIR
+        self.tabs.setTabEnabled(TAB_STARTSTOP, startstop)
+        self.tabs.setTabEnabled(TAB_SPONT, startstop)     # spontaneous is StartStop-only
+        self.tabs.setTabEnabled(TAB_COND, condition)
+        self.tabs.setTabEnabled(TAB_RAW, sir or startstop)  # condition saves no raw
         if not self.tabs.isTabEnabled(self.tabs.currentIndex()):
             self.tabs.setCurrentIndex(0)
 
@@ -220,7 +261,17 @@ class MainWindow(QMainWindow):
         self.session.output_dir = output_root
         # Persist the exact settings that produced these outputs, next to them.
         self.session.save_json(Path(output_root) / "review" / "session.json")
-        self.show_results(output_root, self.session.mode)
+        # A .txt run auto-routes to Condition or SIR by content, so trust the
+        # output on disk for which viewer to open, not the requested run mode.
+        actual = detect_mode(output_root) or self.session.mode
+        if actual != self.session.mode:
+            self.session.set_mode(actual)
+            self.mode_box.blockSignals(True)
+            self.mode_box.setCurrentIndex(_MODE_INDEX.get(actual, 0))
+            self.mode_box.blockSignals(False)
+            self.settings_panel.rebuild()
+            self._sync_tabs()
+        self.show_results(output_root, actual)
 
     # ------------------------------------------------------------------ #
     def show_results(self, output_root: Path, mode: str) -> None:
@@ -228,12 +279,20 @@ class MainWindow(QMainWindow):
         output_root = Path(output_root)
         self.store = ReviewStore(output_root)
 
+        if mode == "condition":
+            self.condition_viewer.load(output_root)
+            self.tabs.setCurrentIndex(TAB_COND)
+            self._raw_source = None      # condition runs save no raw recording
+            self._raw_loaded = None
+            return
+
         if mode == "sir":
             results = SIRResults(output_root)
             if not results.ok:
                 self._log("No crops found — check the annotations.")
             self.sir_viewer.load(results)
-            self.tabs.setCurrentIndex(1)
+            self.recruitment_viewer.load(output_root)   # empty if this run had no recruitment
+            self.tabs.setCurrentIndex(TAB_SIR)
         else:
             ss = StartStopResults(output_root)
             sp = SpontaneousResults(output_root)
@@ -243,7 +302,7 @@ class MainWindow(QMainWindow):
                 self._log("No detections saved — is 'Save annotated .fif of detections' on?")
             if sp.ok:
                 self.spontaneous_viewer.load(sp)
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(TAB_STARTSTOP)
 
         # The raw recording is read only when the Raw tab is actually opened: on a network
         # drive a preprocessed .fif is hundreds of MB, and loading it eagerly stalled the
@@ -253,7 +312,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ #
     def _on_tab_changed(self, index: int) -> None:
-        if index == 4:
+        if index == TAB_RAW:
             self._ensure_raw_loaded()
 
     def _ensure_raw_loaded(self) -> None:
@@ -339,7 +398,7 @@ class MainWindow(QMainWindow):
         self.session.output_dir = root
         self.session.set_mode(mode)
         self.mode_box.blockSignals(True)
-        self.mode_box.setCurrentIndex(0 if mode == "sir" else 1)
+        self.mode_box.setCurrentIndex(_MODE_INDEX.get(mode, 0))
         self.mode_box.blockSignals(False)
         self.settings_panel.rebuild()
         self._sync_tabs()

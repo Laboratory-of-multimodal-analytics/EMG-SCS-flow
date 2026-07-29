@@ -201,6 +201,16 @@ RESP_TMIN = -0.01
 # Latest response time allowed for peak search (s).
 RESP_TMAX = 0.02
 
+# ── Text "curves" exports (pre-cut epochs, stimulus at t=0) ──
+# These files have no pre-stimulus data, so the windows above cannot be used:
+# the baseline window would be empty and the response window would end right on
+# top of the responses. These defaults apply only when the caller leaves
+# RESP_TMIN/RESP_TMAX at their values above.
+# Response search start (s) — past the stimulus artifact.
+TEXT_CURVES_RESP_TMIN = 0.002
+# Response search end (s) — covers the 20-25 ms responses seen in these files.
+TEXT_CURVES_RESP_TMAX = 0.04
+
 # Enable artifact-correlation channel-level rejection in stimulation mode.
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = False
 # Absolute correlation threshold vs artifact channel means.

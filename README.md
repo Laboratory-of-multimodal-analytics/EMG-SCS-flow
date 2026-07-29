@@ -38,8 +38,8 @@ mode ran.
 
 ## Input
 
-- `.mat` (LabChart), `.fif`, `.edf`.
-- **Annotations are required.** SIR mode expects labels encoding configuration and amplitude;
+- `.mat` (LabChart), `.fif`, `.edf`, and `.txt` text **curves** exports (see below).
+- **Annotations are required** (except for curves exports). SIR mode expects labels encoding configuration and amplitude;
   StartStop expects `start`/`stop` markers (Cyrillic `старт`/`стоп` and typos are handled) plus a
   free-text label naming each condition.
 - The stimulation channel must be identifiable as an artifact channel (a name containing `art`),
@@ -51,6 +51,36 @@ mode ran.
 Two LabChart quirks are handled: an empty placeholder channel that breaks the naive loader, and
 headerless "MATLAB Level 4" exports without a `dataend` key — those are reconstructed block by
 block, merged, and re-run from a temporary `.fif`.
+
+### Text "curves" exports (pre-cut epochs)
+
+Files from the clinical EP station (`N - curves count`, then one header + `Values, Volt` block per
+curve) are **already epoched**: the station triggers on the stimulus, so each curve is one epoch
+with sample 0 at the trigger. They are detected by a header sniff, not by extension alone, and
+take a shortened SIR path — **artifact peak-finding and epoching are skipped** and the curves go
+straight into PASS1/PASS2. Everything downstream (templates, onset/P1/P2 detection, gates, the
+force/suppress system, plots, Excel) is the normal SIR code.
+
+Consequences of what the format does *not* carry:
+
+- **No channel names.** Channels are numbered by column position (`ch1`..`chN`). Column order does
+  not imply muscle identity — that has to come from the recording protocol.
+- **No configuration/amplitude labels.** The whole file is one crop: configuration = file stem,
+  amplitude = `all`.
+- **No artifact channel**, so `ARTCHAN` stays empty and no channel is excluded from the EMG set.
+- **No pre-stimulus data**, so the standard windows do not fit and are adapted (only where the
+  caller left them at their defaults, so explicit values still win): epoch = the curve's own span,
+  response = `TEXT_CURVES_RESP_TMIN..TEXT_CURVES_RESP_TMAX` (2–40 ms), baseline = the station's
+  constant pre-artifact pad. That pad is the only pre-artifact data there is; its mean is an exact
+  DC estimate, and assuming a zero baseline instead would bias every peak amplitude by the
+  channel's DC offset.
+- **Raw filtering is skipped.** A 50 Hz notch at 20 kHz has a transition band far longer than one
+  100 ms epoch, so filtering the concatenated curves would ring across their edges. These exports
+  arrive filtered from the station.
+
+The CLI, the scripted `run_pipeline` call and the GUI all take the same path — the GUI only adds
+the file dialog filter and mirrors the adapted windows into its settings panel, so the values shown
+are the values that run.
 
 ---
 

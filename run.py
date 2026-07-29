@@ -3,9 +3,10 @@
 Run the EMG pipeline from the command line.
 
 Usage (from project root):
-  python run.py <input_file> [--startstop | --no-startstop] [--output-dir DIR] [--template-mode MODE]
+  python run.py <input_file> [--startstop | --no-startstop] [--output-dir DIR]
 
-Input: EDF, FIF, or MAT file. Outputs go to results/ or --output-dir.
+Input: EDF, FIF, MAT, or a text "curves" export (.txt, pre-cut epochs).
+Outputs go to results/ or --output-dir.
 """
 
 from __future__ import annotations
@@ -23,12 +24,12 @@ from src import run_pipeline
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="EMG pipeline for SCS / start-stop protocols. Supports EDF, FIF, and MAT.",
+        description="EMG pipeline for SCS / start-stop protocols. Supports EDF, FIF, MAT and text curves exports.",
     )
     parser.add_argument(
         "input_path",
         type=Path,
-        help="Path to the recording (EDF, FIF, or MAT).",
+        help="Path to the recording (EDF, FIF, MAT, or a .txt curves export).",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

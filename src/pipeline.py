@@ -15,6 +15,14 @@ from scipy.io import loadmat
 from tqdm import tqdm
 
 from .annotations import create_annotation_crops, extract_start_stop_segments
+from .text_curves import (
+    is_text_curves_file,
+    text_curves_crop_name,
+    text_curves_epochs,
+    text_curves_window_defaults,
+)
+from .condition import is_condition_paradigm, run_condition_analysis
+from .recruitment import run_recruitment_analysis
 from .constants import (
     ARTCHAN,
     ARTIFACT_REREF,
@@ -48,6 +56,8 @@ from .constants import (
     RAW_BANDPASS_L_FREQ,
     RESP_TMAX,
     RESP_TMIN,
+    TEXT_CURVES_RESP_TMAX,
+    TEXT_CURVES_RESP_TMIN,
     SIR_TM_MIN_CORR,
     SIR_TM_SCALES,
     SIR_TEMPLATE_PER_AMPLITUDE,
@@ -695,6 +705,15 @@ SIR_FORCE_P2_WIN_MS: float = 999.0
 # gates (low median-corr / low inter-trial / hard-valid) — for weak but genuine responses the
 # user explicitly wants kept. Per-epoch P1 must still be detectable; this only skips the gates.
 SIR_FORCE_KEYS: set[tuple[str, str, str]] = set()
+
+# Per-file EXPLICIT markers: place P1/P2/onset at clinician-given latencies and
+# polarities and sample each epoch there, INSTEAD of detecting on the mean. For
+# responses that are real in single sweeps but cancel in the trial-mean (latency
+# jitter), so the mean-based force above finds nothing. Key = (config, channel)
+# [amp = every crop] or (config, amp, channel). Value = a dict:
+#   {"onset": lat_s|None, "p1": (lat_s, pol), "p2": (lat_s, pol)}  pol = +1 up / -1 down.
+# Channels listed here are auto force-kept (gates bypassed) and sampled per-epoch.
+SIR_FORCE_MARKER_LAT: dict[tuple, dict] = {}
 
 # When True, _align_events_to_artifact centres each config on the artifact's FIRST-PEAK
 # APEX located by ONSET (first threshold crossing above the pre-stim baseline, then walk to
@@ -2733,10 +2752,47 @@ def run_pipeline(
     startstop_dir = paths["startstop_dir"]
 
     suffix = edf_path.suffix.lower()
+    # Text ``curves`` exports arrive already epoched: one curve per stimulus,
+    # sample 0 = trigger. There is no continuous recording to search for stimulus
+    # artifacts in, so PASS1/PASS2 are fed these epochs directly (see below).
+    pre_epoched: dict[str, mne.EpochsArray] | None = None
     if suffix == ".mat":
         raw = mat_blocks[0][1] if mat_blocks else _load_raw_from_mat(edf_path)
     elif suffix == ".fif":
         raw = mne.io.read_raw_fif(edf_path, preload=True)
+    elif is_text_curves_file(edf_path):
+        ready = text_curves_epochs(edf_path)
+        arr = ready.get_data()
+        n_ep, n_ch, _ = arr.shape
+        # A moving stimulus artifact means a paired-pulse Condition test, not a
+        # single-shock recruitment file. Route it to its own analysis and return.
+        is_cond, cond_info = is_condition_paradigm(arr, float(ready.info["sfreq"]))
+        if not use_startstop and is_cond:
+            print(
+                f"[CONDITION] Text curves export: {n_ep} curves x {n_ch} channels "
+                f"@ {ready.info['sfreq']:.0f} Hz — moving artifact "
+                f"(spread {cond_info['spread_ms']:.0f} ms) -> Condition test.",
+                flush=True,
+            )
+            build_output_dirs(output_root, startstop_mode=False)
+            run_condition_analysis(
+                arr, float(ready.info["sfreq"]), list(ready.ch_names),
+                output_root, info=cond_info,
+            )
+            if old_mne_log_level is not None:
+                mne.set_log_level(old_mne_log_level)
+            return output_root
+        pre_epoched = {text_curves_crop_name(edf_path): ready}
+        print(
+            f"[SIR] Text curves export: {n_ep} pre-cut epochs x {n_ch} channels "
+            f"@ {ready.info['sfreq']:.0f} Hz — skipping artifact search and epoching.",
+            flush=True,
+        )
+        # A concatenated copy exists only so the Raw browser and the saved
+        # *_raw.fif keep working; nothing downstream analyses it.
+        raw = mne.io.RawArray(
+            np.hstack(list(ready.get_data())), ready.info.copy(), verbose=False
+        )
     else:
         raw = mne.io.read_raw_edf(edf_path, preload=True)
 
@@ -2744,10 +2800,25 @@ def run_pipeline(
     raw.save(original_fif_path, overwrite=True)
     # StartStop detection does not need a stimulus/artifact channel (template
     # matching runs directly on the EMG). Allow art-less recordings there; SIR
-    # still requires one for stimulus-onset detection.
-    default_art_chans = _resolve_art_channels(raw, ARTCHAN, allow_empty=use_startstop)
+    # still requires one for stimulus-onset detection — except for pre-epoched
+    # text exports, which carry no artifact channel and need no onset search.
+    default_art_chans = _resolve_art_channels(
+        raw, ARTCHAN, allow_empty=use_startstop or pre_epoched is not None
+    )
     default_art_set = set(default_art_chans)
     emg_picks = [ch for ch in raw.ch_names if ch not in default_art_set]
+    if pre_epoched is not None:
+        # Filtering the concatenated copy would ring across epoch boundaries: a
+        # 50 Hz notch at 20 kHz has a transition band far longer than one 100 ms
+        # epoch, so it would smear neighbouring curves into each other. These
+        # exports come filtered from the station anyway.
+        if raw_notch_freq is not None or raw_bandpass_l_freq is not None or raw_bandpass_h_freq is not None:
+            print(
+                "[SIR] Text curves export: raw filtering is not applied "
+                "(epochs are already cut; filtering would ring across their edges).",
+                flush=True,
+            )
+        emg_picks = []
     if emg_picks:
         # Notch is applied independently of the band-pass: the full power-line
         # harmonic comb (base .. Nyquist) is removed whenever raw_notch_freq is
@@ -2776,6 +2847,28 @@ def run_pipeline(
             mne.set_log_level(old_mne_log_level)
         return output_root
 
+    if pre_epoched is not None:
+        # Pre-cut epochs start at the stimulus, so the default windows (which all
+        # assume 50 ms of pre-stimulus data) do not fit. Adapt only the ones the
+        # caller left untouched, so explicit arguments still win.
+        # The baseline window lands on the station's constant pre-artifact pad:
+        # its mean is an exact DC estimate, which is what the amplitude metrics
+        # need. Assuming a zero baseline instead would bias every peak value by
+        # the channel's DC offset (hundreds of uV in these files).
+        adapted = text_curves_window_defaults(edf_path)
+        if epoch_tmin == EPOCH_TMIN and epoch_tmax == EPOCH_TMAX:
+            epoch_tmin, epoch_tmax = adapted["epoch_tmin"], adapted["epoch_tmax"]
+        if baseline_tmin == BASELINE_TMIN and baseline_tmax == BASELINE_TMAX:
+            baseline_tmin, baseline_tmax = adapted["baseline_tmin"], adapted["baseline_tmax"]
+        if resp_tmin == RESP_TMIN and resp_tmax == RESP_TMAX:
+            resp_tmin, resp_tmax = adapted["resp_tmin"], adapted["resp_tmax"]
+        print(
+            f"[SIR] Text curves windows: epoch {epoch_tmin * 1e3:.1f}..{epoch_tmax * 1e3:.1f} ms, "
+            f"baseline {baseline_tmin * 1e3:.2f}..{baseline_tmax * 1e3:.2f} ms, "
+            f"response {resp_tmin * 1e3:.1f}..{resp_tmax * 1e3:.1f} ms",
+            flush=True,
+        )
+
     # ── SIR: load pre-computed template bank ──
     template_dir = _resolve_startstop_template_dir()
     template_bank = _load_startstop_template_bank(
@@ -2789,9 +2882,13 @@ def run_pipeline(
             mne.set_log_level(old_mne_log_level)
         return output_root
 
-    print("[SIR] Creating annotation crops...", flush=True)
-    create_annotation_crops(raw, crops_dir, overwrite=True)
-    file_list = list_crop_files(crops_dir)
+    if pre_epoched is not None:
+        # No annotations to crop by: the whole file is one crop.
+        file_list = list(pre_epoched)
+    else:
+        print("[SIR] Creating annotation crops...", flush=True)
+        create_annotation_crops(raw, crops_dir, overwrite=True)
+        file_list = list_crop_files(crops_dir)
 
     # ── Config-level artifact reference: one shared shape per configuration so
     # EVERY amplitude is centred on the SAME artifact feature (the first dip). The
@@ -2882,44 +2979,51 @@ def run_pipeline(
 
     print("[SIR] Collecting channel means...", flush=True)
     for file_name in file_list:
-        file_path = crops_dir / file_name
-        raw_file = mne.io.read_raw_fif(file_path, preload=False)
-        sfreq = raw_file.info["sfreq"]
-
-        art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
-        art_set = set(art_chans)
-        art = _get_art_signal(raw_file, art_chans)
-        min_dist_samples = sfreq * art_min_distance_ms / 1000.0
-        if art_peak_height is not None:
-            fp_kwargs = {"height": art_peak_height, "distance": min_dist_samples}
-            if art_peak_width_ms is not None:
-                fp_kwargs["width"] = (
-                    art_peak_width_ms[0] / 1000.0 * sfreq,
-                    art_peak_width_ms[1] / 1000.0 * sfreq,
-                )
-            peaks, _ = find_peaks(-art, **fp_kwargs)
+        if pre_epoched is not None:
+            # Epochs came pre-cut: no artifact channel, no onset search.
+            epochs = pre_epoched[file_name]
+            sfreq = float(epochs.info["sfreq"])
+            art_chans = []
+            art_set = set()
         else:
-            threshold = THRESH * np.std(art)
-            peaks, _ = find_peaks(-art, height=threshold, distance=min_dist_samples)
-        if sir_align_artifact and len(peaks) >= 3:
-            peaks = _align_events_to_artifact(
-                art, peaks, sfreq,
-                win_ms=sir_align_win_ms, max_shift_ms=sir_align_max_shift_ms,
-                center_on_first_peak=sir_align_first_peak,
-                first_peak_frac=sir_align_first_peak_frac,
-                ref=config_art_ref.get(file_name.split("-")[0]),
-            )
-        if len(peaks) <= MIN_VALID_EPOCHS:
-            continue
+            file_path = crops_dir / file_name
+            raw_file = mne.io.read_raw_fif(file_path, preload=False)
+            sfreq = raw_file.info["sfreq"]
 
-        events = np.column_stack(
-            [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
-        )
-        epochs = mne.Epochs(
-            raw_file, events, event_id=1,
-            tmin=epoch_tmin, tmax=epoch_tmax,
-            baseline=None, preload=True,
-        )
+            art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
+            art_set = set(art_chans)
+            art = _get_art_signal(raw_file, art_chans)
+            min_dist_samples = sfreq * art_min_distance_ms / 1000.0
+            if art_peak_height is not None:
+                fp_kwargs = {"height": art_peak_height, "distance": min_dist_samples}
+                if art_peak_width_ms is not None:
+                    fp_kwargs["width"] = (
+                        art_peak_width_ms[0] / 1000.0 * sfreq,
+                        art_peak_width_ms[1] / 1000.0 * sfreq,
+                    )
+                peaks, _ = find_peaks(-art, **fp_kwargs)
+            else:
+                threshold = THRESH * np.std(art)
+                peaks, _ = find_peaks(-art, height=threshold, distance=min_dist_samples)
+            if sir_align_artifact and len(peaks) >= 3:
+                peaks = _align_events_to_artifact(
+                    art, peaks, sfreq,
+                    win_ms=sir_align_win_ms, max_shift_ms=sir_align_max_shift_ms,
+                    center_on_first_peak=sir_align_first_peak,
+                    first_peak_frac=sir_align_first_peak_frac,
+                    ref=config_art_ref.get(file_name.split("-")[0]),
+                )
+            if len(peaks) <= MIN_VALID_EPOCHS:
+                continue
+
+            events = np.column_stack(
+                [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
+            )
+            epochs = mne.Epochs(
+                raw_file, events, event_id=1,
+                tmin=epoch_tmin, tmax=epoch_tmax,
+                baseline=None, preload=True,
+            )
 
         times = epochs.times
         configuration = file_name.split("-")[0]
@@ -3114,47 +3218,55 @@ def run_pipeline(
 
     print("[SIR] Detecting epochs...", flush=True)
     for file_name in tqdm(file_list, desc="PASS 2: detect epochs"):
-        file_path = crops_dir / file_name
-        raw_file = mne.io.read_raw_fif(file_path)
-        _apply_special_crops(raw_file, file_name)
-
-        sfreq = raw_file.info["sfreq"]
-        art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
-        art_set = set(art_chans)
-        art = _get_art_signal(raw_file, art_chans)
-        min_dist_samples = sfreq * art_min_distance_ms / 1000.0
-        if art_peak_height is not None:
-            fp_kwargs = {"height": art_peak_height, "distance": min_dist_samples}
-            if art_peak_width_ms is not None:
-                fp_kwargs["width"] = (
-                    art_peak_width_ms[0] / 1000.0 * sfreq,
-                    art_peak_width_ms[1] / 1000.0 * sfreq,
-                )
-            peaks, _ = find_peaks(-art, **fp_kwargs)
+        if pre_epoched is not None:
+            epochs = pre_epoched[file_name]
+            sfreq = float(epochs.info["sfreq"])
+            art_chans = []
+            art_set = set()
+            panel_ch_names = list(epochs.ch_names)
         else:
-            threshold = THRESH * np.std(art)
-            peaks, _ = find_peaks(-art, height=threshold, distance=min_dist_samples)
+            file_path = crops_dir / file_name
+            raw_file = mne.io.read_raw_fif(file_path)
+            _apply_special_crops(raw_file, file_name)
 
-        if sir_align_artifact and len(peaks) >= 3:
-            peaks = _align_events_to_artifact(
-                art, peaks, sfreq,
-                win_ms=sir_align_win_ms, max_shift_ms=sir_align_max_shift_ms,
-                center_on_first_peak=sir_align_first_peak,
-                first_peak_frac=sir_align_first_peak_frac,
-                ref=config_art_ref.get(file_name.split("-")[0]),
+            sfreq = raw_file.info["sfreq"]
+            art_chans = _resolve_art_channels(raw_file, ARTCHAN, fallback_chans=default_art_chans)
+            art_set = set(art_chans)
+            art = _get_art_signal(raw_file, art_chans)
+            min_dist_samples = sfreq * art_min_distance_ms / 1000.0
+            if art_peak_height is not None:
+                fp_kwargs = {"height": art_peak_height, "distance": min_dist_samples}
+                if art_peak_width_ms is not None:
+                    fp_kwargs["width"] = (
+                        art_peak_width_ms[0] / 1000.0 * sfreq,
+                        art_peak_width_ms[1] / 1000.0 * sfreq,
+                    )
+                peaks, _ = find_peaks(-art, **fp_kwargs)
+            else:
+                threshold = THRESH * np.std(art)
+                peaks, _ = find_peaks(-art, height=threshold, distance=min_dist_samples)
+
+            if sir_align_artifact and len(peaks) >= 3:
+                peaks = _align_events_to_artifact(
+                    art, peaks, sfreq,
+                    win_ms=sir_align_win_ms, max_shift_ms=sir_align_max_shift_ms,
+                    center_on_first_peak=sir_align_first_peak,
+                    first_peak_frac=sir_align_first_peak_frac,
+                    ref=config_art_ref.get(file_name.split("-")[0]),
+                )
+
+            if len(peaks) <= MIN_VALID_EPOCHS:
+                continue
+
+            events = np.column_stack(
+                [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
             )
-
-        if len(peaks) <= MIN_VALID_EPOCHS:
-            continue
-
-        events = np.column_stack(
-            [peaks + raw_file.first_samp, np.zeros_like(peaks, dtype=int), np.ones_like(peaks, dtype=int)]
-        )
-        epochs = mne.Epochs(
-            raw_file, events, event_id=1,
-            tmin=epoch_tmin, tmax=epoch_tmax,
-            baseline=None, preload=True,
-        )
+            epochs = mne.Epochs(
+                raw_file, events, event_id=1,
+                tmin=epoch_tmin, tmax=epoch_tmax,
+                baseline=None, preload=True,
+            )
+            panel_ch_names = list(raw_file.info["ch_names"])
 
         epochs.save(epochs_dir / f"{file_name.split('.fif')[0]}-epo.fif", overwrite=True)
 
@@ -3244,6 +3356,37 @@ def run_pipeline(
                 tmpl_cfg[_ch] = np.asarray(_mw, dtype=float)
                 _forced_here.add(_ch)
 
+        # ── Explicit per-file markers (latency + polarity given by the user) ──
+        # Place P1/P2/onset at the given latencies and mark the channel for
+        # per-epoch sampling (see the force-from-template path in the epoch loop),
+        # regardless of whether the trial-mean shows the deflection.
+        _explicit_pol: dict[str, dict] = {}
+        if SIR_FORCE_MARKER_LAT:
+            _c2i2 = {c: i for i, c in enumerate(epochs.ch_names)}
+            for _key, _spec in SIR_FORCE_MARKER_LAT.items():
+                if isinstance(_key, tuple) and len(_key) == 2 and _key[0] == configuration:
+                    _ch = _key[1]
+                elif (isinstance(_key, tuple) and len(_key) == 3
+                      and _key[0] == configuration and _key[1] == stim_amp_raw):
+                    _ch = _key[2]
+                else:
+                    continue
+                if _ch not in _c2i2 or _ch in art_set:
+                    continue
+                _p1 = _spec.get("p1")
+                _p2 = _spec.get("p2")
+                m = dict(markers_cfg.get(_ch, {}))
+                m["onset"] = float(_spec["onset"]) if _spec.get("onset") is not None else np.nan
+                m["p1"] = float(_p1[0]) if _p1 else np.nan
+                m["p2"] = float(_p2[0]) if _p2 else np.nan
+                markers_cfg[_ch] = m
+                tmpl_cfg[_ch] = data_epoched[:, _c2i2[_ch], :].mean(axis=0)
+                _explicit_pol[_ch] = {
+                    "p1": int(_p1[1]) if _p1 else 1,
+                    "p2": int(_p2[1]) if _p2 else 1,
+                }
+                _forced_here.add(_ch)
+
         eligible_channels = [
             ch for ch in epochs.ch_names
             if ch not in art_set
@@ -3277,6 +3420,42 @@ def run_pipeline(
                 t_p1 = markers_cfg[ch_name]["p1"]
                 t_p2 = markers_cfg[ch_name]["p2"]
                 tmpl = tmpl_cfg[ch_name]
+
+                # ── Force markers straight from the config template ──
+                # On some channels (a dip riding the artifact-recovery ramp, a
+                # near-flat P1) the per-epoch peak re-search below does not
+                # converge, so a manually-placed marker vanishes. When the crop
+                # is force-keyed, trust the template latencies the clinician set
+                # on the mean and just sample THIS epoch's value at each — no
+                # re-detection, no gates. Polarity comes from the template.
+                _ex_pol = _explicit_pol.get(ch_name)
+                if _ex_pol is not None or (configuration, stim_amp_raw, ch_name) in SIR_FORCE_KEYS:
+                    # Polarity: explicit if the user gave it, else the sign of the
+                    # template at that latency. Wider sample window for explicit
+                    # markers (single-sweep peaks jitter more than the mean).
+                    _win = 2.0 if _ex_pol is not None else 1.0
+
+                    def _pol_at(_t, _which):
+                        if _ex_pol is not None:
+                            return _ex_pol[_which]
+                        _i = int(np.argmin(np.abs(times - _t)))
+                        return +1 if (tmpl[_i] - np.mean(tmpl[baseline_mask])) >= 0 else -1
+                    _on = float(t_on_tmpl) if np.isfinite(t_on_tmpl) else np.nan
+                    _p1l, _p1v = (np.nan, np.nan)
+                    if np.isfinite(t_p1):
+                        _p1l, _p1v = pick_epoch_value_near_latency(
+                            sig, times, float(t_p1), sfreq, win_ms=_win, polarity=_pol_at(t_p1, "p1"))
+                    _p2l, _p2v = (np.nan, np.nan)
+                    if np.isfinite(t_p2):
+                        _p2l, _p2v = pick_epoch_value_near_latency(
+                            sig, times, float(t_p2), sfreq, win_ms=_win, polarity=_pol_at(t_p2, "p2"))
+                    _ptp = (float(np.abs(_p1v - _p2v))
+                            if (np.isfinite(_p1v) and np.isfinite(_p2v)) else np.nan)
+                    channel_epoch_results[ch_name].append(
+                        {"ep": ep, "onset": _on, "p1": _p1l, "p2": _p2l,
+                         "pv1": _p1v, "pv2": _p2v, "ptp": _ptp, "sig": sig}
+                    )
+                    continue
 
                 # Onset near template onset
                 onset_latency = detect_onset_near_template(
@@ -3472,7 +3651,8 @@ def run_pipeline(
             # Manual per-file suppression for known false positives on specific crops.
             manually_suppressed = (configuration, stim_amp_raw, ch) in SIR_SUPPRESS_KEYS
             # Whitelist: named crops bypass the consistency gates (weak but genuine responses).
-            force_kept = (configuration, stim_amp_raw, ch) in SIR_FORCE_KEYS
+            # Explicit-marker channels are always kept — the user placed them by hand.
+            force_kept = (configuration, stim_amp_raw, ch) in SIR_FORCE_KEYS or ch in _explicit_pol
             if manually_suppressed or (not force_kept and (
                 artifact_like_channel
                 or low_median_corr
@@ -3506,14 +3686,14 @@ def run_pipeline(
         base_name = file_name.split(".fif")[0]
         plot_epochs_panel(
             data_epoched=data_epoched, times=times,
-            ch_names=raw_file.info["ch_names"], epochs_ch_names=epochs.ch_names,
+            ch_names=panel_ch_names, epochs_ch_names=epochs.ch_names,
             art_chans=art_set, latency_markers=latency_markers,
             title=base_name, out_path=plots_grid_dir / f"{base_name}.png",
             show_grid=True, show_markers=True,
         )
         plot_epochs_panel(
             data_epoched=data_epoched, times=times,
-            ch_names=raw_file.info["ch_names"], epochs_ch_names=epochs.ch_names,
+            ch_names=panel_ch_names, epochs_ch_names=epochs.ch_names,
             art_chans=art_set, latency_markers=latency_markers,
             title=base_name, out_path=plots_plain_dir / f"{base_name}.png",
             show_grid=False, show_markers=False,
@@ -3593,6 +3773,16 @@ def run_pipeline(
             dfc.to_excel(writer, sheet_name=sheet_name, index=False)
 
     plot_boxplots(df, boxplot_dir)
+
+    # Text ``curves`` exports are recruitment sweeps (one curve per stimulus,
+    # response grows across curves). Emit per-curve recruitment tables/plots and
+    # the top-N / amplitude-group box-plots from the per-epoch metrics.
+    if pre_epoched is not None:
+        try:
+            run_recruitment_analysis(output_root)
+        except Exception as exc:   # never let the extra step fail the whole run
+            print(f"[RECRUITMENT] skipped ({type(exc).__name__}: {exc})", flush=True)
+
     if old_mne_log_level is not None:
         mne.set_log_level(old_mne_log_level)
 
