@@ -27,11 +27,14 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from matplotlib.widgets import SpanSelector
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QHeaderView, QLabel, QListWidget, QSplitter,
-    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QHeaderView, QLabel, QListWidget, QPushButton,
+    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
+
+from src.condition import load_overrides, save_overrides
 
 from ..results import COND_DIR, mode_dir
 
@@ -64,7 +67,9 @@ def _fmt(lab: float) -> str:
 
 
 class ConditionViewer(QWidget):
-    """Amplitude vs ISI + the sweeps behind it, for one Condition run."""
+    """Amplitude vs ISI + the curves behind it, for one Condition run."""
+
+    rerun_requested = Signal()
 
     def __init__(self, session=None) -> None:
         super().__init__()
@@ -81,6 +86,10 @@ class ConditionViewer(QWidget):
         self._markers: dict[str, np.ndarray] = {}
         self._present: dict[str, np.ndarray] = {}
         self._means_time: dict[str, np.ndarray] = {}
+        self.root: Path | None = None
+        self.overrides: dict = {}
+        self._span: tuple[float, float] | None = None
+        self._selector = None
         self.times_full: np.ndarray | None = None
         self.cond_artifact: np.ndarray | None = None
 
@@ -114,6 +123,25 @@ class ConditionViewer(QWidget):
         self.wf_aligned.setChecked(True)
         self.wf_aligned.toggled.connect(lambda _: self._draw())
 
+        # ---- manual correction, mirroring the SIR crop review ----
+        self.btn_window = QPushButton("Задать окно ответа")
+        self.btn_window.setEnabled(False)
+        self.btn_window.setToolTip(
+            "Протяните мышью по нижнему графику над нужным ответом, затем нажмите.\n"
+            "Шаблон будет взят из этого окна, а не из банка."
+        )
+        self.btn_window.clicked.connect(self._set_window)
+        self.btn_reject = QPushButton("Ответа нет")
+        self.btn_reject.setToolTip("Пометить канал как не отвечающий и обнулить его амплитуды.")
+        self.btn_reject.clicked.connect(self._toggle_reject)
+        self.btn_clear = QPushButton("Снять правку")
+        self.btn_clear.clicked.connect(self._clear_override)
+        self.btn_rerun = QPushButton("Пересчитать с правками")
+        self.btn_rerun.clicked.connect(self.rerun_requested)
+        self.ov_label = QLabel("правок нет")
+        self.ov_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.ov_label.setWordWrap(True)
+
         self.stats = QTableWidget(0, 4)
         self.stats.setHorizontalHeaderLabels(["ISI", "N", "ампл. мкВ", "persist."])
         self.stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -132,6 +160,10 @@ class ConditionViewer(QWidget):
         lv.addWidget(self.show_markers)
         lv.addWidget(self.mark_absent)
         lv.addWidget(self.wf_aligned)
+        lv.addWidget(QLabel("<b>Ручная правка канала</b>"))
+        for b in (self.btn_window, self.btn_reject, self.btn_clear, self.btn_rerun):
+            lv.addWidget(b)
+        lv.addWidget(self.ov_label)
         lv.addWidget(QLabel("<b>По условиям</b>"))
         lv.addWidget(self.stats, 1)
 
@@ -173,6 +205,9 @@ class ConditionViewer(QWidget):
 
     # ------------------------------------------------------------------ #
     def load(self, root: Path) -> None:
+        self.root = Path(root)
+        self.overrides = load_overrides(self.root)
+        self._span = None
         self.base = mode_dir(Path(root), COND_DIR)
         arr = self.base / "arrays"
         excel = self.base / "Excel"
@@ -320,7 +355,14 @@ class ConditionViewer(QWidget):
             ax_pers.spines[s].set_visible(False)
 
         self._draw_curves(ax_cur, ch)
+        # Drag over the response to define a template window, exactly as the SIR
+        # crop review does it.
+        self._selector = SpanSelector(
+            ax_cur, self._on_span, "horizontal", useblit=False,
+            props=dict(alpha=0.25, facecolor="#ffb703"),
+        )
         self.canvas.draw_idle()
+        self._refresh_override_label()
         self._draw_waterfall(ch)
         self._fill_stats(d, tags, amp, pers)
 
@@ -372,7 +414,15 @@ class ConditionViewer(QWidget):
             ax.set_ylim(lo - pad, hi + pad)
         ax.set_xlabel("мс относительно артефакта")
         ax.set_ylabel("мкВ")
+        cur = self.overrides.get(ch, {})
+        if cur.get("window_ms"):
+            a, b = cur["window_ms"]
+            ax.axvspan(a, b, color="#ffb703", alpha=0.18, lw=0, zorder=0)
+        elif self._span is not None:
+            ax.axvspan(self._span[0], self._span[1], color="#ffb703", alpha=0.12, lw=0, zorder=0)
         extra = f" · {_plural_curves(n_abs)} без ответа" if n_abs else ""
+        if cur.get("reject"):
+            extra += " · ПОМЕЧЕН КАК БЕЗ ОТВЕТА"
         ax.set_title(f"{ch} — {_fmt(self.selected)}: кривые и среднее, control пунктиром{extra}",
                      fontsize=10, loc="left")
         ax.grid(True, color="0.92", lw=0.6)
@@ -428,6 +478,63 @@ class ConditionViewer(QWidget):
         for s in ("top", "right", "left"):
             ax.spines[s].set_visible(False)
         self.wf_canvas.draw_idle()
+
+    # ---- manual correction ------------------------------------------- #
+    def _on_span(self, lo: float, hi: float) -> None:
+        if hi - lo < 0.5:                      # a click, not a drag
+            return
+        self._span = (float(lo), float(hi))
+        self.btn_window.setEnabled(True)
+        self.btn_window.setText(f"Задать окно {lo:.0f}–{hi:.0f} мс")
+        self._draw()
+
+    def _set_window(self) -> None:
+        if not self.channel or self._span is None or self.root is None:
+            return
+        self.overrides.setdefault(self.channel, {}).pop("reject", None)
+        self.overrides[self.channel]["window_ms"] = [round(self._span[0], 2),
+                                                     round(self._span[1], 2)]
+        self._save_overrides()
+
+    def _toggle_reject(self) -> None:
+        if not self.channel or self.root is None:
+            return
+        cur = self.overrides.get(self.channel, {})
+        if cur.get("reject"):
+            self.overrides.pop(self.channel, None)
+        else:
+            self.overrides[self.channel] = {"reject": True}
+        self._save_overrides()
+
+    def _clear_override(self) -> None:
+        if not self.channel or self.root is None:
+            return
+        self.overrides.pop(self.channel, None)
+        self._span = None
+        self.btn_window.setEnabled(False)
+        self.btn_window.setText("Задать окно ответа")
+        self._save_overrides()
+
+    def _save_overrides(self) -> None:
+        save_overrides(self.root, self.overrides)
+        self._refresh_override_label()
+        self._draw()
+
+    def _refresh_override_label(self) -> None:
+        cur = self.overrides.get(self.channel or "", {})
+        if cur.get("reject"):
+            txt = f"<b>{self.channel}</b>: помечен как без ответа"
+        elif cur.get("window_ms"):
+            a, b = cur["window_ms"]
+            txt = f"<b>{self.channel}</b>: окно {a:.0f}–{b:.0f} мс (шаблон из окна)"
+        else:
+            txt = "правок нет"
+        others = [c for c in self.overrides if c != self.channel]
+        if others:
+            txt += f" · ещё правок: {', '.join(sorted(others))}"
+        txt += "<br>Правки применяются при пересчёте."
+        self.ov_label.setText(txt)
+        self.btn_reject.setText("Вернуть ответ" if cur.get("reject") else "Ответа нет")
 
     def _fill_stats(self, d, tags, amp, pers) -> None:
         n = d["N"].to_numpy()

@@ -31,6 +31,7 @@ identically whether launched from ``run_pipeline`` (script), the CLI, or the GUI
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .io_utils import CONDITION_FOLDER, resolve_mode_dirs
@@ -95,6 +96,64 @@ CONDITION_MIN_SHARP_FRAC = 0.35
 # templates to be COMPRESSED (<1) but not stretched (>1) — a stretched wide
 # template would match a narrow response spuriously and misplace the markers.
 CONDITION_TM_SCALES = (0.3, 0.5, 0.7, 0.85, 1.0)
+
+
+#: Manual corrections live next to the results, so a re-run from the CLI honours
+#: what was marked in the GUI and vice versa. One entry per channel:
+#:   {"ch5": {"reject": true},
+#:    "ch6": {"window_ms": [12.0, 24.0]}}
+OVERRIDES_NAME = "condition_overrides.json"
+
+
+def overrides_path(output_root: Path) -> Path:
+    return Path(output_root) / "review" / OVERRIDES_NAME
+
+
+def load_overrides(output_root: Path) -> dict:
+    p = overrides_path(output_root)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_overrides(output_root: Path, data: dict) -> Path:
+    p = overrides_path(output_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def _manual_match(per_cond_mean, labels, tw_s, window_ms) -> dict | None:
+    """Template taken from a window the clinician drew, instead of the bank.
+
+    The reference stays the strongest condition — that is where the response is
+    cleanest — but its shape inside the given window becomes the template, and
+    P1/P2 are placed within that window. The bank is not consulted at all, so a
+    response the bank has no shape for can still be measured.
+    """
+    lo, hi = (float(window_ms[0]) / 1e3, float(window_ms[1]) / 1e3)
+    if hi <= lo:
+        return None
+    win = (tw_s >= lo) & (tw_s <= hi)
+    if win.sum() < 5:
+        return None
+    best_lab, best_ptp = None, -np.inf
+    for lab in labels:
+        seg = per_cond_mean[lab][win]
+        if not np.any(np.isfinite(seg)):
+            continue
+        p = float(np.nanmax(seg) - np.nanmin(seg))
+        if p > best_ptp:
+            best_ptp, best_lab = p, lab
+    if best_lab is None:
+        return None
+    ref = np.nan_to_num(per_cond_mean[best_lab], nan=0.0)
+    match = {"template": ref, "name": "окно вручную", "corr": np.nan,
+             "onset": np.nan, "p1": np.nan, "p2": np.nan}
+    return _refine_markers_on_mean(ref, tw_s, match, window=(lo, hi))
 
 
 def _channel_loudness(data: np.ndarray) -> np.ndarray:
@@ -253,7 +312,7 @@ def _match_channel_template(per_cond_mean, labels, tw_s, sfreq, bank):
     return _refine_markers_on_mean(ref, tw_s, match)
 
 
-def _refine_markers_on_mean(ref_mean, tw_s, match):
+def _refine_markers_on_mean(ref_mean, tw_s, match, window=None):
     """Data-driven P1/P2/onset on the reference mean.
 
     The bank match only confirms that a stereotyped response is present; its own
@@ -263,7 +322,10 @@ def _refine_markers_on_mean(ref_mean, tw_s, match):
     CONDITION_P2_MIN_FRAC of |P1| (else monophasic → P2 = NaN) — onset = foot of P1.
     """
     base_mask = (tw_s >= CONDITION_BASE_LO) & (tw_s <= CONDITION_BASE_HI)
-    resp_mask = (tw_s >= CONDITION_DET_TMIN) & (tw_s <= CONDITION_DET_TMAX)
+    if window is None:
+        resp_mask = (tw_s >= CONDITION_DET_TMIN) & (tw_s <= CONDITION_DET_TMAX)
+    else:
+        resp_mask = (tw_s >= window[0]) & (tw_s <= window[1])
     base = np.nanmean(ref_mean[base_mask])
     base = 0.0 if not np.isfinite(base) else float(base)
     w = ref_mean - base
@@ -607,8 +669,16 @@ def run_condition_analysis(
     output_root: Path,
     info: dict | None = None,
 ) -> Path:
-    """Full Condition-test analysis. ``data`` is (n_curves, n_ch, n_samp) volts."""
+    """Full Condition-test analysis. ``data`` is (n_curves, n_ch, n_samp) volts.
+
+    Manual corrections, if any were saved for this output root, are applied per
+    channel: a rejected channel is reported as having no response, and a channel
+    with a drawn window gets its template from that window instead of the bank.
+    """
     output_root = Path(output_root)
+    overrides = load_overrides(output_root)
+    if overrides:
+        print(f"[CONDITION] manual corrections for: {', '.join(sorted(overrides))}", flush=True)
     # A condition run is the only thing in this output root, so it writes
     # straight into results/ — the "Condition test" level only comes back when
     # the root already holds another analysis.
@@ -671,8 +741,16 @@ def run_condition_analysis(
             segs_by_lab[lab] = (idx, segs)
             per_cond_mean[lab] = np.nanmean(segs, axis=0)
 
-        # ── find the real response via the pre-computed template bank ──
-        match = _match_channel_template(per_cond_mean, labels, tw_s, sfreq, bank) if bank else None
+        # ── find the response: manual correction first, then the bank ──
+        ov = overrides.get(ch_name, {}) if isinstance(overrides, dict) else {}
+        source = "банк"
+        if ov.get("reject"):
+            match, source = None, "отклонён вручную"
+        elif ov.get("window_ms"):
+            match = _manual_match(per_cond_mean, labels, tw_s, ov["window_ms"])
+            source = "окно вручную" if match else "окно вручную (не удалось)"
+        else:
+            match = _match_channel_template(per_cond_mean, labels, tw_s, sfreq, bank) if bank else None
         resp_mask = (tw_s >= CONDITION_DET_TMIN) & (tw_s <= CONDITION_DET_TMAX)
         tmpl_name = match["name"] if match else None
         tmpl_corr = round(float(match["corr"]), 3) if match else np.nan
@@ -713,6 +791,7 @@ def run_condition_analysis(
                 "Amplitude SE uV": round(se, 4),
                 "Template": tmpl_name,
                 "Template corr": tmpl_corr,
+                "Источник шаблона": source,
                 "Onset ms": on_ms, "P1 ms": p1_ms, "P2 ms": p2_ms,
             })
 

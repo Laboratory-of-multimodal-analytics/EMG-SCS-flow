@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
         self.spontaneous_viewer = SpontaneousViewer(self.session)
         self.spontaneous_viewer.rerun_requested.connect(self.run)
         self.condition_viewer = ConditionViewer(self.session)
+        self.condition_viewer.rerun_requested.connect(self.run)
 
         self.raw_browser = RawBrowser()
 
