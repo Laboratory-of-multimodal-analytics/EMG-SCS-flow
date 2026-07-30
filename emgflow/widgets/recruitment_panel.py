@@ -133,7 +133,7 @@ class RecruitmentPanel(QWidget):
         if xmax:
             ax.set_xlim(0.5, xmax + 0.5)
 
-        ax.set_ylabel("response (µV)")
+        ax.set_ylabel("PTP / |P1|, µV")
         ax.set_xlabel("curve number")
         ax.set_title(f"{self.config}", fontsize=10)
         ax.grid(True, color="0.92", lw=0.6)

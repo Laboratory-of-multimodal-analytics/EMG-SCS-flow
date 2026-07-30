@@ -321,7 +321,7 @@ class ScenarioViewer(QWidget):
             "curve number"
             + (f"   ({n_missing} of {len(curves)} without a detection)" if n_missing else "")
         )
-        ax_top.set_ylabel("response (µV)")
+        ax_top.set_ylabel("PTP / |P1|, µV")
         ax_top.set_title(f"{ch} — response vs curve", fontsize=10, loc="left")
         ax_top.grid(True, color="0.92", lw=0.6)
         for side in ("top", "right"):

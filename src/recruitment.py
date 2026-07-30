@@ -239,32 +239,34 @@ def _grid(n, ncol=2):
 def _plot_recruitment_curves(tidy, responders, out_path):
     """Response size against curve number — the recruitment curve itself.
 
-    The headline series is "Amplitude" (PTP when the response is biphasic, |P1|
-    when it is monophasic): it is always positive, so growth reads upward even
-    on channels whose P1 is a trough. P1/P2/PTP are overlaid only when they
-    actually carry values — on these files P2 and PTP are routinely all-NaN, and
-    plotting empty series just clutters the legend.
+    ONE series: peak-to-peak, falling back to |P1| where the response is
+    monophasic and there is no second peak to measure against. Both are positive,
+    so growth reads upward even on channels whose P1 is a trough.
+
+    P1 and P2 used to be drawn alongside it. They duplicated the same curve (PTP
+    is their difference) while dragging the axis into negative values, which
+    squashed the recruitment into the top half of the panel. The per-curve tables
+    still carry all three if a component is needed on its own.
     """
     fig, axes, nrow, ncol = _grid(len(responders))
-    extras = [("PTP uV", "k", "PTP"), ("P1 uV", "tab:red", "P1"), ("P2 uV", "tab:green", "P2")]
     for i, ch in enumerate(responders):
         ax = axes[i // ncol][i % ncol]
         d = tidy[tidy["Channel"] == ch].sort_values("Curve")
-        ax.plot(d["Curve"], d["Amplitude uV"], marker="o", ms=3, lw=1.2,
-                color="tab:blue", label="Амплитуда")
-        for col, color, lab in extras:
-            if d[col].notna().any():
-                ax.plot(d["Curve"], d[col], marker=".", ms=3, lw=0.8,
-                        color=color, alpha=0.7, label=lab)
+        n_ptp = int(d["PTP uV"].notna().sum())
+        n_p1 = int(d["Amplitude uV"].notna().sum()) - n_ptp
+        ax.plot(d["Curve"], d["Amplitude uV"], marker="o", ms=3.5, lw=1.3,
+                color="tab:blue")
         ax.axhline(0, color="0.7", lw=0.6)
-        ax.set_title(ch, fontsize=10, loc="left")
+        note = f"PTP: {n_ptp}" + (f", |P1|: {n_p1}" if n_p1 else "")
+        ax.set_title(f"{ch}   ({note})", fontsize=10, loc="left")
         ax.set_ylabel("µV"); ax.grid(alpha=0.3)
-        ax.legend(fontsize=7)
+        ax.set_ylim(bottom=0)
     for j in range(len(responders), nrow * ncol):
         axes[j // ncol][j % ncol].axis("off")
     for ax in axes[-1]:
         ax.set_xlabel("номер кривой")
-    fig.suptitle("Кривые рекрутирования (амплитуда vs номер кривой)", fontsize=12)
+    fig.suptitle("Кривые рекрутирования — размах ответа (PTP, либо |P1| без второго пика)",
+                 fontsize=12)
     fig.tight_layout(); fig.savefig(out_path, dpi=160); plt.close(fig)
 
 
