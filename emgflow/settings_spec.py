@@ -44,6 +44,12 @@ SHARED: list[Lever] = [
           "Empty = skip the low edge. Empty on BOTH edges = notch-only."),
     Lever("raw_bandpass_h_freq", "Band-pass high (Hz)", "opt_float", 300.0, "Filtering", "both", "kwarg",
           "Empty = skip the high edge."),
+    Lever("DRIFT_MEDIAN_WIN_MS", "Curve exports: drift window (ms)", "opt_float", 25.0,
+          "Filtering", "sir", "global",
+          "Slow drift is removed from pre-cut curve epochs by subtracting a running median "
+          "over this window. A high-pass filter is not available at 100 ms / 20 kHz. Shorter "
+          "removes slower trends but starts eating broad responses — at 10 ms the Zh14 ch4 "
+          "response drops from 260 to 109 uV. Empty switches it off."),
     Lever("MAT_DIVIDE_BY_1000", "MAT: divide by 1000", "bool", True, "Filtering", "both", "global",
           "LabChart unit rescaling on .mat load."),
 
