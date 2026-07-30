@@ -686,6 +686,11 @@ def run_condition_analysis(
     overrides = load_overrides(output_root)
     if overrides:
         print(f"[CONDITION] manual corrections for: {', '.join(sorted(overrides))}", flush=True)
+    # review/ holds the clinician's corrections and is the one thing in the output
+    # root that cannot be recomputed. Deleting the folder to force a clean run
+    # takes them with it, so say when there are none but a marker file exists.
+    elif (Path(output_root) / "review").exists():
+        print("[CONDITION] no manual corrections found (review/ exists but is empty)", flush=True)
     # A condition run is the only thing in this output root, so it writes
     # straight into results/ — the "Condition test" level only comes back when
     # the root already holds another analysis.
