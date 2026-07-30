@@ -871,7 +871,7 @@ def run_condition_analysis(
 # --------------------------------------------------------------------------- #
 # Local recompute
 # --------------------------------------------------------------------------- #
-def recompute_channel(output_root: Path, channel: str) -> dict:
+def recompute_channel(output_root: Path, channel: str, rebuild_shared: bool = True) -> dict:
     """Redo ONE channel from the arrays the run already saved.
 
     A manual correction changes one channel, and re-running the pipeline to see
@@ -977,7 +977,20 @@ def recompute_channel(output_root: Path, channel: str) -> dict:
                     CONDITION_RESP_LO * 1e3, CONDITION_RESP_HI * 1e3,
                     markers_ms=(on_ms, p1_ms, p2_ms))
 
-    # All-channel figures, rebuilt from the tables so every channel stays in step.
+    if rebuild_shared:
+        _rebuild_shared_figures(base, labels)
+    return {"channel": channel, "source": source, "onset_ms": on_ms, "p1_ms": p1_ms,
+            "p2_ms": p2_ms, "n_present": int(sum(present_map.values())), "n_curves": len(aligned)}
+
+
+def _rebuild_shared_figures(base: Path, labels: list[float]) -> None:
+    """The three all-channel figures, redrawn from the tables on disk.
+
+    They span every channel, so after a batch of corrections they are rebuilt
+    once rather than once per channel.
+    """
+    excel = base / "Excel"
+    summary = pd.read_csv(excel / "condition_summary.csv")
     per_all = pd.read_csv(excel / "condition_amplitudes_per_curve.csv")
     chans = sorted(summary["Channel"].astype(str).unique(), key=lambda s: (len(s), s))
     key = lambda v: 0.0 if str(v) == "control" else float(v)
@@ -995,5 +1008,25 @@ def recompute_channel(output_root: Path, channel: str) -> dict:
     _plot_boxplots_grid(labels, box_by, amp_dir / "amplitude_boxplots_all_channels.png")
     _plot_persistence_grid(labels, pers_by, amp_dir / "persistence_vs_condition_all_channels.png")
 
-    return {"channel": channel, "source": source, "onset_ms": on_ms, "p1_ms": p1_ms,
-            "p2_ms": p2_ms, "n_present": int(sum(present_map.values())), "n_curves": len(aligned)}
+
+def recompute_corrections(output_root: Path) -> list[dict]:
+    """Apply every saved correction at once.
+
+    Corrections are made channel by channel but read together — a run is judged
+    as a whole — so this redoes each corrected channel and rebuilds the
+    all-channel figures once at the end.
+    """
+    output_root = Path(output_root)
+    ov = load_overrides(output_root)
+    if not ov:
+        return []
+    base, _ = resolve_mode_dirs(output_root, CONDITION_FOLDER)
+    labels = [float(v) for v in np.load(base / "arrays" / "condition_labels.npy")]
+    out = []
+    for ch in sorted(ov):
+        try:
+            out.append(recompute_channel(output_root, ch, rebuild_shared=False))
+        except Exception as exc:
+            out.append({"channel": ch, "error": f"{type(exc).__name__}: {exc}"})
+    _rebuild_shared_figures(base, labels)
+    return out

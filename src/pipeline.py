@@ -10,6 +10,7 @@ import mne
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy.signal import find_peaks
 from scipy.io import loadmat
 from tqdm import tqdm
@@ -105,6 +106,7 @@ from .constants import (
     STARTSTOP_SIM_TMIN,
     STARTSTOP_SIM_TMAX,
     THRESH,
+    DUMP_EPOCHS_AS_TEXT,
     SWEEP_STRONG_FRAC,
     SWEEP_STRONG_MIN,
     DRIFT_MEDIAN_WIN_MS,
@@ -261,6 +263,7 @@ def _match_sir_template(
     sig_resp_c = sig_resp - float(np.mean(sig_resp))
     if float(np.std(sig_resp_c)) == 0 or len(sig_resp) < 5:
         return None
+    sig_resp_norm = float(np.sqrt(np.dot(sig_resp_c, sig_resp_c)))
 
     best_corr = -np.inf
     best: dict[str, object] | None = None
@@ -286,52 +289,62 @@ def _match_sir_template(
             n_shifts = max(3, int((anchor_tmax - anchor_tmin) * sfreq) + 1)
             anchor_candidates = np.linspace(anchor_tmin, anchor_tmax, n_shifts)
 
+            # P2-after-P1 depends only on the scaled markers, not on the shift,
+            # so it is decided once per (template, scale) rather than per anchor.
+            if np.isfinite(p2_scaled) and p2_scaled <= p1_scaled:
+                continue
+
             for flip in (1, -1):
-                for anchor_t in anchor_candidates:
-                    # Template times in epoch coordinates.
-                    shifted_tpl_times = tpl_times * scale + anchor_t
+                # Every shift at once. Shifting the anchor is the same as
+                # evaluating the template at shifted times, so all candidate
+                # placements are one interpolation and one matrix product
+                # instead of a Python loop with 3.8 M np.corrcoef calls — that
+                # loop was 169 s of a 188 s run on a 100-curve file.
+                # Both grids step by 1/sfreq, so every point the template is
+                # ever evaluated at lies on ONE uniform grid: shifting the
+                # anchor just slides the window along it. Interpolate that grid
+                # once and take sliding views instead of interpolating a
+                # (shifts x samples) matrix.
+                base = resp_times[0] - anchor_candidates[-1]
+                n_grid = len(resp_times) + len(anchor_candidates) - 1
+                grid = base + np.arange(n_grid) / sfreq
+                g = np.interp(grid, tpl_times * scale, float(flip) * wave_raw,
+                              left=0.0, right=0.0)
+                # Window for anchor i starts at (A-1-i): later anchors sit earlier.
+                tpl_at = sliding_window_view(g, len(resp_times))[::-1]
+                tpl_c = tpl_at - tpl_at.mean(axis=1, keepdims=True)
+                den = np.sqrt(np.einsum("ij,ij->i", tpl_c, tpl_c)) * sig_resp_norm
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    corrs = (tpl_c @ sig_resp_c) / den
+                corrs[~np.isfinite(corrs)] = -np.inf      # flat template at this shift
+                k = int(np.argmax(corrs))                 # first maximum, as the loop had
+                corr = float(corrs[k])
+                if corr <= best_corr:
+                    continue
+                anchor_t = float(anchor_candidates[k])
+                shifted_tpl_times = tpl_times * scale + anchor_t
 
-                    # Interpolate template at response-window time points.
-                    tpl_at_resp = np.interp(
-                        resp_times, shifted_tpl_times, float(flip) * wave_raw,
-                        left=0.0, right=0.0,
-                    )
-                    tpl_at_resp_c = tpl_at_resp - float(np.mean(tpl_at_resp))
-                    if float(np.std(tpl_at_resp_c)) == 0:
-                        continue
+                p1_abs = anchor_t + p1_scaled
+                p2_abs = anchor_t + p2_scaled if np.isfinite(p2_scaled) else np.nan
+                onset_abs = anchor_t + onset_scaled if np.isfinite(onset_scaled) else np.nan
+                if np.isfinite(onset_abs) and onset_abs < resp_tmin:
+                    onset_abs = np.nan
 
-                    corr = float(np.corrcoef(sig_resp_c, tpl_at_resp_c)[0, 1])
-                    if np.isnan(corr) or corr <= best_corr:
-                        continue
+                best_corr = corr
+                synth_on_epoch = np.interp(
+                    times, shifted_tpl_times, float(flip) * wave_raw, left=0.0, right=0.0,
+                )
 
-                    p1_abs = anchor_t + p1_scaled
-                    p2_abs = anchor_t + p2_scaled if np.isfinite(p2_scaled) else np.nan
-                    onset_abs = anchor_t + onset_scaled if np.isfinite(onset_scaled) else np.nan
-
-                    # Sanity: onset must be within the response window, P2 must follow P1.
-                    if np.isfinite(onset_abs) and onset_abs < resp_tmin:
-                        onset_abs = np.nan
-                    if np.isfinite(p2_abs) and p2_abs <= p1_abs:
-                        continue
-
-                    best_corr = corr
-
-                    # Synthesize the full template on the epoch time axis.
-                    synth_on_epoch = np.interp(
-                        times, shifted_tpl_times, float(flip) * wave_raw,
-                        left=0.0, right=0.0,
-                    )
-
-                    best = {
-                        "name": tpl["name"],
-                        "scale": scale,
-                        "flip": flip,
-                        "corr": best_corr,
-                        "template": synth_on_epoch,
-                        "onset": onset_abs,
-                        "p1": p1_abs,
-                        "p2": p2_abs,
-                    }
+                best = {
+                    "name": tpl["name"],
+                    "scale": scale,
+                    "flip": flip,
+                    "corr": best_corr,
+                    "template": synth_on_epoch,
+                    "onset": onset_abs,
+                    "p1": p1_abs,
+                    "p2": p2_abs,
+                }
 
     if best is None or best["corr"] < min_corr:
         return None
@@ -2920,8 +2933,12 @@ def run_pipeline(
     if CAR_REREF and default_art_chans:
         _apply_car_reref(raw, default_art_chans)
 
-    preproc_path = ensure_dir(paths["data_dir"]) / f"{edf_path.stem}_preprocessed_raw.fif"
-    raw.save(preproc_path, overwrite=True)
+    # For a pre-cut curve export nothing is filtered or re-referenced, so the
+    # "preprocessed" copy would be byte-identical to the original. The reader
+    # already falls back to the original when it is missing.
+    if pre_epoched is None:
+        preproc_path = ensure_dir(paths["data_dir"]) / f"{edf_path.stem}_preprocessed_raw.fif"
+        raw.save(preproc_path, overwrite=True)
 
     if use_startstop:
         _run_startstop_analysis(raw, startstop_dir, default_art_chans, default_condition=edf_path.stem)
@@ -3371,7 +3388,9 @@ def run_pipeline(
             epochs_array.reshape(epochs_array.shape[0], -1),
             columns=[f"{ch}_{t}" for ch in channel_names for t in times_to_save],
         )
-        ep_df.to_csv(epochs_dir / f"{file_name.split('.fif')[0]}-epo.txt", index=False, sep="\t")
+        if DUMP_EPOCHS_AS_TEXT:
+            ep_df.to_csv(epochs_dir / f"{file_name.split('.fif')[0]}-epo.txt",
+                         index=False, sep="\t")
 
         data_epoched = epochs.get_data()
         times = epochs.times

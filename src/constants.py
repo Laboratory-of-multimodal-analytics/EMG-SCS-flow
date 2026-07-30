@@ -223,6 +223,11 @@ RESP_TMAX = 0.02
 # slice of it, not on all curves: the weak half carries no response, and
 # including it both dilutes the template and makes the epochs look inconsistent
 # with each other, which is what a sweep is supposed to be.
+# The epochs are already saved as a .fif; the tab-separated copy beside it is
+# five times larger (31 MB on a 100-curve file) and nothing in the toolbox reads
+# it. Off unless it is needed for an external tool.
+DUMP_EPOCHS_AS_TEXT = False
+
 SWEEP_STRONG_FRAC = 0.3      # share of curves treated as "the strong end"
 SWEEP_STRONG_MIN = 8         # but never fewer than this many
 

@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from src.condition import load_overrides, recompute_channel, save_overrides
+from src.condition import load_overrides, recompute_corrections, save_overrides
 
 from ..results import COND_DIR, mode_dir
 from ..templates import build_template
@@ -142,10 +142,11 @@ class ConditionViewer(QWidget):
         # Local: the correction touches one channel, and everything needed to
         # redo it is already saved, so re-parsing the raw export would be minutes
         # of work to answer a question about one trace.
-        self.btn_rerun = QPushButton("Пересчитать канал")
+        self.btn_rerun = QPushButton("Пересчитать по правкам")
         self.btn_rerun.setToolTip(
-            "Пересчитывает только текущий канал из сохранённых кривых.\n"
-            "Исходный файл не перечитывается."
+            "Внесите все правки, затем нажмите один раз.\n"
+            "Пересчитываются все поправленные каналы из сохранённых кривых;\n"
+            "исходный файл не перечитывается."
         )
         self.btn_rerun.clicked.connect(self._recompute)
         self.ov_label = QLabel("правок нет")
@@ -557,22 +558,26 @@ class ConditionViewer(QWidget):
         self._save_overrides()
 
     def _recompute(self) -> None:
-        if not self.channel or self.root is None:
+        """Apply every correction at once — corrections are made one at a time
+        but the run is judged as a whole."""
+        if self.root is None:
             return
         ch = self.channel
         try:
-            info = recompute_channel(self.root, ch)
+            done = recompute_corrections(self.root)
         except Exception as exc:
             self.ov_label.setText(f"<span style='color:#b00'>Не удалось пересчитать: {exc}</span>")
+            return
+        if not done:
+            self.ov_label.setText("Правок нет — пересчитывать нечего.")
             return
         self.load(self.root)                     # re-read the updated tables and arrays
         rows = [self.channel_list.item(i).text() for i in range(self.channel_list.count())]
         if ch in rows:
             self.channel_list.setCurrentRow(rows.index(ch))
-        self.ov_label.setText(
-            f"<b>{ch}</b> пересчитан · источник: {info['source']} · "
-            f"P1 {info['p1_ms']} мс · с ответом {info['n_present']} из {info['n_curves']}"
-        )
+        parts = [(f"{d['channel']}: {d['error']}" if "error" in d
+                  else f"{d['channel']} — {d['source']}") for d in done]
+        self.ov_label.setText("Пересчитано: " + "; ".join(parts))
 
     def _save_overrides(self) -> None:
         save_overrides(self.root, self.overrides)
