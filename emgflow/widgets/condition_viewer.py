@@ -37,6 +37,22 @@ from ..results import COND_DIR, mode_dir
 
 CONTROL = "control"
 
+#: Red is reserved for the SELECTED interval — it is the thing in focus. A sweep
+#: the presence gate rejected gets its own hue instead, or the two read as the
+#: same annotation at a glance.
+SELECTED_COLOR = "#d73027"
+ABSENT_COLOR = "#7b3294"
+
+
+def _plural_sweeps(n: int) -> str:
+    """1 свип / 2 свипа / 5 свипов — the label sits in a title, so it has to read."""
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return f"{n} свип"
+    if n10 in (2, 3, 4) and n100 not in (12, 13, 14):
+        return f"{n} свипа"
+    return f"{n} свипов"
+
 
 def _fmt(lab: float) -> str:
     return CONTROL if float(lab) == 0.0 else f"{float(lab):.0f} мс"
@@ -59,6 +75,9 @@ class ConditionViewer(QWidget):
         self._means: dict[str, np.ndarray] = {}
         self._markers: dict[str, np.ndarray] = {}
         self._present: dict[str, np.ndarray] = {}
+        self._means_time: dict[str, np.ndarray] = {}
+        self.times_full: np.ndarray | None = None
+        self.cond_artifact: np.ndarray | None = None
 
         self.header = QLabel("<b>No Condition results in this run</b>")
         self.header.setWordWrap(True)
@@ -83,6 +102,12 @@ class ConditionViewer(QWidget):
         self.mark_absent = QCheckBox("красным — свипы без ответа")
         self.mark_absent.setChecked(True)
         self.mark_absent.toggled.connect(lambda _: self._draw())
+        # Off = real recording time, which is where the travel of the response
+        # along the curve is visible; alignment makes the shapes comparable but
+        # removes exactly that.
+        self.wf_aligned = QCheckBox("waterfall: выровнять по артефакту")
+        self.wf_aligned.setChecked(True)
+        self.wf_aligned.toggled.connect(lambda _: self._draw())
 
         self.stats = QTableWidget(0, 4)
         self.stats.setHorizontalHeaderLabels(["ISI", "N", "ампл. мВ", "persist."])
@@ -101,6 +126,7 @@ class ConditionViewer(QWidget):
         lv.addWidget(self.show_control)
         lv.addWidget(self.show_markers)
         lv.addWidget(self.mark_absent)
+        lv.addWidget(self.wf_aligned)
         lv.addWidget(QLabel("<b>По условиям</b>"))
         lv.addWidget(self.stats, 1)
 
@@ -173,6 +199,12 @@ class ConditionViewer(QWidget):
             self._markers[f.name[: -len("_markers_ms.npy")]] = np.load(f)
         for f in sorted(arr.glob("*_present.npy")):
             self._present[f.name[: -len("_present.npy")]] = np.load(f)
+        for f in sorted(arr.glob("*_condition_means_time.npy")):
+            self._means_time[f.name[: -len("_condition_means_time.npy")]] = np.load(f)
+        tf = arr / "times_full_ms.npy"
+        self.times_full = np.load(tf) if tf.exists() else None
+        ca = arr / "condition_artifact_ms.npy"
+        self.cond_artifact = np.load(ca) if ca.exists() else None
 
         chans = sorted(self.summary["Channel"].astype(str).unique(),
                        key=lambda s: (len(s), s))
@@ -306,14 +338,17 @@ class ConditionViewer(QWidget):
                     continue
                 ok = True if present is None or k >= len(present) else bool(present[k])
                 if not ok:
-                    n_abs += 1
-                red = self.mark_absent.isChecked() and not ok
-                ax.plot(t, aligned[k], color="#d62728" if red else "0.6",
-                        lw=0.6, alpha=0.85 if red else 0.55, zorder=2 if red else 1)
+                    n_abs += 1                     # counted before use in the label
+                flag = self.mark_absent.isChecked() and not ok
+                ax.plot(t, aligned[k], color=ABSENT_COLOR if flag else "0.6",
+                        lw=0.7 if flag else 0.6, alpha=0.9 if flag else 0.55,
+                        zorder=2 if flag else 1,
+                        label="свип без ответа" if (flag and n_abs == 1) else None)
         if self.show_control.isChecked() and 0.0 in self.labels:
             ci = self.labels.index(0.0)
             ax.plot(t, means[ci], color="0.35", lw=1.4, ls="--", zorder=3, label="control")
-        ax.plot(t, means[i], color="#d73027", lw=2.0, zorder=4, label=_fmt(self.selected))
+        ax.plot(t, means[i], color=SELECTED_COLOR, lw=2.0, zorder=4,
+                label=f"{_fmt(self.selected)} — среднее")
         ax.axvline(0, color="tab:blue", lw=1.0, ls=":", zorder=2)
         # The latencies the amplitudes were actually sampled at — this is how you
         # check the numbers came off the response and not off the artifact tail.
@@ -332,7 +367,7 @@ class ConditionViewer(QWidget):
             ax.set_ylim(lo - pad, hi + pad)
         ax.set_xlabel("мс относительно артефакта")
         ax.set_ylabel("мВ")
-        extra = f" · {n_abs} свипов без ответа" if n_abs else ""
+        extra = f" · {_plural_sweeps(n_abs)} без ответа" if n_abs else ""
         ax.set_title(f"{ch} — {_fmt(self.selected)}: свипы и среднее, control пунктиром{extra}",
                      fontsize=10, loc="left")
         ax.grid(True, color="0.92", lw=0.6)
@@ -348,8 +383,11 @@ class ConditionViewer(QWidget):
         which is only visible with all the intervals in one picture.
         """
         self.wf_fig.clear()
-        means = self._means.get(ch)
-        t = self.times
+        aligned = self.wf_aligned.isChecked()
+        if aligned:
+            means, t = self._means.get(ch), self.times
+        else:
+            means, t = self._means_time.get(ch), self.times_full
         if means is None or t is None or not self.labels:
             ax = self.wf_fig.add_subplot(111)
             ax.text(0.5, 0.5, "Нет сохранённых кривых.", ha="center", va="center",
@@ -361,19 +399,27 @@ class ConditionViewer(QWidget):
         for row, lab in enumerate(self.labels):
             y = means[row] + row * step
             sel = self.selected is not None and float(lab) == float(self.selected)
-            ax.plot(t, y, color="#d73027" if sel else "k", lw=1.6 if sel else 0.8, zorder=3 if sel else 2)
+            ax.plot(t, y, color=SELECTED_COLOR if sel else "k",
+                    lw=1.6 if sel else 0.8, zorder=3 if sel else 2)
             ax.text(t[0], row * step, _fmt(lab) + "  ", ha="right", va="center",
-                    fontsize=8, color="#d73027" if sel else "0.25",
+                    fontsize=8, color=SELECTED_COLOR if sel else "0.25",
                     fontweight="bold" if sel else "normal")
-            ax.plot(0, row * step, "|", color="tab:blue", ms=9, mew=1.4, zorder=4)
+            # Artifact marker: at zero when aligned, at its real position when not.
+            a_ms = 0.0
+            if not aligned and self.cond_artifact is not None and row < len(self.cond_artifact):
+                a_ms = float(self.cond_artifact[row])
+            ax.plot(a_ms, row * step, "|", color="tab:blue", ms=9, mew=1.4, zorder=4)
         mk = self._markers.get(ch)
-        if self.show_markers.isChecked() and mk is not None:
+        if aligned and self.show_markers.isChecked() and mk is not None:
             for t_ms, col in zip(mk, ("tab:blue", "tab:red", "tab:green")):
                 if np.isfinite(t_ms):
                     ax.axvline(float(t_ms), color=col, lw=1.0, ls="--", alpha=0.6, zorder=1)
         ax.set_yticks([])
-        ax.set_xlabel("мс относительно артефакта")
-        ax.set_title(f"{ch} — все интервалы, выровнено по артефакту", fontsize=10, loc="left")
+        ax.set_xlabel("мс относительно артефакта" if aligned else "мс (реальное время кривой)")
+        ax.set_title(
+            f"{ch} — все интервалы, "
+            + ("выровнено по артефакту" if aligned else "реальное время: ответ едет за артефактом"),
+            fontsize=10, loc="left")
         for s in ("top", "right", "left"):
             ax.spines[s].set_visible(False)
         self.wf_canvas.draw_idle()

@@ -451,9 +451,10 @@ def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path,
     (the thing paired stimulation is measuring) actually show up.
 
     The onset/P1/P2 the amplitudes were measured at are drawn as vertical
-    guides, and a sweep the presence gate rejected is drawn in red rather than
-    grey — this figure is also how you check that the numbers came off the right
-    part of the curve.
+    guides, and a sweep the presence gate rejected is drawn in purple rather
+    than grey — this figure is also how you check that the numbers came off the
+    right part of the curve. Purple and not red: red marks the selected interval
+    in the GUI, and two reds side by side read as one annotation.
     """
     rows = [lab for lab in labels if segs_by_lab.get(lab, (None, []))[1]]
     if not rows:
@@ -467,8 +468,9 @@ def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path,
         block = np.asarray(segs_by_lab[lab][1], dtype=float)
         for k, w in zip(idx_list, block):
             ok = present_by_curve.get(int(k), True)
-            ax.plot(tw_ms, w, color=("0.55" if ok else "#d62728"),
-                    lw=0.6, alpha=0.6 if ok else 0.85)
+            ax.plot(tw_ms, w, color=("0.55" if ok else "#7b3294"),
+                    lw=0.6 if ok else 0.7, alpha=0.6 if ok else 0.9,
+                    label=None if ok else "свип без ответа")
         if markers_ms is not None:
             for t_ms, col in zip(markers_ms, ("tab:blue", "tab:red", "tab:green")):
                 if t_ms is not None and np.isfinite(t_ms):
@@ -493,6 +495,15 @@ def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path,
         pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.1
         axes[0][0].set_ylim(lo - pad, hi + pad)
     axes[-1][0].set_xlabel("мс относительно артефакта")
+    # One legend for the whole figure, de-duplicated: every rejected sweep
+    # carries the same label, and matplotlib would otherwise list them all.
+    handles, labels_ = axes[0][0].get_legend_handles_labels()
+    seen, h, l = set(), [], []
+    for hh, ll in zip(handles, labels_):
+        if ll and ll not in seen:
+            seen.add(ll); h.append(hh); l.append(ll)
+    if h:
+        axes[0][0].legend(h, l, fontsize=7, frameon=False, loc="upper right")
     fig.suptitle(f"{ch_name}: отдельные кривые по condition", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
@@ -686,6 +697,13 @@ def run_condition_analysis(
         if match is not None:
             np.save(arr_dir / f"{ch_name}_template.npy",
                     np.asarray(match["template"], dtype=float))
+        # Per-condition means in REAL recording time as well as artifact-aligned.
+        # Aligning is what makes the responses comparable, but it also hides the
+        # thing that defines this protocol — that the response travels along the
+        # curve — so both views have to be available.
+        np.save(arr_dir / f"{ch_name}_condition_means_time.npy",
+                np.vstack([data_mv[np.where(isi_labels == lab)[0], ch, :].mean(0)
+                           for lab in labels]))
         amp_by_channel[ch_name] = (amp_mean, amp_se)
         box_by_channel[ch_name] = box
         persist_by_channel[ch_name] = persistence
@@ -712,6 +730,9 @@ def run_condition_analysis(
     np.save(arr_dir / "condition_labels.npy", np.array(labels))
     np.save(arr_dir / "curve_condition.npy", np.asarray(isi_labels, dtype=float))
     np.save(arr_dir / "artifact_ms.npy", np.asarray(pos_ms, dtype=float))
+    np.save(arr_dir / "times_full_ms.npy", t_ms)
+    np.save(arr_dir / "condition_artifact_ms.npy",
+            np.array([float(np.median(pos_ms[isi_labels == lab])) for lab in labels]))
     pd.DataFrame(per_curve_rows).to_csv(excel_dir / "condition_amplitudes_per_curve.csv", index=False)
     pd.DataFrame(summary_rows).to_csv(excel_dir / "condition_summary.csv", index=False)
     print(f"[CONDITION] Outputs written under {out_dir}", flush=True)
