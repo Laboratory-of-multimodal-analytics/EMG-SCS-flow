@@ -458,6 +458,12 @@ class SIRResults:
 
         Amplitude = peak-to-peak when the response is biphasic, |P1| when it is
         monophasic (P2 goes undetected on most of these channels).
+
+        EVERY curve gets a row, including the ones with no detection, whose
+        amplitude is NaN. Dropping them would start the curve at whatever
+        stimulus first produced a response and hide the sub-threshold run before
+        it — but that run is part of the recruitment curve, and where the
+        response comes and goes the gaps are the finding.
         """
         if self.metrics.empty:
             return pd.DataFrame()
@@ -481,7 +487,6 @@ class SIRResults:
             "p1_uv": p1,
             "p1_ms": pd.to_numeric(sub["Peak1 latency"], errors="coerce") * 1e3,
         })
-        out = out[out["amp_uv"].notna()]
         return out.sort_values(["Channel", "curve"])
 
 

@@ -216,7 +216,10 @@ class ScenarioViewer(QWidget):
         """Channels with at least one detected response, in natural order."""
         if self.by_curve is None or self.by_curve.empty:
             return []
-        chans = self.by_curve["Channel"].unique()
+        # A channel counts as responding if ANY curve carried a detection — the
+        # frame now holds a row per curve, undetected ones included.
+        got = self.by_curve.groupby("Channel")["amp_uv"].apply(lambda s: s.notna().any())
+        chans = [c for c, ok in got.items() if ok]
         return sorted((c for c in chans if c in self.waves), key=lambda s: (len(s), s))
 
     # ------------------------------------------------------------------ #
@@ -289,9 +292,12 @@ class ScenarioViewer(QWidget):
         curves = g["curve"].to_numpy(int)
         amps = g["amp_uv"].to_numpy(float)
         self._points = curves
+        got = np.isfinite(amps)
+        # The line is drawn over the full curve range; NaNs break it, so curves
+        # with no detection show up as gaps instead of shifting the axis.
         if by_group:
             for gi, lab in enumerate(labels):
-                m = (g["group"] == lab).to_numpy()
+                m = ((g["group"] == lab).to_numpy()) & got
                 if m.any():
                     ax_top.plot(curves[m], amps[m], "o", ms=5, color=GROUP_COLORS[gi],
                                 label=f"{lab} (n={int(m.sum())})")
@@ -300,13 +306,21 @@ class ScenarioViewer(QWidget):
         else:
             norm = mcolors.Normalize(vmin=1, vmax=max(int(curves.max()), 2))
             ax_top.plot(curves, amps, "-", lw=0.9, color="0.75", zorder=0)
-            ax_top.scatter(curves, amps, s=26, c=[SWEEP_CMAP(norm(c)) for c in curves], zorder=3)
-        if self.selected_curve is not None and self.selected_curve in set(curves.tolist()):
+            ax_top.scatter(curves[got], amps[got], s=26,
+                           c=[SWEEP_CMAP(norm(c)) for c in curves[got]], zorder=3)
+        n_missing = int((~got).sum())
+        if len(curves):
+            ax_top.set_xlim(0.5, float(curves.max()) + 0.5)
+        if (self.selected_curve is not None and self.selected_curve in set(curves.tolist())
+                and got[list(curves).index(self.selected_curve)]):
             y = float(amps[list(curves).index(self.selected_curve)])
             ax_top.axvline(self.selected_curve, color="#ffb703", lw=1.2, zorder=1)
             ax_top.plot([self.selected_curve], [y], "o", ms=11, mfc="none",
                         mec="#ff8800", mew=2.0, zorder=4)
-        ax_top.set_xlabel("curve number")
+        ax_top.set_xlabel(
+            "curve number"
+            + (f"   ({n_missing} of {len(curves)} without a detection)" if n_missing else "")
+        )
         ax_top.set_ylabel("response (µV)")
         ax_top.set_title(f"{ch} — response vs curve", fontsize=10, loc="left")
         ax_top.grid(True, color="0.92", lw=0.6)

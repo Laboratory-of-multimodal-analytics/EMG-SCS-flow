@@ -112,15 +112,26 @@ class RecruitmentPanel(QWidget):
             "<b>Recruitment</b> — response vs curve number "
             "(this export carries no amplitude labels)"
         )
-        channels = sorted(bc["Channel"].unique(), key=lambda s: (len(s), s))
+        # Channels with at least one detection; the frame carries a row per
+        # curve, so undetected curves are NaN and break the line into gaps
+        # rather than moving the axis.
+        got = bc.groupby("Channel")["amp_uv"].apply(lambda s: s.notna().any())
+        channels = sorted((c for c, ok in got.items() if ok), key=lambda s: (len(s), s))
         colors = plt.get_cmap("tab10")
+        xmax = 0
         for i, ch in enumerate(channels):
             g = bc[bc["Channel"] == ch].sort_values("curve")
             focused = (self.highlight is None) or (ch == self.highlight)
-            ax.plot(g["curve"], g["amp_uv"], "-o", ms=3,
-                    lw=1.8 if focused else 0.9, color=colors(i % 10),
-                    alpha=1.0 if focused else 0.25, label=ch,
+            col = colors(i % 10)
+            ax.plot(g["curve"], g["amp_uv"], "-", lw=1.8 if focused else 0.9,
+                    color=col, alpha=1.0 if focused else 0.25, label=ch,
                     zorder=3 if focused else 2)
+            d = g[g["amp_uv"].notna()]
+            ax.plot(d["curve"], d["amp_uv"], "o", ms=3, color=col,
+                    alpha=1.0 if focused else 0.25, zorder=3 if focused else 2)
+            xmax = max(xmax, int(g["curve"].max()) if len(g) else 0)
+        if xmax:
+            ax.set_xlim(0.5, xmax + 0.5)
 
         ax.set_ylabel("response (µV)")
         ax.set_xlabel("curve number")
