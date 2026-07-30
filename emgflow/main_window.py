@@ -23,7 +23,7 @@ from .widgets.settings_panel import SettingsPanel
 from .widgets.sir_viewer import SIRViewer
 from .widgets.spontaneous_viewer import SpontaneousViewer
 from .widgets.startstop_viewer import StartStopViewer
-from .widgets.plot_gallery import ConditionViewer
+from .widgets.condition_viewer import ConditionViewer
 from .widgets.scenario_viewer import ScenarioViewer
 
 MODES = [("Stimulation-induced (SIR)", "sir"), ("StartStop", "startstop"),

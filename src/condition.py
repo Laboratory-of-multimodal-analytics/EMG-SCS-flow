@@ -664,6 +664,16 @@ def run_condition_analysis(
         persist_by_channel[ch_name] = persistence
         np.save(arr_dir / f"{ch_name}_condition_means.npy",
                 np.vstack([per_cond_mean[l] for l in labels]))
+        # Individual artifact-aligned curves too, in file order, so the GUI can
+        # pull up one sweep at a time instead of only the per-condition mean —
+        # sweep-to-sweep failure of the response is the thing this protocol
+        # measures, and a mean hides it.
+        aligned = np.full((n_curves, pre + post), np.nan)
+        for lab in labels:
+            idx, segs = segs_by_lab[lab]
+            for k, seg in zip(idx, segs):
+                aligned[k] = seg
+        np.save(arr_dir / f"{ch_name}_curves_aligned.npy", aligned)
 
     _plot_amp_vs_condition_grid(labels, amp_by_channel,
                                 amp_dir / "amplitude_vs_condition_all_channels.png")
@@ -673,6 +683,8 @@ def run_condition_analysis(
                            amp_dir / "persistence_vs_condition_all_channels.png")
     np.save(arr_dir / "times_ms.npy", tw_ms)
     np.save(arr_dir / "condition_labels.npy", np.array(labels))
+    np.save(arr_dir / "curve_condition.npy", np.asarray(isi_labels, dtype=float))
+    np.save(arr_dir / "artifact_ms.npy", np.asarray(pos_ms, dtype=float))
     pd.DataFrame(per_curve_rows).to_csv(excel_dir / "condition_amplitudes_per_curve.csv", index=False)
     pd.DataFrame(summary_rows).to_csv(excel_dir / "condition_summary.csv", index=False)
     print(f"[CONDITION] Outputs written under {out_dir}", flush=True)

@@ -60,7 +60,7 @@ class ProcessedRun:
     (the 'Time series' column), and reading one per run would make a scan take minutes.
     """
     root: Path
-    mode: str            # "sir" | "startstop"
+    mode: str            # "sir" | "startstop" | "condition"
     name: str
     n_items: int         # crops (SIR) or saved conditions (StartStop)
     has_spontaneous: bool
@@ -69,11 +69,12 @@ class ProcessedRun:
 
     @property
     def mode_label(self) -> str:
-        return "Stimulation-induced" if self.mode == "sir" else "StartStop"
+        return {"sir": "Stimulation-induced", "condition": "Condition test"}.get(
+            self.mode, "StartStop")
 
     @property
     def items_label(self) -> str:
-        return "crops" if self.mode == "sir" else "conditions"
+        return {"sir": "crops", "condition": "ISI"}.get(self.mode, "conditions")
 
 
 def detect_mode(root: Path) -> str | None:
@@ -169,13 +170,26 @@ def _describe(root: Path, mode: str) -> ProcessedRun:
         base = mode_dir(root, SIR_DIR)
         items = base / "Stimulus-centered epochs"
         pattern = "*-epo.fif"
+        csv = base / "Excel" / "Large_dataset_emg_response_metrics.csv"
+    elif mode == "condition":
+        # A Condition run has no crops and no detection fif; what it produced is
+        # a set of inter-stimulus intervals, counted from its own summary.
+        base = mode_dir(root, COND_DIR)
+        items = base / "Waterfall"
+        pattern = "*_by_artifact.png"
+        csv = base / "Excel" / "condition_summary.csv"
     else:
         base = mode_dir(root, SS_DIR)
         items = base / "Detections raw"
         pattern = "*.fif"
-    csv = base / "Excel" / "Large_dataset_emg_response_metrics.csv"
+        csv = base / "Excel" / "Large_dataset_emg_response_metrics.csv"
 
     n_items = len(list(items.glob(pattern))) if items.exists() else 0
+    if mode == "condition" and csv.exists():
+        try:
+            n_items = int(pd.read_csv(csv)["Condition (ISI ms)"].nunique())
+        except Exception:
+            pass
 
     size_mb, mtime = 0.0, 0.0
     if csv.exists():
