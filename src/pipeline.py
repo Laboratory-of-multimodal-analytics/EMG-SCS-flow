@@ -3521,7 +3521,19 @@ def run_pipeline(
 
                 base = sig[baseline_mask]
                 bstd = base.std()
-                if bstd == 0 or np.isnan(bstd):
+                # A flat baseline means a dead channel on a continuous recording.
+                # On a pre-cut curve export it means nothing: the baseline window
+                # IS the station's constant pre-artifact pad, so it is flat by
+                # construction, and whether np.std of a dozen identical floats
+                # comes out as exactly 0 or as 1e-21 is decided by rounding. That
+                # coin flip was discarding 276 of 800 epochs in one Zh14 file,
+                # the largest responses among them. There, ask instead whether
+                # the epoch carries any signal at all.
+                epoch_is_flat = (
+                    float(np.std(sig)) == 0.0 if pre_epoched is not None
+                    else bstd == 0
+                )
+                if epoch_is_flat or np.isnan(bstd):
                     channel_epoch_results[ch_name].append(
                         {"ep": ep, "onset": np.nan, "p1": np.nan, "p2": np.nan,
                          "pv1": np.nan, "pv2": np.nan, "ptp": np.nan, "sig": sig}
