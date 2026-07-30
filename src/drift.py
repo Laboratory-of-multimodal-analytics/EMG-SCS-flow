@@ -69,8 +69,17 @@ def remove_drift(
     """Subtract the slow baseline from every epoch/channel of *data*.
 
     ``data`` is ``(n_epochs, n_channels, n_samples)``. The artifact head
-    (``skip_s``) keeps its original values — only the post-artifact part is
-    corrected, so the artifact stays available for alignment and QC.
+    (``skip_s``) keeps its SHAPE — the spike is not flattened, so it stays
+    available for alignment and QC — but it is shifted by the same constant as
+    the first corrected sample.
+
+    That shift matters more than it looks. The head holds the station's constant
+    pre-artifact pad, and the pipeline takes its mean as the epoch's baseline.
+    Leaving the head at its raw level while the rest of the curve is pulled to
+    zero leaves the two on different references, and the baseline subtraction
+    then displaces every response by the pad's stale offset — a median of 1.6 mV
+    and up to 7.4 mV on Zh14 Т11-12 двойная стим, which silently flipped
+    responses out of their detector's polarity and lost whole channels.
     """
     if win_ms is None:
         return data
@@ -78,5 +87,10 @@ def remove_drift(
     drift = estimate_drift(data, sfreq, win_ms=win_ms, skip_s=skip_s)
     i0 = min(int(round(skip_s * sfreq)), data.shape[-1])
     out = data - drift
-    out[..., :i0] = data[..., :i0]
+    if i0 > 0:
+        # Bring the head to the same reference as the corrected rest. After the
+        # drift is subtracted the signal sits at zero, so the pad has to sit at
+        # zero too; the pad is constant, so its own first sample is its level.
+        # Subtracting it leaves the artifact's SHAPE untouched.
+        out[..., :i0] = data[..., :i0] - data[..., [0]]
     return out
