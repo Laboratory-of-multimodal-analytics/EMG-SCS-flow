@@ -115,7 +115,7 @@ class ConditionViewer(QWidget):
         self.wf_aligned.toggled.connect(lambda _: self._draw())
 
         self.stats = QTableWidget(0, 4)
-        self.stats.setHorizontalHeaderLabels(["ISI", "N", "ампл. мВ", "persist."])
+        self.stats.setHorizontalHeaderLabels(["ISI", "N", "ампл. мкВ", "persist."])
         self.stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.stats.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
@@ -278,8 +278,8 @@ class ConditionViewer(QWidget):
             return 0.0 if str(v) == CONTROL else float(v)
         d = d.assign(_isi=d["Condition (ISI ms)"].map(_key)).sort_values("_isi")
         xs = np.arange(len(d))
-        amp = d["Amplitude mean mV"].to_numpy(float)
-        se = d["Amplitude SE mV"].to_numpy(float)
+        amp = d["Amplitude mean uV"].to_numpy(float)
+        se = d["Amplitude SE uV"].to_numpy(float)
         pers = d["Persistence"].to_numpy(float)
         tags = [_fmt(v) for v in d["_isi"]]
 
@@ -290,7 +290,7 @@ class ConditionViewer(QWidget):
         ctrl = amp[0] if len(amp) and d["_isi"].iloc[0] == 0.0 else np.nan
         if np.isfinite(ctrl):
             ax_amp.axhline(ctrl, color="0.6", lw=1.0, ls="--", zorder=1,
-                           label=f"control = {ctrl:.3f} мВ")
+                           label=f"control = {ctrl:.0f} мкВ")
         ax_amp.errorbar(xs, amp, yerr=se, marker="s", ms=5, lw=1.4, color="k",
                         capsize=3, zorder=3)
         sel_i = None
@@ -301,7 +301,7 @@ class ConditionViewer(QWidget):
                 ax_amp.plot([sel_i], [amp[sel_i]], "o", ms=13, mfc="none",
                             mec="#ff8800", mew=2.2, zorder=4)
         ax_amp.set_xticks(xs); ax_amp.set_xticklabels(tags, rotation=45, fontsize=7)
-        ax_amp.set_ylabel("Амплитуда, мВ")
+        ax_amp.set_ylabel("Амплитуда, мкВ")
         ax_amp.set_title(f"{ch} — ответ против интервала", fontsize=10, loc="left")
         ax_amp.grid(True, color="0.92", lw=0.6)
         if np.isfinite(ctrl):
@@ -371,7 +371,7 @@ class ConditionViewer(QWidget):
             pad = 0.1 * (hi - lo) if hi > lo else 0.1
             ax.set_ylim(lo - pad, hi + pad)
         ax.set_xlabel("мс относительно артефакта")
-        ax.set_ylabel("мВ")
+        ax.set_ylabel("мкВ")
         extra = f" · {_plural_curves(n_abs)} без ответа" if n_abs else ""
         ax.set_title(f"{ch} — {_fmt(self.selected)}: кривые и среднее, control пунктиром{extra}",
                      fontsize=10, loc="left")
@@ -433,6 +433,6 @@ class ConditionViewer(QWidget):
         n = d["N"].to_numpy()
         self.stats.setRowCount(len(tags))
         for r, tag in enumerate(tags):
-            vals = [tag, str(int(n[r])), f"{amp[r]:.3f}", f"{pers[r]:.2f}"]
+            vals = [tag, str(int(n[r])), f"{amp[r]:.0f}", f"{pers[r]:.2f}"]
             for c, v in enumerate(vals):
                 self.stats.setItem(r, c, QTableWidgetItem(v))

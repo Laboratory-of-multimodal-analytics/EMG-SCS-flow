@@ -76,9 +76,21 @@ CONDITION_PRESENCE_MIN_UV = 20.0
 CONDITION_P2_WIN_MS = 8.0
 CONDITION_P2_MIN_FRAC = 0.15
 # A channel whose STRONGEST condition response (peak-to-peak) is below this is a
-# non-responder — no template, no detections (e.g. a channel that only carries
-# low-amplitude noise correlating with itself).
-CONDITION_CHANNEL_MIN_PTP_UV = 100.0
+# non-responder. 40 uV, not 100: on DZh11 нерв Th12-L1 ch6 carries a real,
+# condition-modulated response of 73 uV at 16-21 ms, and a 100 uV floor deleted
+# the whole channel.
+CONDITION_CHANNEL_MIN_PTP_UV = 40.0
+
+# Amplitude alone cannot tell a response from the artifact's recovery tail — on
+# that same file ch4 and ch8 show 375 uV in the response window with no response
+# in them at all, and they match a bank template at corr 0.88-0.89 because the
+# bank is scale- and width-free. What separates them is SHAPE: an evoked response
+# is a fast deflection a few ms wide, the recovery is a slow monotone drift over
+# tens of ms. So the channel mean is split into a slow part (running median over
+# CONDITION_SHARP_WIN_MS) and the rest, and the rest has to carry a real share of
+# the amplitude. Measured on that file: genuine responses 0.49-0.87, tails 0.20-0.22.
+CONDITION_SHARP_WIN_MS = 8.0
+CONDITION_MIN_SHARP_FRAC = 0.35
 # Template time-scales for matching. These responses are narrow, so allow the
 # templates to be COMPRESSED (<1) but not stretched (>1) — a stretched wide
 # template would match a narrow response spuriously and misplace the markers.
@@ -221,7 +233,11 @@ def _match_channel_template(per_cond_mean, labels, tw_s, sfreq, bank):
         return None
     # channel-level responder gate: even the strongest condition must clear a
     # peak-to-peak floor, else this is a noise-only (non-responding) channel.
-    if best_ptp < CONDITION_CHANNEL_MIN_PTP_UV / 1e3:   # ref is in mV
+    if best_ptp < CONDITION_CHANNEL_MIN_PTP_UV:
+        return None
+    # Shape gate: reject the artifact's recovery tail, which passes any
+    # amplitude test and matches the bank just as well as a real response.
+    if not _has_sharp_response(per_cond_mean[best_lab], tw_s, resp_mask):
         return None
     ref = np.nan_to_num(per_cond_mean[best_lab], nan=0.0)
     match = _match_sir_template(
@@ -311,9 +327,31 @@ def _curve_amplitude(seg_mv, tw_s, match, resp_mask):
     if not np.isfinite(p1v):
         return 0.0, False
     amp = abs(p1v - p2v) if np.isfinite(p2v) else abs(p1v - base)
-    if amp < CONDITION_PRESENCE_MIN_UV / 1e3:   # floor in mV (values are mV)
+    if amp < CONDITION_PRESENCE_MIN_UV:
         return 0.0, False
     return float(amp), True
+
+
+def _has_sharp_response(wave, tw_s, resp_mask) -> bool:
+    """True when the response window carries a FAST deflection, not a slow drift.
+
+    The wave is split into a slow part (running median over
+    ``CONDITION_SHARP_WIN_MS``, wider than a response and far narrower than a
+    recovery) and the remainder. A muscle response survives that subtraction; an
+    artifact tail collapses into it.
+    """
+    from scipy.ndimage import median_filter
+
+    w = np.asarray(wave, dtype=float)
+    seg = np.nan_to_num(w[resp_mask])
+    if seg.size < 5:
+        return False
+    total = float(np.ptp(seg))
+    if total <= 0:
+        return False
+    n = max(int(round(CONDITION_SHARP_WIN_MS / 1e3 * _sf(tw_s))), 3) | 1
+    sharp = np.nan_to_num(w) - median_filter(np.nan_to_num(w), size=n, mode="nearest")
+    return float(np.ptp(sharp[resp_mask])) / total >= CONDITION_MIN_SHARP_FRAC
 
 
 def _sf(tw_s):
@@ -422,7 +460,7 @@ def _plot_amp_vs_condition_grid(labels, amp_by_channel, out_path):
                     capsize=3, lw=1.2)
         ax.set_xticks(xs)
         ax.set_xticklabels(tags, rotation=45, fontsize=7)
-        ax.set_ylabel("Amplitude, mV")
+        ax.set_ylabel("Amplitude, мкВ")
         ax.set_title(ch_name, fontsize=10, loc="left")
         ax.grid(alpha=0.3)
     for j in range(n, nrow * ncol):          # blank any unused cell
@@ -483,7 +521,7 @@ def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path,
         tag = "control" if lab == 0 else f"ISI {lab:.0f} мс"
         ax.set_title(f"{tag}: n={len(block)} кривых, среднее ± SD",
                      fontsize=9, loc="left")
-        ax.set_ylabel("мВ")
+        ax.set_ylabel("мкВ")
         ax.grid(alpha=0.3)
     # Shared y-limit from the post-artifact data only: the artifact dwarfs the
     # response and would otherwise flatten every curve onto the zero line.
@@ -524,7 +562,7 @@ def _plot_boxplots_grid(labels, box_by_channel, out_path):
                    showfliers=False, medianprops=dict(color="tab:red"))
         ax.set_xticks(np.arange(len(labels)))
         ax.set_xticklabels(tags, rotation=45, fontsize=7)
-        ax.set_ylabel("Amplitude, mV")
+        ax.set_ylabel("Amplitude, мкВ")
         ax.set_title(ch_name, fontsize=10, loc="left")
         ax.grid(alpha=0.3, axis="y")
     for j in range(n, nrow * ncol):
@@ -583,7 +621,10 @@ def run_condition_analysis(
     for d in (wf_dir, curves_dir, amp_dir, excel_dir, arr_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    data_mv = data * 1e3  # report in mV, like the reference figure
+    # Microvolts, matching every other surface in the toolbox — the Condition
+    # tables used to be the only ones in mV, which made the same response look a
+    # thousand times smaller than in the recruitment tables next to it.
+    data_mv = data * 1e6
     n_curves, n_ch, n_samp = data_mv.shape
     t_ms = np.arange(n_samp) / sfreq * 1e3
 
@@ -654,7 +695,7 @@ def run_condition_analysis(
                     "Channel": ch_name, "Curve": int(k) + 1,
                     "Condition (ISI ms)": ("control" if lab == 0 else lab),
                     "Artifact ms": round(float(pos_ms[k]), 2),
-                    "Amplitude mV": round(float(a), 4),
+                    "Amplitude uV": round(float(a), 4),
                     "Response present": bool(present),
                 })
             arr = np.array(curve_amps, dtype=float)
@@ -668,8 +709,8 @@ def run_condition_analysis(
                 "N": counts[lab],
                 "N with response": int(np.sum(present_flags)),
                 "Persistence": round(frac, 3),
-                "Amplitude mean mV": round(m, 4) if np.isfinite(m) else np.nan,
-                "Amplitude SE mV": round(se, 4),
+                "Amplitude mean uV": round(m, 4) if np.isfinite(m) else np.nan,
+                "Amplitude SE uV": round(se, 4),
                 "Template": tmpl_name,
                 "Template corr": tmpl_corr,
                 "Onset ms": on_ms, "P1 ms": p1_ms, "P2 ms": p2_ms,
