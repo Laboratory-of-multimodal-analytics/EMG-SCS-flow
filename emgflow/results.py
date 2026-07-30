@@ -18,6 +18,17 @@ SIR_DIR = "Stimulation-induced responses"
 SS_DIR = "StartStop analysis"
 COND_DIR = "Condition test"
 
+
+def mode_dir(root: Path, folder: str) -> Path:
+    """Where *folder*-mode results live in this output root.
+
+    A run that produced only one analysis writes straight into ``results/``; the
+    ``<mode>/`` level is kept only when a root holds more than one. Prefer the
+    nested path when it exists so both layouts read the same way.
+    """
+    nested = Path(root) / "results" / folder
+    return nested if nested.exists() else Path(root) / "results"
+
 METRIC_COLS = [
     "Configuration", "Stim. amplitude", "Epoch", "Channel",
     "Onset latency", "Peak1 latency", "Peak2 latency",
@@ -68,25 +79,34 @@ class ProcessedRun:
 def detect_mode(root: Path) -> str | None:
     """Which mode produced this output root — judged by CONTENT, not by folder names.
 
-    `build_output_dirs` creates both trees on every run, so an empty
-    'Stimulation-induced responses/' folder proves nothing.
+    Folders are created lazily now (a SIR run no longer leaves an empty
+    'StartStop analysis/' behind), but content remains the safer test: older
+    output roots on disk still carry both empty trees.
     """
     root = Path(root)
     # Condition test is a distinct output tree (no SIR epochs, no StartStop fif),
     # so probe it first by its own summary CSV / plots.
-    cond_csv = root / "results" / COND_DIR / "Excel" / "condition_summary.csv"
-    cond_wf = root / "results" / COND_DIR / "Waterfall"
-    if cond_csv.exists() or (cond_wf.exists() and any(cond_wf.glob("*.png"))):
+    cond = mode_dir(root, COND_DIR)
+    cond_wf = cond / "Waterfall"
+    if (cond / "Excel" / "condition_summary.csv").exists() or (
+            cond_wf.exists() and any(cond_wf.glob("*.png"))):
         return "condition"
 
-    sir_epochs = root / "results" / SIR_DIR / "Stimulus-centered epochs"
-    sir_csv = root / "results" / SIR_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv"
-    if (sir_epochs.exists() and any(sir_epochs.glob("*-epo.fif"))) or sir_csv.exists():
+    sir = mode_dir(root, SIR_DIR)
+    sir_epochs = sir / "Stimulus-centered epochs"
+    if (sir_epochs.exists() and any(sir_epochs.glob("*-epo.fif"))):
         return "sir"
 
-    ss_raw = root / "results" / SS_DIR / "Detections raw"
-    ss_csv = root / "results" / SS_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv"
-    if (ss_raw.exists() and any(ss_raw.glob("*.fif"))) or ss_csv.exists():
+    ss = mode_dir(root, SS_DIR)
+    ss_raw = ss / "Detections raw"
+    if (ss_raw.exists() and any(ss_raw.glob("*.fif"))):
+        return "startstop"
+
+    # Metrics CSV alone: both modes write the same file name, so it can only
+    # disambiguate when the mode folder is present.
+    if (root / "results" / SIR_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv").exists():
+        return "sir"
+    if (root / "results" / SS_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv").exists():
         return "startstop"
     return None
 
@@ -98,6 +118,9 @@ _PRUNE = {
     "Plots", "Raw epochs", "Templates", "Detections raw", "Spontaneous EMG",
     "Stimulus-centered epochs", "Template overlays", "annot_crops_fif", "__pycache__",
     "Condition test", "Waterfall", "Amplitude vs condition", "Recruitment", "arrays",
+    "Jendrassik", "Paired stimulation", "Curves per condition",
+    "Plots with grid and markers", "Plots without grid and markers",
+    "Plots grouped by amplitude", "Template overlays per amplitude",
 }
 
 
@@ -143,13 +166,14 @@ def scan_processed(base: Path, max_depth: int = 4) -> list[ProcessedRun]:
 def _describe(root: Path, mode: str) -> ProcessedRun:
     """Summarise a run from directory metadata alone — stat and listings, never a CSV read."""
     if mode == "sir":
-        items = root / "results" / SIR_DIR / "Stimulus-centered epochs"
+        base = mode_dir(root, SIR_DIR)
+        items = base / "Stimulus-centered epochs"
         pattern = "*-epo.fif"
-        csv = root / "results" / SIR_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv"
     else:
-        items = root / "results" / SS_DIR / "Detections raw"
+        base = mode_dir(root, SS_DIR)
+        items = base / "Detections raw"
         pattern = "*.fif"
-        csv = root / "results" / SS_DIR / "Excel" / "Large_dataset_emg_response_metrics.csv"
+    csv = base / "Excel" / "Large_dataset_emg_response_metrics.csv"
 
     n_items = len(list(items.glob(pattern))) if items.exists() else 0
 
@@ -160,7 +184,7 @@ def _describe(root: Path, mode: str) -> ProcessedRun:
     if not mtime:
         mtime = root.stat().st_mtime
 
-    spont = root / "results" / SS_DIR / "Spontaneous EMG"
+    spont = mode_dir(root, SS_DIR) / "Spontaneous EMG"
     return ProcessedRun(
         root=root,
         mode=mode,
@@ -203,7 +227,7 @@ def _parse_crop_stem(stem: str) -> tuple[str, str] | None:
 class SIRResults:
     def __init__(self, output_root: Path) -> None:
         self.root = Path(output_root)
-        self.results_dir = self.root / "results" / SIR_DIR
+        self.results_dir = mode_dir(self.root, SIR_DIR)
         self.metrics = _read_csv(self.results_dir / "Excel" / "Large_dataset_emg_response_metrics.csv")
         self.crops: list[Crop] = []
         epochs_dir = self.results_dir / "Stimulus-centered epochs"
@@ -219,6 +243,8 @@ class SIRResults:
     def raw_path(self) -> Path | None:
         """The preprocessed recording the run was built from — what the raw browser shows."""
         d = self.root / "data" / SIR_DIR
+        if not d.exists():
+            d = self.root / "data"
         for pattern in ("*_preprocessed_raw.fif", "*_original_raw.fif"):
             hits = sorted(d.glob(pattern))
             if hits:
@@ -407,6 +433,57 @@ class SIRResults:
         data = epochs.get_data(picks=[channel])[:, 0, :] * 1e6
         return epochs.times, data.mean(axis=0)
 
+    # ------------------------------------------------------------------ #
+    # Neurosoft curve exports
+    # ------------------------------------------------------------------ #
+    @property
+    def scenario(self) -> str | None:
+        """Which Neurosoft protocol this run produced, or None for a normal SIR run.
+
+        Read off the deliverable folder the pipeline wrote — the three scenarios
+        are mutually exclusive, so the first hit is the answer.
+        """
+        for folder in ("Recruitment", "Jendrassik", "Paired stimulation"):
+            if (self.results_dir / folder).is_dir():
+                return folder
+        return None
+
+    def recruitment_by_curve(self, config: str, session=None) -> pd.DataFrame:
+        """Response size per CURVE, for exports with no amplitude axis.
+
+        A Neurosoft file is one crop whose curves ARE the stimulation ramp: the
+        amplitude label is the synthetic ``all`` and carries no number, so the
+        amplitude-keyed curve cannot be drawn. The curve index is the ramp, and
+        plotting against it is the recruitment curve the clinician asks for.
+
+        Amplitude = peak-to-peak when the response is biphasic, |P1| when it is
+        monophasic (P2 goes undetected on most of these channels).
+        """
+        if self.metrics.empty:
+            return pd.DataFrame()
+        sub = self.metrics[self.metrics["Configuration"].astype(str) == str(config)].copy()
+        if sub.empty or "Epoch" not in sub.columns:
+            return pd.DataFrame()
+
+        if session is not None:
+            rejected = np.array([
+                self._is_rejected(session, str(config), str(a), str(ch))
+                for a, ch in zip(sub["Stim. amplitude"], sub["Channel"])
+            ], dtype=bool)
+            sub.loc[rejected, ["Peak1 latency", "Peak1 value", "PTP amplitude"]] = np.nan
+
+        ptp = pd.to_numeric(sub["PTP amplitude"], errors="coerce") * 1e6
+        p1 = pd.to_numeric(sub["Peak1 value"], errors="coerce") * 1e6
+        out = pd.DataFrame({
+            "Channel": sub["Channel"].astype(str),
+            "curve": sub["Epoch"].astype(int) + 1,      # curve numbers are 1-based
+            "amp_uv": ptp.where(ptp.notna(), p1.abs()),
+            "p1_uv": p1,
+            "p1_ms": pd.to_numeric(sub["Peak1 latency"], errors="coerce") * 1e3,
+        })
+        out = out[out["amp_uv"].notna()]
+        return out.sort_values(["Channel", "curve"])
+
 
 # --------------------------------------------------------------------------- #
 # StartStop
@@ -428,7 +505,7 @@ class Detection:
 class StartStopResults:
     def __init__(self, output_root: Path) -> None:
         self.root = Path(output_root)
-        self.results_dir = self.root / "results" / SS_DIR
+        self.results_dir = mode_dir(self.root, SS_DIR)
         self.metrics = _read_csv(self.results_dir / "Excel" / "Large_dataset_emg_response_metrics.csv")
         self.channel_qc = _read_csv(self.results_dir / "Excel" / "STARTSTOP_channel_qc.csv")
         self.discarded = _read_csv(self.results_dir / "Excel" / "STARTSTOP_template_anchor_discarded.csv")
@@ -487,7 +564,7 @@ class StartStopResults:
 class SpontaneousResults:
     def __init__(self, output_root: Path) -> None:
         self.root = Path(output_root)
-        self.base = self.root / "results" / SS_DIR / "Spontaneous EMG"
+        self.base = mode_dir(self.root, SS_DIR) / "Spontaneous EMG"
 
     @property
     def ok(self) -> bool:

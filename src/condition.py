@@ -12,7 +12,8 @@ Auto-routing: the text-curves loader detects the artifact channel and the
 per-curve artifact positions; if those positions vary (spread beyond a few ms)
 the file is a Condition test and goes here, otherwise it stays on the SIR path.
 
-Outputs, under ``results/Condition test/``:
+Outputs (straight in ``results/`` when this is the only analysis in the output
+root, else under ``results/Condition test/``):
   - ``Waterfall/<ch>_by_artifact.png`` / ``<ch>_by_time.png`` — per-condition
     mean curves stacked (control at the bottom, ISI increasing upward), aligned
     on the artifact or in real recording time.
@@ -31,6 +32,8 @@ identically whether launched from ``run_pipeline`` (script), the CLI, or the GUI
 from __future__ import annotations
 
 from pathlib import Path
+
+from .io_utils import CONDITION_FOLDER, resolve_mode_dirs
 
 import matplotlib
 
@@ -439,6 +442,49 @@ def _grid_axes(n, ncol=2):
     return fig, axes, nrow, ncol
 
 
+def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path):
+    """Every curve of one channel, one row per condition (mean ± SD on top).
+
+    The waterfall shows one mean per condition; A. Militskova also asks for the
+    individual curves, which is where sweep-to-sweep failures of the response
+    (the thing paired stimulation is measuring) actually show up.
+    """
+    rows = [lab for lab in labels if segs_by_lab.get(lab, (None, []))[1]]
+    if not rows:
+        return
+    fig, axes = plt.subplots(len(rows), 1, figsize=(9, 2.4 * len(rows)),
+                             squeeze=False, sharex=True, sharey=True)
+    for r, lab in enumerate(rows):
+        ax = axes[r][0]
+        block = np.asarray(segs_by_lab[lab][1], dtype=float)
+        for w in block:
+            ax.plot(tw_ms, w, color="0.55", lw=0.6, alpha=0.6)
+        m = np.nanmean(block, axis=0)
+        sd = np.nanstd(block, axis=0, ddof=1) if len(block) > 1 else np.zeros_like(m)
+        ax.fill_between(tw_ms, m - sd, m + sd, color="tab:blue", alpha=0.20, lw=0)
+        ax.plot(tw_ms, m, color="tab:blue", lw=1.8)
+        ax.axvline(0, color="tab:red", lw=1.0, ls=":")
+        tag = "control" if lab == 0 else f"ISI {lab:.0f} мс"
+        ax.set_title(f"{tag}: n={len(block)} кривых, среднее ± SD",
+                     fontsize=9, loc="left")
+        ax.set_ylabel("мВ")
+        ax.grid(alpha=0.3)
+    # Shared y-limit from the post-artifact data only: the artifact dwarfs the
+    # response and would otherwise flatten every curve onto the zero line.
+    post = tw_ms >= CONDITION_RESP_LO * 1e3
+    allseg = np.concatenate([np.asarray(segs_by_lab[l][1], dtype=float)[:, post]
+                             for l in rows], axis=0)
+    if allseg.size and np.isfinite(allseg).any():
+        lo, hi = float(np.nanmin(allseg)), float(np.nanmax(allseg))
+        pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.1
+        axes[0][0].set_ylim(lo - pad, hi + pad)
+    axes[-1][0].set_xlabel("мс относительно артефакта")
+    fig.suptitle(f"{ch_name}: отдельные кривые по condition", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def _plot_boxplots_grid(labels, box_by_channel, out_path):
     """One subplot per channel: per-condition distribution of per-curve amplitudes.
 
@@ -500,12 +546,16 @@ def run_condition_analysis(
 ) -> Path:
     """Full Condition-test analysis. ``data`` is (n_curves, n_ch, n_samp) volts."""
     output_root = Path(output_root)
-    out_dir = output_root / "results" / "Condition test"
+    # A condition run is the only thing in this output root, so it writes
+    # straight into results/ — the "Condition test" level only comes back when
+    # the root already holds another analysis.
+    out_dir, _ = resolve_mode_dirs(output_root, CONDITION_FOLDER)
     wf_dir = out_dir / "Waterfall"
+    curves_dir = out_dir / "Curves per condition"
     amp_dir = out_dir / "Amplitude vs condition"
     excel_dir = out_dir / "Excel"
     arr_dir = out_dir / "arrays"
-    for d in (wf_dir, amp_dir, excel_dir, arr_dir):
+    for d in (wf_dir, curves_dir, amp_dir, excel_dir, arr_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     data_mv = data * 1e3  # report in mV, like the reference figure
@@ -607,6 +657,8 @@ def run_condition_analysis(
                         markers_ms=(on_ms, p1_ms, p2_ms))
         _plot_waterfall_time(data_mv, ch, isi_labels, labels, pos_ms, t_ms, ch_name,
                              wf_dir / f"{ch_name}_by_time.png")
+        _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name,
+                                   curves_dir / f"{ch_name}_curves.png")
         amp_by_channel[ch_name] = (amp_mean, amp_se)
         box_by_channel[ch_name] = box
         persist_by_channel[ch_name] = persistence

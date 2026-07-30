@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+from matplotlib import colors as mcolors
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -25,6 +26,9 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+from src.constants import TEXT_CURVES_RESP_TMIN
+from src.plotting import SWEEP_CMAP
 
 from ..results import Crop, SIRResults
 from .plot_canvas import C_ONSET, C_P1, C_P2, MARKER_SIZE, FitPlotCanvas, style_channel_axis
@@ -228,6 +232,12 @@ class SIRViewer(QWidget):
         data = epochs.get_data(picks=chans) * 1e6  # -> µV
         mean = data.mean(axis=0)
         template_mode = self.mode_template.isChecked()
+        # On a Neurosoft curve export every epoch is one stimulus of growing
+        # intensity, so the epochs carry the result and their mean hides it.
+        # Colour them by position in the sweep (later = darker) and drop the mean,
+        # matching the panels the pipeline writes.
+        sweep = self.results.scenario is not None
+        norm = mcolors.Normalize(vmin=1, vmax=max(len(data), 2)) if sweep else None
 
         axes = self.plot.make_axes(len(chans))
         for ax, ch, idx in zip(axes, chans, range(len(chans))):
@@ -235,14 +245,24 @@ class SIRViewer(QWidget):
             state = self.session.edit_state(self.crop.config, self.crop.amp, ch)
             rejected = state["suppressed"] or state["channel_excluded"] or state["config_excluded"]
 
-            ax.plot(times, data[:, idx, :].T, color="gray", alpha=0.7, lw=0.7, zorder=1)
-            ax.plot(times, mean[idx], color="black", lw=2.0, zorder=3)
+            if sweep:
+                for ep in range(data.shape[0]):
+                    ax.plot(times, data[ep, idx, :], color=SWEEP_CMAP(norm(ep + 1)),
+                            alpha=0.9, lw=0.7, zorder=1)
+            else:
+                ax.plot(times, data[:, idx, :].T, color="gray", alpha=0.7, lw=0.7, zorder=1)
+                ax.plot(times, mean[idx], color="black", lw=2.0, zorder=3)
             ax.axvline(0.0, color="0.45", lw=0.8, ls=":", zorder=2)
 
             # Scale each row to its own post-stimulus response: the artifact and pre-stimulus
             # drift are often an order of magnitude larger and would flatten the deflection
-            # being judged.
-            resp = mean[idx][times > 0]
+            # being judged. On a Neurosoft sweep the stimulus artifact sits ~1 ms AFTER t=0
+            # (there is no pre-stimulus data), so the window has to start at the response
+            # onset instead of at zero, and the scale comes from the strongest curve rather
+            # than from a mean that averages weak and strong together.
+            t_from = TEXT_CURVES_RESP_TMIN if sweep else 0.0
+            resp = (np.nanmax(np.abs(data[:, idx, :][:, times > t_from]), axis=0)
+                    if sweep else mean[idx][times > t_from])
             span = float(np.nanmax(np.abs(resp))) if resp.size and np.isfinite(resp).any() else 0.0
             if span > 0:
                 ax.set_ylim(-1.7 * span, 1.7 * span)
@@ -274,8 +294,10 @@ class SIRViewer(QWidget):
 
         axes[-1].set_xlabel("time (s)", fontsize=8)
         axes[-1].set_xlim(times[0], times[-1])
+        subtitle = (f"{len(epochs)} curves, coloured by order (later = darker)"
+                    if sweep else f"{len(epochs)} epochs")
         self.plot.fig.suptitle(
-            f"{self.crop.label} · {len(epochs)} epochs · onset•blue P1•red P2•green",
+            f"{self.crop.label} · {subtitle} · onset•blue P1•red P2•green",
             fontsize=8,
         )
         self.plot.refresh()
@@ -378,7 +400,10 @@ class SIRViewer(QWidget):
         if self.results is None or self.crop is None:
             return
         df = self.results.recruitment_curves(self.crop.config, self.session)
-        self.recruitment.show_config(df, self.crop.config)
+        # Neurosoft exports have no amplitude axis; the panel falls back to the
+        # curve order, so hand it the per-curve metrics as well.
+        by_curve = self.results.recruitment_by_curve(self.crop.config, self.session)
+        self.recruitment.show_config(df, self.crop.config, by_curve=by_curve)
 
     # ------------------------------------------------------------------ #
     def _channel_at(self, event) -> str | None:

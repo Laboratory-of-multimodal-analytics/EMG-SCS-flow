@@ -30,9 +30,9 @@ The two modes are near-disjoint code paths and answer different questions. Pick 
 | Extras | recruitment across amplitudes | **spontaneous-EMG analysis**: RMS envelopes, bursts, antagonist co-activation |
 | Question it answers | how does the response grow with stimulation amplitude? | what happened during this movement/task, and how active was each muscle? |
 
-A StartStop run produces **no** SIR results — but `build_output_dirs` creates both folder trees
-on every run, so an empty `Stimulation-induced responses/` folder proves nothing about which
-mode ran.
+A StartStop run produces **no** SIR results, and no longer creates the SIR folder tree either —
+see [Output](#output) for how the layout stays flat. Output roots produced before that change may
+still carry empty trees from both modes.
 
 ---
 
@@ -81,6 +81,52 @@ Consequences of what the format does *not* carry:
 The CLI, the scripted `run_pipeline` call and the GUI all take the same path — the GUI only adds
 the file dialog filter and mirrors the adapted windows into its settings panel, so the values shown
 are the values that run.
+
+#### The three Neurosoft protocols
+
+Per A. Militskova, the file name carries the stimulation level (`Th9-10`, `Th12-L1`, `C3-4` …)
+followed by a token naming the test, and each test wants a different deliverable. `src/neurosoft.py`
+resolves which one a file is *before* any analysis runs, and only that scenario's outputs are
+produced — no template diagnostics, no per-amplitude box-plots, no averaging plot.
+
+| Scenario | Name tokens | Deliverable (under `results/`) |
+| --- | --- | --- |
+| **Recruitment curve** | `RC`, `rec curve`, `kr rec`, `кр рек`, `КР` | `Recruitment/` — amplitude vs curve number per channel, top-N and amplitude-group box-plots, per-curve tables |
+| **Jendrassik manoeuvre** | `JM`, `ендр`, `Ендрассик` | `Jendrassik/` — every curve drawn, grouped by amplitude with group mean ± SD, group statistics |
+| **Paired stimulation** | `2 stim`, `2ст`, `двойная стим`, `парная`, `paired` | `Paired stimulation/` (same as Jendrassik), or the Condition-test outputs when the ISI is recoverable |
+
+Matching is case-insensitive and tolerates the Cyrillic/Latin homoglyph mixing these names are full
+of (`Тh11-12`, `JМ`). A file with **no** token falls back to the signal: a moving stimulus artifact
+means paired-pulse, a fixed one means a recruitment sweep — the common case for bare `Th11-12.txt`.
+When the name and the signal disagree the name wins and the run log says so.
+
+Both plot panels (`Plots with grid and markers`, `Plots without grid and markers`) change shape for
+these files: **the black mean line is dropped** and each curve is coloured by its position in the
+sweep instead — **the later the curve, the darker it is** (light = first/weakest → dark =
+last/strongest). Averaging the curves would destroy exactly the effect under study, since each curve
+is already one stimulus. The y-axis is fitted to the post-artifact window, letting the stimulus
+artifact (±10 mV against responses of ~0.1 mV) run off-scale.
+
+The amplitude-group figures put **all channels on one figure** (`curves_by_amplitude_group.png`),
+one subplot per channel with the groups overlaid — the groups are read by comparing them, and that
+means having them side by side rather than in one file per channel.
+
+In the GUI the scenario surface is one **interactive** tab that renames itself after whichever
+scenario the run produced ("Recruitment curve" / "Jendrassik manoeuvre" / "Paired stimulation"),
+since the three are mutually exclusive. It is driven by the per-curve metrics and the saved epochs,
+not by the exported PNGs: pick a channel, click a point on the response-vs-curve plot (or drag the
+slider) to pull that curve up bold with its markers, switch the colouring between curve order and
+amplitude group, and read the group mean/SD table beside it.
+
+The **Crop review** tab also draws these files properly: its recruitment panel falls back to the
+curve number when the export carries no amplitude labels (previously it went blank), and the epoch
+stack is coloured by curve order with the mean dropped, the same as the exported panels.
+
+**Paired stimulation splits in two.** When the artifact position varies across curves the ISI is
+real and recoverable, and the run goes to the Condition-test analysis (waterfalls, amplitude vs ISI,
+persistence). Every tSCS `двойная стимуляция` export in the FCBRN dataset instead carries one
+artifact per curve fixed at t=0 — the interval simply is not in the file — so those fall back to the
+per-curve + amplitude-group deliverable and the log states why.
 
 ---
 
@@ -158,25 +204,46 @@ distorts the stereotyped peak shapes that detection relies on.
 
 ## Output
 
+By default results go **next to the recording, in a folder named `<subject> <file>`** —
+`(Ж14)/Th11-12.txt` → `(Ж14)/(Ж14) Th11-12/`. The subject prefix is the containing folder's name,
+which in this dataset is the subject code; it is redundant while you sit inside that folder and
+essential the moment you do not, since half the subjects have a `Th11-12.txt` and the results
+folders would otherwise be indistinguishable in the GUI's run list or once copied out. (The prefix
+is skipped when the file name already starts with it.) `--output-dir` overrides the whole thing.
+
+Two things keep the tree flat:
+
+- Directories are created **lazily**, as something is written into them. A SIR run no longer leaves
+  an empty `StartStop analysis/` tree behind (and vice versa), and a scenario that emits no
+  box-plots leaves no `Boxplots/` folder. An existing folder means that analysis actually ran.
+- The **`<mode>/` level is dropped when it would be the only one**. It exists to keep two analyses
+  apart inside one output root, and a run produces exactly one of them — so results land straight in
+  `results/`. The level comes back only if the root already holds a different analysis, where the
+  names would collide (both modes write `Excel/Large_dataset_emg_response_metrics.csv`). Readers
+  accept either layout, so older output roots still open.
+
 ```
 <output_root>/
-├── data/<mode folder>/          original + preprocessed .fif  (SIR also: annot_crops_fif/)
-└── results/
-    ├── Stimulation-induced responses/
-    │   ├── Stimulus-centered epochs/     <config>_<amp>-epo.fif
-    │   ├── Excel/                        per-epoch metrics + summary stats
-    │   ├── Plots with / without grid and markers/, Plots grouped by amplitude/
-    │   ├── Boxplots/, Templates/, Template overlays/
-    └── StartStop analysis/
-        ├── Excel/                        metrics, summary, and three diagnostic tables:
-        │                                 accepted anchors, discarded anchors + reason, channel QC
-        ├── Detections raw/               <condition>_detections_raw.fif — the recording with one
-        │                                 annotation per detection (channels merged: "ECR L+TR R")
-        ├── Raw epochs/, Plots …/, Boxplots/, Templates/
-        └── Spontaneous EMG/<condition>/
-            ├── Excel/                    summary, per-window detail, bursts, co-activation episodes
-            ├── Envelopes/                per-burst RMS envelopes (.txt)
-            └── Plots/                    overview with bursts, envelope overlays, L-shapes
+├── data/                        original + preprocessed .fif  (SIR also: annot_crops_fif/)
+└── results/                     ← one run: no mode folder. Mixed root: nested under
+    │                              Stimulation-induced responses/ | StartStop analysis/ |
+    │                              Condition test/
+    │  SIR:
+    ├── Stimulus-centered epochs/     <config>_<amp>-epo.fif
+    ├── Excel/                        per-epoch metrics + summary stats
+    ├── Plots with / without grid and markers/, Plots grouped by amplitude/
+    ├── Boxplots/, Templates/, Template overlays/
+    ├── Recruitment/ | Jendrassik/ | Paired stimulation/   (Neurosoft .txt: one of the three)
+    │  StartStop:
+    ├── Excel/                        metrics, summary, and three diagnostic tables:
+    │                                 accepted anchors, discarded anchors + reason, channel QC
+    ├── Detections raw/               <condition>_detections_raw.fif — the recording with one
+    │                                 annotation per detection (channels merged: "ECR L+TR R")
+    ├── Raw epochs/, Plots …/, Boxplots/, Templates/
+    └── Spontaneous EMG/<condition>/
+        ├── Excel/                    summary, per-window detail, bursts, co-activation episodes
+        ├── Envelopes/                per-burst RMS envelopes (.txt)
+        └── Plots/                    overview with bursts, envelope overlays, L-shapes
 ```
 
 Key files: `Excel/Large_dataset_emg_response_metrics.csv` (per-epoch metrics) and

@@ -23,7 +23,8 @@ from .widgets.settings_panel import SettingsPanel
 from .widgets.sir_viewer import SIRViewer
 from .widgets.spontaneous_viewer import SpontaneousViewer
 from .widgets.startstop_viewer import StartStopViewer
-from .widgets.plot_gallery import ConditionViewer, RecruitmentViewer
+from .widgets.plot_gallery import ConditionViewer
+from .widgets.scenario_viewer import ScenarioViewer
 
 MODES = [("Stimulation-induced (SIR)", "sir"), ("StartStop", "startstop"),
          ("Condition test", "condition")]
@@ -87,7 +88,7 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel(self.session)
         self.sir_viewer = SIRViewer(self.session)
         self.sir_viewer.rerun_requested.connect(self.run)
-        self.recruitment_viewer = RecruitmentViewer(self.session)
+        self.recruitment_viewer = ScenarioViewer(self.session)
         self.startstop_viewer = StartStopViewer(self.session)
         self.spontaneous_viewer = SpontaneousViewer(self.session)
         self.spontaneous_viewer.rerun_requested.connect(self.run)
@@ -170,8 +171,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.session.input_path = Path(path)
-        # Default next to the input, mirroring the pipeline's own convention.
-        self.session.output_dir = Path(path).parent / "results" / Path(path).stem
+        # Ask the pipeline itself where it would write, so the GUI and the CLI
+        # never disagree about the output location.
+        from src.pipeline import _default_output_root_for_input
+        self.session.output_dir = _default_output_root_for_input(Path(path))
         self.file_label.setText(str(path))
         self.run_btn.setEnabled(True)
         self._log(f"Loaded {path}")
@@ -205,6 +208,18 @@ class MainWindow(QMainWindow):
         self.session.set_mode(MODES[idx][1])
         self.settings_panel.rebuild()
         self._sync_tabs()
+
+    def _sync_scenario_tab(self) -> None:
+        """Name the scenario tab after the scenario this run actually produced.
+
+        The three Neurosoft protocols are mutually exclusive, so a tab labelled
+        "Recruitment" on a Jendrassik run is simply wrong; a non-Neurosoft SIR run
+        produces none of them and the tab goes back to its generic name.
+        """
+        from .widgets.scenario_viewer import SCENARIOS
+        folder = getattr(self.recruitment_viewer, "scenario", None)
+        label = SCENARIOS.get(folder, (None,))[0] if folder else None
+        self.tabs.setTabText(TAB_RECRUIT, label or "Recruitment")
 
     def _sync_tabs(self) -> None:
         """Grey out the surfaces the current mode cannot produce."""
@@ -291,7 +306,8 @@ class MainWindow(QMainWindow):
             if not results.ok:
                 self._log("No crops found — check the annotations.")
             self.sir_viewer.load(results)
-            self.recruitment_viewer.load(output_root)   # empty if this run had no recruitment
+            self.recruitment_viewer.load(output_root)   # empty if no Neurosoft scenario ran
+            self._sync_scenario_tab()
             self.tabs.setCurrentIndex(TAB_SIR)
         else:
             ss = StartStopResults(output_root)
@@ -380,8 +396,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "No results here",
                 f"{root}\n\ndoes not contain pipeline results.\n\n"
-                "Note that the pipeline creates both mode folders on every run, so an empty "
-                "'Stimulation-induced responses' folder does not mean SIR results exist.",
+                "Pick the run folder itself — the one holding 'results/'. Older runs may nest "
+                "their outputs under 'Stimulation-induced responses/' or 'StartStop analysis/'; "
+                "both layouts are read.",
             )
             return
 

@@ -21,8 +21,9 @@ from .text_curves import (
     text_curves_epochs,
     text_curves_window_defaults,
 )
-from .condition import is_condition_paradigm, run_condition_analysis
+from .condition import group_conditions, is_condition_paradigm, run_condition_analysis
 from .recruitment import run_recruitment_analysis
+from .jendrassik import run_curve_group_analysis
 from .constants import (
     ARTCHAN,
     ARTIFACT_REREF,
@@ -114,7 +115,15 @@ from .detection import (
     find_extra_p1_peak,
     pick_epoch_value_near_latency,
 )
-from .io_utils import build_output_dirs, list_crop_files
+from .io_utils import build_output_dirs, ensure_dir, list_crop_files
+from .neurosoft import (
+    JENDRASSIK,
+    PAIRED,
+    RECRUITMENT,
+    SCENARIO_LABELS,
+    detect_scenario,
+    intensities_from_name,
+)
 from .plotting import (
     amp_to_number,
     plot_boxplots,
@@ -1700,8 +1709,6 @@ def _run_startstop_analysis(
         "raw_epochs_dir": startstop_dir / "Raw epochs",
         "templates_dir": startstop_dir / "Templates",
     }
-    for p in paths.values():
-        p.mkdir(parents=True, exist_ok=True)
 
     group_store_by_condition = defaultdict(lambda: defaultdict(list))
     grouped_times = None
@@ -2454,7 +2461,7 @@ def _run_startstop_analysis(
                 ch_suffix = "+".join(safe_chs)
                 if len(ch_suffix) > 80:
                     ch_suffix = f"{ch_suffix[:77]}..."
-                out_path = raw_epochs_dir / f"epoch_{ep_idx:03d}__{ch_suffix}.png"
+                out_path = ensure_dir(raw_epochs_dir) / f"epoch_{ep_idx:03d}__{ch_suffix}.png"
                 fig = epochs_wide[wpos].plot(
                     picks=ch_names,
                     scalings={"eeg": scale} if scale is not None else None,
@@ -2505,6 +2512,8 @@ def _run_startstop_analysis(
         )
 
     print("[STARTSTOP] Writing outputs...", flush=True)
+    if template_match_rows or template_discard_rows or channel_template_rows or channel_qc_rows or all_results_rows:
+        ensure_dir(excel_dir)
     if template_match_rows:
         pd.DataFrame(template_match_rows).to_csv(
             excel_dir / "STARTSTOP_template_anchor_matches.csv", index=False
@@ -2643,16 +2652,20 @@ def _excel_safe_sheet_name(name: str) -> str:
 
 
 def _default_output_root_for_input(edf_path: Path) -> Path:
-    # Prefer placing outputs under a project-level results/ sibling of data/,
-    # even when input files live in nested data subfolders.
-    data_ancestor: Path | None = None
-    for parent in edf_path.resolve().parents:
-        if parent.name.lower() == "data":
-            data_ancestor = parent
-            break
-    if data_ancestor is not None:
-        return data_ancestor.parent / "results" / edf_path.stem
-    return edf_path.parent.parent / "results" / edf_path.stem
+    """Results live next to the recording, in a folder named ``<subject> <file>``.
+
+    ``(Ж14)/Th11-12.txt`` -> ``(Ж14)/(Ж14) Th11-12/``. The subject prefix comes
+    from the containing folder, which in this dataset is the subject code. It is
+    redundant while you sit inside that folder and essential the moment you do
+    not: half the subjects have a ``Th11-12.txt``, so the results folders are
+    indistinguishable once opened side by side in the GUI's run list, copied out,
+    or attached to anything. Pass ``--output-dir`` to put them elsewhere.
+    """
+    subject = edf_path.parent.name
+    stem = edf_path.stem
+    # Do not stutter when the file is already named after its subject.
+    name = stem if (not subject or stem.startswith(subject)) else f"{subject} {stem}"
+    return edf_path.parent / name
 
 
 def run_pipeline(
@@ -2757,6 +2770,8 @@ def run_pipeline(
     # sample 0 = trigger. There is no continuous recording to search for stimulus
     # artifacts in, so PASS1/PASS2 are fed these epochs directly (see below).
     pre_epoched: dict[str, mne.EpochsArray] | None = None
+    # Set for Neurosoft .txt exports only; gates which outputs the SIR path emits.
+    neurosoft_scenario: str | None = None
     if suffix == ".mat":
         raw = mat_blocks[0][1] if mat_blocks else _load_raw_from_mat(edf_path)
     elif suffix == ".fif":
@@ -2765,24 +2780,60 @@ def run_pipeline(
         ready = text_curves_epochs(edf_path)
         arr = ready.get_data()
         n_ep, n_ch, _ = arr.shape
-        # A moving stimulus artifact means a paired-pulse Condition test, not a
-        # single-shock recruitment file. Route it to its own analysis and return.
-        is_cond, cond_info = is_condition_paradigm(arr, float(ready.info["sfreq"]))
-        if not use_startstop and is_cond:
+        # Neurosoft exports come in three protocols that want three different
+        # deliverables (see src/neurosoft.py). Resolve which one this file is
+        # BEFORE any analysis, so each scenario only produces its own outputs.
+        neurosoft_scenario, scen_info = detect_scenario(
+            edf_path, data=arr, sfreq=float(ready.info["sfreq"])
+        )
+        print(
+            f"[NEUROSOFT] {edf_path.name}: "
+            f"{SCENARIO_LABELS[neurosoft_scenario]} (by {scen_info['reason']}) — "
+            f"{n_ep} curves x {n_ch} channels @ {ready.info['sfreq']:.0f} Hz",
+            flush=True,
+        )
+        if scen_info.get("conflict"):
             print(
-                f"[CONDITION] Text curves export: {n_ep} curves x {n_ch} channels "
-                f"@ {ready.info['sfreq']:.0f} Hz — moving artifact "
-                f"(spread {cond_info['spread_ms']:.0f} ms) -> Condition test.",
+                "[NEUROSOFT] WARNING: the name says "
+                f"{SCENARIO_LABELS[neurosoft_scenario]} but the stimulus artifact "
+                f"moves across curves (spread "
+                f"{scen_info['signal']['spread_ms']:.0f} ms), which looks like "
+                "paired stimulation. Going with the name.",
                 flush=True,
             )
-            build_output_dirs(output_root, startstop_mode=False)
-            run_condition_analysis(
-                arr, float(ready.info["sfreq"]), list(ready.ch_names),
-                output_root, info=cond_info,
+        # Paired stimulation splits in two, and only the signal can tell which:
+        #
+        #  - the inter-stimulus interval IS in the export (the artifact, and the
+        #    response with it, moves from curve to curve — the TMS-conditioning
+        #    files): group by real ISI in the Condition analysis and return.
+        #  - it is NOT (every tSCS "двойная стимуляция" export in this dataset:
+        #    one artifact per curve, fixed at t=0): there is no ISI axis to
+        #    recover, so the file stays on the fixed-t0 path and gets the same
+        #    per-curve + amplitude-group deliverable as the Jendrassik files.
+        if not use_startstop and neurosoft_scenario == PAIRED:
+            cond_info = scen_info.get("signal")
+            if cond_info is None:
+                _, cond_info = is_condition_paradigm(arr, float(ready.info["sfreq"]))
+            _, isi_labels = group_conditions(cond_info["positions_ms"])
+            if len(isi_labels) > 1:
+                print(
+                    f"[NEUROSOFT] {len(isi_labels)} inter-stimulus intervals in the "
+                    "artifact positions -> Condition test.",
+                    flush=True,
+                )
+                run_condition_analysis(
+                    arr, float(ready.info["sfreq"]), list(ready.ch_names),
+                    output_root, info=cond_info,
+                )
+                if old_mne_log_level is not None:
+                    mne.set_log_level(old_mne_log_level)
+                return output_root
+            print(
+                "[NEUROSOFT] One stimulus artifact per curve at a fixed latency — "
+                "the export does not carry the inter-stimulus interval. Falling "
+                "back to per-curve figures + amplitude groups (no ISI axis).",
+                flush=True,
             )
-            if old_mne_log_level is not None:
-                mne.set_log_level(old_mne_log_level)
-            return output_root
         pre_epoched = {text_curves_crop_name(edf_path): ready}
         print(
             f"[SIR] Text curves export: {n_ep} pre-cut epochs x {n_ch} channels "
@@ -2797,7 +2848,7 @@ def run_pipeline(
     else:
         raw = mne.io.read_raw_edf(edf_path, preload=True)
 
-    original_fif_path = paths["data_dir"] / f"{edf_path.stem}_original_raw.fif"
+    original_fif_path = ensure_dir(paths["data_dir"]) / f"{edf_path.stem}_original_raw.fif"
     raw.save(original_fif_path, overwrite=True)
     # StartStop detection does not need a stimulus/artifact channel (template
     # matching runs directly on the EMG). Allow art-less recordings there; SIR
@@ -2839,7 +2890,7 @@ def run_pipeline(
     if CAR_REREF and default_art_chans:
         _apply_car_reref(raw, default_art_chans)
 
-    preproc_path = paths["data_dir"] / f"{edf_path.stem}_preprocessed_raw.fif"
+    preproc_path = ensure_dir(paths["data_dir"]) / f"{edf_path.stem}_preprocessed_raw.fif"
     raw.save(preproc_path, overwrite=True)
 
     if use_startstop:
@@ -3137,8 +3188,14 @@ def run_pipeline(
                             onset=m["onset"], p1=m["p1"], p2=m["p2"],
                         )
 
+    # Template figures/overlays are detection diagnostics keyed on "one crop per
+    # stimulation amplitude". A Neurosoft export is a single crop whose curves
+    # ARE the amplitude axis, so every one of those panels collapses to a copy of
+    # the same waveform. Skip them; the scenario deliverables carry the result.
+    emit_sir_diagnostics = neurosoft_scenario is None
+
     # ── Save template figures ──
-    for configuration, ch_dict in config_templates.items():
+    for configuration, ch_dict in (config_templates.items() if emit_sir_diagnostics else []):
         times = config_meta[configuration]["times"]
         for ch_name, template in ch_dict.items():
             if template is None or ch_name in default_art_set:
@@ -3157,8 +3214,7 @@ def run_pipeline(
 
     # ── Save template overlay panels (mean waveform + template per config) ──
     overlay_dir = paths["stim_results_dir"] / "Template overlays"
-    overlay_dir.mkdir(parents=True, exist_ok=True)
-    for configuration in config_templates:
+    for configuration in (config_templates if emit_sir_diagnostics else []):
         times = config_meta[configuration]["times"]
         ch_waves = config_waveforms[configuration]
         ch_means: dict[str, np.ndarray] = {}
@@ -3184,9 +3240,8 @@ def run_pipeline(
         )
 
     # ── Per-amplitude overlay panels ──
-    if SIR_TEMPLATE_PER_AMPLITUDE:
+    if SIR_TEMPLATE_PER_AMPLITUDE and emit_sir_diagnostics:
         amp_overlay_dir = paths["stim_results_dir"] / "Template overlays per amplitude"
-        amp_overlay_dir.mkdir(parents=True, exist_ok=True)
         for (configuration, amp_str), ch_tmpls in amp_templates.items():
             times = config_meta[configuration]["times"]
             ch_means_amp: dict[str, np.ndarray] = {}
@@ -3269,6 +3324,7 @@ def run_pipeline(
             )
             panel_ch_names = list(raw_file.info["ch_names"])
 
+        ensure_dir(epochs_dir)
         epochs.save(epochs_dir / f"{file_name.split('.fif')[0]}-epo.fif", overwrite=True)
 
         epochs_array = epochs.get_data()
@@ -3685,27 +3741,41 @@ def run_pipeline(
                 results["Time series"].append(e["sig"])
 
         base_name = file_name.split(".fif")[0]
+        # Neurosoft curves are single stimuli of growing intensity, so the panel
+        # colours them by position in the sweep instead of drawing an average
+        # over them (see plot_epochs_panel).
+        panel_title = base_name
+        if neurosoft_scenario is not None:
+            panel_title = f"{base_name} — {SCENARIO_LABELS[neurosoft_scenario]}"
         plot_epochs_panel(
             data_epoched=data_epoched, times=times,
             ch_names=panel_ch_names, epochs_ch_names=epochs.ch_names,
             art_chans=art_set, latency_markers=latency_markers,
-            title=base_name, out_path=plots_grid_dir / f"{base_name}.png",
+            title=panel_title, out_path=plots_grid_dir / f"{base_name}.png",
             show_grid=True, show_markers=True,
+            color_by_order=neurosoft_scenario is not None,
+            ylim_from=resp_tmin if neurosoft_scenario is not None else None,
         )
         plot_epochs_panel(
             data_epoched=data_epoched, times=times,
             ch_names=panel_ch_names, epochs_ch_names=epochs.ch_names,
             art_chans=art_set, latency_markers=latency_markers,
-            title=base_name, out_path=plots_plain_dir / f"{base_name}.png",
+            title=panel_title, out_path=plots_plain_dir / f"{base_name}.png",
             show_grid=False, show_markers=False,
+            color_by_order=neurosoft_scenario is not None,
+            ylim_from=resp_tmin if neurosoft_scenario is not None else None,
         )
 
     # ── Write outputs ──
     print("[SIR] Writing outputs...", flush=True)
     df_results = pd.DataFrame(results)
+    ensure_dir(excel_dir)
     df_results.to_csv(excel_dir / "Large_dataset_emg_response_metrics.csv", index=False)
 
-    if group_store:
+    # "Grouped by amplitude" averages the epochs within each crop — for a
+    # Neurosoft export that is one mean over the whole sweep, i.e. exactly the
+    # averaging that hides the recruitment. Skip it there.
+    if group_store and emit_sir_diagnostics:
         plot_grouped_by_amplitude(group_store, times, plots_grouped_dir, default_art_set)
 
     metrics = [
@@ -3773,16 +3843,41 @@ def run_pipeline(
             sheet_name = _excel_safe_sheet_name(config)
             dfc.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    plot_boxplots(df, boxplot_dir)
+    # These box-plots split the metrics BY stimulation amplitude, which a
+    # Neurosoft export does not have (it is one crop). Each scenario emits its
+    # own grouping instead — by curve for recruitment, by amplitude group for
+    # the Jendrassik manoeuvre.
+    if emit_sir_diagnostics:
+        plot_boxplots(df, boxplot_dir)
 
-    # Text ``curves`` exports are recruitment sweeps (one curve per stimulus,
-    # response grows across curves). Emit per-curve recruitment tables/plots and
-    # the top-N / amplitude-group box-plots from the per-epoch metrics.
-    if pre_epoched is not None:
+    # ── Scenario deliverables (Neurosoft .txt exports only) ──
+    if neurosoft_scenario == RECRUITMENT:
         try:
             run_recruitment_analysis(output_root)
         except Exception as exc:   # never let the extra step fail the whole run
             print(f"[RECRUITMENT] skipped ({type(exc).__name__}: {exc})", flush=True)
+    elif neurosoft_scenario in (JENDRASSIK, PAIRED):
+        # Same deliverable for both: the curves themselves plus amplitude groups
+        # with their means and spreads.
+        #
+        # How many groups to look for comes from the file name. At one intensity
+        # the run is a block of plain test stimuli and a block with the manoeuvre
+        # -> two response levels. A name that says "80 и 90 мА" means that pair
+        # was run at each of two intensities -> four. Nothing in the export
+        # itself records the current, so the name is the only source.
+        intensities = intensities_from_name(edf_path)
+        n_groups = 2 * max(len(intensities), 1)
+        if intensities:
+            print(
+                f"[NEUROSOFT] intensities in the name: "
+                f"{', '.join(f'{v} mA' for v in intensities)} -> "
+                f"looking for {n_groups} amplitude groups.",
+                flush=True,
+            )
+        try:
+            run_curve_group_analysis(output_root, neurosoft_scenario, n_groups)
+        except Exception as exc:
+            print(f"[{neurosoft_scenario.upper()}] skipped ({type(exc).__name__}: {exc})", flush=True)
 
     if old_mne_log_level is not None:
         mne.set_log_level(old_mne_log_level)

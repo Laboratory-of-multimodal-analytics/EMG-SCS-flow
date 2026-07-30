@@ -15,6 +15,14 @@ matplotlib.use("Agg")
 
 _AMP_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
+#: Colour ramp for a stimulation sweep: the LATER the curve, the DARKER it is.
+#: Reversed viridis, whose lightness is monotone, so "later" reads as "darker"
+#: at a glance. The lightest end is trimmed off — pure viridis yellow is close
+#: to invisible on white at hairline widths.
+SWEEP_CMAP = matplotlib.colors.LinearSegmentedColormap.from_list(
+    "sweep_late_dark", matplotlib.colormaps["viridis_r"](np.linspace(0.10, 1.0, 256))
+)
+
 
 def amp_to_number(amp) -> float:
     if amp is None or (isinstance(amp, float) and np.isnan(amp)):
@@ -48,29 +56,70 @@ def plot_epochs_panel(
     show_grid: bool = True,
     show_markers: bool = True,
     epochs_to_plot: dict[str, list[int]] | None = None,
+    color_by_order: bool = False,
+    order_label: str = "curve #",
+    ylim_from: float | None = None,
 ) -> None:
+    """Per-channel panel of the epochs in one crop.
+
+    Default (continuous recordings): grey epochs with their black mean on top —
+    the mean is the result, the epochs are context.
+
+    ``color_by_order=True`` (Neurosoft curve exports): the curves are ALREADY the
+    result — each one is a single stimulus of growing intensity, so averaging
+    them destroys exactly the effect under study. The mean line is dropped and
+    each curve is instead coloured by its position in the sweep (light = first /
+    weakest, dark = last / strongest), which is how the growth of the response
+    is meant to be read off the panel.
+
+    ``ylim_from`` (seconds) scales each channel's y-axis to the data AFTER that
+    time. In these exports the stimulus artifact reaches ±10 mV against muscle
+    responses of ~0.1 mV, so an axis fitted to the whole epoch flattens the
+    response into the zero line. The artifact is simply allowed off-scale.
+    """
     n_channels = len(ch_names)
-    fig, axes = plt.subplots(n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=500)
+    # Constrained layout in colour mode: it is the only engine that places a
+    # figure-level colourbar and the per-axes titles without them colliding.
+    fig, axes = plt.subplots(
+        n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=500,
+        layout="constrained" if color_by_order else None,
+    )
     if n_channels == 1:
         axes = [axes]
+
+    cmap = SWEEP_CMAP
+    norm = None
+    if color_by_order and data_epoched.shape[0] > 0:
+        norm = matplotlib.colors.Normalize(vmin=1, vmax=max(data_epoched.shape[0], 2))
 
     for i, ch in enumerate(ch_names):
         ax = axes[i]
         ch_idx = epochs_ch_names.index(ch)
         ch_data = data_epoched[:, ch_idx, :]
+        # Row j of ch_data belongs to this epoch index (identity unless a subset
+        # was requested); needed so the colour tracks the curve's real position.
+        row_order = list(range(data_epoched.shape[0]))
         idx_map = None
         if epochs_to_plot is not None:
             keep = epochs_to_plot.get(ch, [])
             if keep:
                 idx_map = {ep_idx: i for i, ep_idx in enumerate(keep)}
                 ch_data = ch_data[keep, :]
+                row_order = list(keep)
             else:
                 ch_data = None
 
         if ch_data is not None:
-            ax.plot(times, ch_data.T * 1e6, color="gray", alpha=0.7, linewidth=0.7)
-            avg = ch_data.mean(axis=0)
-            ax.plot(times, avg * 1e6, color="black", linewidth=2)
+            if color_by_order and norm is not None:
+                for row, ep_idx in enumerate(row_order):
+                    ax.plot(
+                        times, ch_data[row] * 1e6,
+                        color=cmap(norm(ep_idx + 1)), linewidth=0.8, alpha=0.9,
+                    )
+            else:
+                ax.plot(times, ch_data.T * 1e6, color="gray", alpha=0.7, linewidth=0.7)
+                avg = ch_data.mean(axis=0)
+                ax.plot(times, avg * 1e6, color="black", linewidth=2)
 
         if show_markers and (ch not in art_chans):
             for entry in latency_markers[ch]:
@@ -97,13 +146,28 @@ def plot_epochs_panel(
                     p2_idx = np.argmin(np.abs(times - p2))
                     ax.scatter(p2, ch_data[ep_idx, p2_idx] * 1e6, color="green", s=18)
 
+        if ylim_from is not None and ch_data is not None and ch_data.size:
+            post = ch_data[:, np.asarray(times) >= ylim_from] * 1e6
+            if post.size and np.isfinite(post).any():
+                lo, hi = float(np.nanmin(post)), float(np.nanmax(post))
+                pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.1
+                ax.set_ylim(lo - pad, hi + pad)
+
         ax.set_ylabel("Amplitude (mkV)")
         ax.grid(bool(show_grid) if ch_data is not None else False)
         ax.set_title(ch)
 
     axes[-1].set_xlabel("Time (s)")
     plt.suptitle(title)
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    if color_by_order and norm is not None:
+        # One shared colourbar for the whole panel: it is the legend that makes
+        # the colours readable as "stimulus strength grows this way". Added
+        # BEFORE tight_layout so the label is laid out with everything else.
+        sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = fig.colorbar(sm, ax=list(axes), fraction=0.015, pad=0.02)
+        cbar.set_label(order_label)
+    else:
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path)
     plt.close(fig)

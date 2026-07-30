@@ -1,8 +1,9 @@
 """Read-only gallery for PNG plots + CSV tables the pipeline wrote.
 
-Used by the Condition-test and Recruitment result surfaces: both are just folders
-of PNGs and CSVs, so they share one widget. The GUI never recomputes anything —
-it renders exactly what the scripted run produced (same as the other viewers).
+Used by the Condition-test surface, which is a folder of PNGs and CSVs. The
+Neurosoft scenarios moved off this widget onto an interactive surface
+(widgets/scenario_viewer.py) — browsing finished images is fine for a
+per-condition waterfall, but not for picking curves out of a sweep.
 """
 
 from __future__ import annotations
@@ -157,27 +158,11 @@ class ConditionViewer(QWidget):
         lay.addWidget(self.gallery)
 
     def load(self, root: Path) -> None:
-        base = Path(root) / "results" / "Condition test"
+        from ..results import COND_DIR, mode_dir
+        base = mode_dir(Path(root), COND_DIR)
         self.gallery.set_sections([
             ("Amplitude vs condition", _images(base / "Amplitude vs condition")),
+            ("Curves per condition", _images(base / "Curves per condition")),
             ("Waterfall", _images(base / "Waterfall")),
-            ("Tables (Excel)", _csvs(base / "Excel")),
-        ])
-
-
-class RecruitmentViewer(QWidget):
-    """Per-curve recruitment outputs for single-shock text files."""
-
-    def __init__(self, session=None) -> None:
-        super().__init__()
-        self.gallery = ResultsGallery()
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.gallery)
-
-    def load(self, root: Path) -> None:
-        base = Path(root) / "results" / "Stimulation-induced responses" / "Recruitment"
-        self.gallery.set_sections([
-            ("Plots", _images(base)),
             ("Tables (Excel)", _csvs(base / "Excel")),
         ])

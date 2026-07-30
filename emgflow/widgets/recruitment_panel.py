@@ -4,6 +4,11 @@ Response size (peak-to-peak, µV) against stimulation amplitude, one line per ch
 a 95 % CI band across the epochs of each crop. A single-trial point gets no band — a
 zero-width ribbon is the honest rendering, not a fabricated interval.
 
+Neurosoft curve exports have no amplitude axis to plot against — the file is one crop and
+its amplitude label is the synthetic ``all``. There the ramp IS the curve order, so the
+panel switches its x-axis to the curve number rather than going blank. It is the same
+recruitment curve; only the units of the x-axis are unknown.
+
 The pipeline still writes its own summary tables; this is for looking, not for archiving.
 """
 
@@ -20,10 +25,12 @@ class RecruitmentPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.df = None
+        self.by_curve = None
         self.highlight: str | None = None
 
-        title = QLabel("<b>Recruitment</b> — peak-to-peak vs amplitude, mean ± 95 % CI")
-        title.setStyleSheet("font-size: 11px;")
+        self.title = QLabel("<b>Recruitment</b> — peak-to-peak vs amplitude, mean ± 95 % CI")
+        self.title.setStyleSheet("font-size: 11px;")
+        title = self.title
 
         self.fig = Figure(figsize=(5, 3), layout="constrained")
         self.canvas = FigureCanvasQTAgg(self.fig)
@@ -34,8 +41,12 @@ class RecruitmentPanel(QWidget):
         layout.addWidget(self.canvas, 1)
 
     # ------------------------------------------------------------------ #
-    def show_config(self, df, config: str, highlight: str | None = None) -> None:
+    def show_config(self, df, config: str, highlight: str | None = None,
+                    by_curve=None) -> None:
+        """*df* is amplitude-keyed; *by_curve* is the per-curve fallback used when
+        the file carries no amplitude axis (Neurosoft exports)."""
         self.df = df
+        self.by_curve = by_curve
         self.config = config
         self.highlight = highlight
         self._draw()
@@ -49,19 +60,16 @@ class RecruitmentPanel(QWidget):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
         df = self.df
-        if df is None or len(df) == 0:
-            ax.text(0.5, 0.5, "No recruitment data for this configuration.",
-                    ha="center", va="center", color="gray")
-            ax.set_axis_off()
-            self.canvas.draw_idle()
-            return
+        if df is not None and len(df) and "amp_value" in df:
+            usable = df[np.isfinite(df["amp_value"])]
+        else:
+            usable = None
 
-        usable = df[np.isfinite(df["amp_value"])]
-        if usable.empty:
-            ax.text(0.5, 0.5, "Amplitude labels are not numeric — no curve can be drawn.",
-                    ha="center", va="center", color="gray")
-            ax.set_axis_off()
-            self.canvas.draw_idle()
+        # Fewer than two numeric amplitudes means there is no amplitude axis to
+        # draw — one crop, or non-numeric labels. The curve order is the ramp for
+        # those files, so plot against that instead of going blank.
+        if usable is None or usable["amp_value"].nunique() < 2:
+            self._draw_by_curve(ax)
             return
 
         channels = sorted(usable["Channel"].unique())
@@ -79,8 +87,43 @@ class RecruitmentPanel(QWidget):
             ax.fill_between(x, y - ci, y + ci, color=col,
                             alpha=0.22 if focused else 0.06, lw=0, zorder=1)
 
+        self.title.setText("<b>Recruitment</b> — peak-to-peak vs amplitude, mean ± 95 % CI")
         ax.set_ylabel("peak-to-peak (µV)")
         ax.set_xlabel("stimulation amplitude")
+        ax.set_title(f"{self.config}", fontsize=10)
+        ax.grid(True, color="0.92", lw=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        if channels:
+            ax.legend(fontsize=7, ncol=2, frameon=False)
+        self.canvas.draw_idle()
+
+    def _draw_by_curve(self, ax) -> None:
+        """Response size against curve number — the ramp when amplitudes are unknown."""
+        bc = self.by_curve
+        if bc is None or len(bc) == 0:
+            ax.text(0.5, 0.5, "No recruitment data for this configuration.",
+                    ha="center", va="center", color="gray")
+            ax.set_axis_off()
+            self.canvas.draw_idle()
+            return
+
+        self.title.setText(
+            "<b>Recruitment</b> — response vs curve number "
+            "(this export carries no amplitude labels)"
+        )
+        channels = sorted(bc["Channel"].unique(), key=lambda s: (len(s), s))
+        colors = plt.get_cmap("tab10")
+        for i, ch in enumerate(channels):
+            g = bc[bc["Channel"] == ch].sort_values("curve")
+            focused = (self.highlight is None) or (ch == self.highlight)
+            ax.plot(g["curve"], g["amp_uv"], "-o", ms=3,
+                    lw=1.8 if focused else 0.9, color=colors(i % 10),
+                    alpha=1.0 if focused else 0.25, label=ch,
+                    zorder=3 if focused else 2)
+
+        ax.set_ylabel("response (µV)")
+        ax.set_xlabel("curve number")
         ax.set_title(f"{self.config}", fontsize=10)
         ax.grid(True, color="0.92", lw=0.6)
         for side in ("top", "right"):
