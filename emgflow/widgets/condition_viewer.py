@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from src.condition import load_overrides, save_overrides
+from src.condition import load_overrides, recompute_channel, save_overrides
 
 from ..results import COND_DIR, mode_dir
 from ..templates import build_template
@@ -139,8 +139,15 @@ class ConditionViewer(QWidget):
         self.btn_reject.clicked.connect(self._toggle_reject)
         self.btn_clear = QPushButton("Снять правку")
         self.btn_clear.clicked.connect(self._clear_override)
-        self.btn_rerun = QPushButton("Пересчитать с правками")
-        self.btn_rerun.clicked.connect(self.rerun_requested)
+        # Local: the correction touches one channel, and everything needed to
+        # redo it is already saved, so re-parsing the raw export would be minutes
+        # of work to answer a question about one trace.
+        self.btn_rerun = QPushButton("Пересчитать канал")
+        self.btn_rerun.setToolTip(
+            "Пересчитывает только текущий канал из сохранённых кривых.\n"
+            "Исходный файл не перечитывается."
+        )
+        self.btn_rerun.clicked.connect(self._recompute)
         self.ov_label = QLabel("правок нет")
         self.ov_label.setStyleSheet("color: gray; font-size: 10px;")
         self.ov_label.setWordWrap(True)
@@ -548,6 +555,24 @@ class ConditionViewer(QWidget):
         self.btn_window.setEnabled(False)
         self.btn_window.setText("Задать окно ответа")
         self._save_overrides()
+
+    def _recompute(self) -> None:
+        if not self.channel or self.root is None:
+            return
+        ch = self.channel
+        try:
+            info = recompute_channel(self.root, ch)
+        except Exception as exc:
+            self.ov_label.setText(f"<span style='color:#b00'>Не удалось пересчитать: {exc}</span>")
+            return
+        self.load(self.root)                     # re-read the updated tables and arrays
+        rows = [self.channel_list.item(i).text() for i in range(self.channel_list.count())]
+        if ch in rows:
+            self.channel_list.setCurrentRow(rows.index(ch))
+        self.ov_label.setText(
+            f"<b>{ch}</b> пересчитан · источник: {info['source']} · "
+            f"P1 {info['p1_ms']} мс · с ответом {info['n_present']} из {info['n_curves']}"
+        )
 
     def _save_overrides(self) -> None:
         save_overrides(self.root, self.overrides)

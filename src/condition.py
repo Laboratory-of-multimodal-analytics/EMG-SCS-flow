@@ -866,3 +866,134 @@ def run_condition_analysis(
     pd.DataFrame(summary_rows).to_csv(excel_dir / "condition_summary.csv", index=False)
     print(f"[CONDITION] Outputs written under {out_dir}", flush=True)
     return out_dir
+
+
+# --------------------------------------------------------------------------- #
+# Local recompute
+# --------------------------------------------------------------------------- #
+def recompute_channel(output_root: Path, channel: str) -> dict:
+    """Redo ONE channel from the arrays the run already saved.
+
+    A manual correction changes one channel, and re-running the pipeline to see
+    it means re-parsing a 30 MB text export and redoing every other channel —
+    minutes of work to answer a question about one trace. Everything needed is
+    already on disk: the artifact-aligned curves, their condition labels and the
+    time axis. So the correction is applied here, the channel's rows in both
+    tables are replaced, its figures are redrawn, and the three all-channel
+    figures are rebuilt from the updated tables.
+
+    Returns a small summary of what changed.
+    """
+    output_root = Path(output_root)
+    base, _ = resolve_mode_dirs(output_root, CONDITION_FOLDER)
+    arr, excel = base / "arrays", base / "Excel"
+    aligned_p = arr / f"{channel}_curves_aligned.npy"
+    if not aligned_p.exists():
+        raise FileNotFoundError(f"No saved curves for {channel} — run the file once first.")
+
+    aligned = np.load(aligned_p)
+    tw_ms = np.load(arr / "times_ms.npy")
+    tw_s = tw_ms / 1e3
+    labels = [float(v) for v in np.load(arr / "condition_labels.npy")]
+    curve_cond = np.load(arr / "curve_condition.npy")
+    sfreq = _sf(tw_s)
+
+    segs_by_lab, per_cond_mean = {}, {}
+    for lab in labels:
+        idx = np.where(curve_cond == lab)[0]
+        segs = [aligned[k] for k in idx if k < len(aligned)]
+        segs_by_lab[lab] = (idx, segs)
+        per_cond_mean[lab] = np.nanmean(segs, axis=0) if segs else np.full(aligned.shape[1], np.nan)
+
+    ov = load_overrides(output_root).get(channel, {})
+    if ov.get("reject"):
+        match, source = None, "отклонён вручную"
+    elif ov.get("window_ms"):
+        match = _manual_match(per_cond_mean, labels, tw_s, ov["window_ms"], ov.get("markers_ms"))
+        source = ("маркеры вручную" if (match and ov.get("markers_ms"))
+                  else "окно вручную" if match else "окно вручную (не удалось)")
+    else:
+        bank = _load_bank()
+        match = _match_channel_template(per_cond_mean, labels, tw_s, sfreq, bank) if bank else None
+        source = "банк"
+
+    resp_mask = (tw_s >= CONDITION_DET_TMIN) & (tw_s <= CONDITION_DET_TMAX)
+    on_ms = round(float(match["onset"]) * 1e3, 2) if match and np.isfinite(match["onset"]) else np.nan
+    p1_ms = round(float(match["p1"]) * 1e3, 2) if match else np.nan
+    p2_ms = round(float(match["p2"]) * 1e3, 2) if match and np.isfinite(match["p2"]) else np.nan
+
+    per_rows, sum_rows, present_map = [], [], {}
+    amp_mean, amp_se, persistence, box = [], [], [], []
+    for lab in labels:
+        idx, segs = segs_by_lab[lab]
+        amps, flags = [], []
+        for k, seg in zip(idx, segs):
+            a, present = (0.0, False) if match is None else _curve_amplitude(seg, tw_s, match, resp_mask)
+            amps.append(a); flags.append(present); present_map[int(k)] = bool(present)
+            per_rows.append({"Channel": channel, "Curve": int(k) + 1,
+                             "Condition (ISI ms)": ("control" if lab == 0 else lab),
+                             "Artifact ms": np.nan, "Amplitude uV": round(float(a), 4),
+                             "Response present": bool(present)})
+        a = np.array(amps, dtype=float)
+        m = float(a.mean()) if a.size else np.nan
+        se = float(a.std(ddof=1) / np.sqrt(a.size)) if a.size > 1 else 0.0
+        amp_mean.append(m); amp_se.append(se)
+        persistence.append(float(np.mean(flags)) if flags else 0.0); box.append(a)
+        sum_rows.append({"Channel": channel, "Condition (ISI ms)": ("control" if lab == 0 else lab),
+                         "N": len(idx), "N with response": int(np.sum(flags)),
+                         "Persistence": round(float(np.mean(flags)) if flags else 0.0, 3),
+                         "Amplitude mean uV": round(m, 4) if np.isfinite(m) else np.nan,
+                         "Amplitude SE uV": round(se, 4),
+                         "Template": (match["name"] if match else None),
+                         "Template corr": (round(float(match["corr"]), 3)
+                                           if match and np.isfinite(match.get("corr", np.nan)) else np.nan),
+                         "Источник шаблона": source,
+                         "Onset ms": on_ms, "P1 ms": p1_ms, "P2 ms": p2_ms})
+
+    def _replace(path: Path, rows: list[dict]) -> pd.DataFrame:
+        df = pd.read_csv(path)
+        keep = df[df["Channel"].astype(str) != channel]
+        # Artifact ms is not recoverable per curve here; keep whatever was there.
+        new = pd.DataFrame(rows)
+        if "Artifact ms" in df.columns and "Artifact ms" in new.columns:
+            old = df[df["Channel"].astype(str) == channel][["Curve", "Artifact ms"]]
+            new = new.drop(columns=["Artifact ms"]).merge(old, on="Curve", how="left")
+        out = pd.concat([keep, new[df.columns.intersection(new.columns)]], ignore_index=True)
+        out.to_csv(path, index=False)
+        return out
+
+    _replace(excel / "condition_amplitudes_per_curve.csv", per_rows)
+    summary = _replace(excel / "condition_summary.csv", sum_rows)
+
+    np.save(arr / f"{channel}_markers_ms.npy", np.array([on_ms, p1_ms, p2_ms], dtype=float))
+    np.save(arr / f"{channel}_present.npy",
+            np.array([present_map.get(k, False) for k in range(len(aligned))], dtype=bool))
+
+    _plot_curves_per_condition(segs_by_lab, tw_ms, labels, channel,
+                               base / "Curves per condition" / f"{channel}_curves.png",
+                               markers_ms=(on_ms, p1_ms, p2_ms), present_by_curve=present_map)
+    _plot_waterfall(per_cond_mean, tw_ms, labels, channel,
+                    base / "Waterfall" / f"{channel}_by_artifact.png",
+                    CONDITION_RESP_LO * 1e3, CONDITION_RESP_HI * 1e3,
+                    markers_ms=(on_ms, p1_ms, p2_ms))
+
+    # All-channel figures, rebuilt from the tables so every channel stays in step.
+    per_all = pd.read_csv(excel / "condition_amplitudes_per_curve.csv")
+    chans = sorted(summary["Channel"].astype(str).unique(), key=lambda s: (len(s), s))
+    key = lambda v: 0.0 if str(v) == "control" else float(v)
+    amp_by, box_by, pers_by = {}, {}, {}
+    for ch in chans:
+        g = summary[summary["Channel"].astype(str) == ch].copy()
+        g = g.assign(_k=g["Condition (ISI ms)"].map(key)).sort_values("_k")
+        amp_by[ch] = (g["Amplitude mean uV"].tolist(), g["Amplitude SE uV"].tolist())
+        pers_by[ch] = g["Persistence"].tolist()
+        p = per_all[per_all["Channel"].astype(str) == ch]
+        box_by[ch] = [p.loc[p["Condition (ISI ms)"].map(key) == l, "Amplitude uV"].to_numpy(float)
+                      for l in labels]
+    amp_dir = base / "Amplitude vs condition"
+    _plot_amp_vs_condition_grid(labels, amp_by, amp_dir / "amplitude_vs_condition_all_channels.png")
+    _plot_boxplots_grid(labels, box_by, amp_dir / "amplitude_boxplots_all_channels.png")
+    _plot_persistence_grid(labels, pers_by, amp_dir / "persistence_vs_condition_all_channels.png")
+
+    return {"channel": channel, "source": source, "onset_ms": on_ms, "p1_ms": p1_ms,
+            "p2_ms": p2_ms, "n_present": int(sum(present_map.values())), "n_curves": len(aligned)}
