@@ -470,7 +470,7 @@ def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path,
             ok = present_by_curve.get(int(k), True)
             ax.plot(tw_ms, w, color=("0.55" if ok else "#7b3294"),
                     lw=0.6 if ok else 0.7, alpha=0.6 if ok else 0.9,
-                    label=None if ok else "свип без ответа")
+                    label=None if ok else "кривая без ответа")
         if markers_ms is not None:
             for t_ms, col in zip(markers_ms, ("tab:blue", "tab:red", "tab:green")):
                 if t_ms is not None and np.isfinite(t_ms):
@@ -556,7 +556,7 @@ def _plot_persistence_grid(labels, persist_by_channel, out_path):
         axes[j // ncol][j % ncol].axis("off")
     for ax in axes[-1]:
         ax.set_xlabel("condition (ISI, мс)")
-    fig.suptitle("Persistence: доля свипов с ответом по condition", fontsize=12)
+    fig.suptitle("Persistence: доля кривых с ответом по condition", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)

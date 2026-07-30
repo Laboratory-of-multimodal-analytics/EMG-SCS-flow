@@ -44,14 +44,19 @@ SELECTED_COLOR = "#d73027"
 ABSENT_COLOR = "#7b3294"
 
 
-def _plural_sweeps(n: int) -> str:
-    """1 свип / 2 свипа / 5 свипов — the label sits in a title, so it has to read."""
+def _plural_curves(n: int) -> str:
+    """1 кривая / 2 кривые / 5 кривых.
+
+    "Кривая", not "свип": it is the word the station itself uses ("количество
+    кривых в файле") and the one the clinicians use, so the labels match what
+    they already read on the machine.
+    """
     n10, n100 = n % 10, n % 100
     if n10 == 1 and n100 != 11:
-        return f"{n} свип"
+        return f"{n} кривая"
     if n10 in (2, 3, 4) and n100 not in (12, 13, 14):
-        return f"{n} свипа"
-    return f"{n} свипов"
+        return f"{n} кривые"
+    return f"{n} кривых"
 
 
 def _fmt(lab: float) -> str:
@@ -90,7 +95,7 @@ class ConditionViewer(QWidget):
         self.cond_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.cond_list.currentRowChanged.connect(self._on_condition)
 
-        self.show_sweeps = QCheckBox("отдельные свипы")
+        self.show_sweeps = QCheckBox("отдельные кривые")
         self.show_sweeps.setChecked(True)
         self.show_sweeps.toggled.connect(lambda _: self._draw())
         self.show_control = QCheckBox("наложить control")
@@ -99,7 +104,7 @@ class ConditionViewer(QWidget):
         self.show_markers = QCheckBox("маркеры onset/P1/P2")
         self.show_markers.setChecked(True)
         self.show_markers.toggled.connect(lambda _: self._draw())
-        self.mark_absent = QCheckBox("красным — свипы без ответа")
+        self.mark_absent = QCheckBox("выделять кривые без ответа")
         self.mark_absent.setChecked(True)
         self.mark_absent.toggled.connect(lambda _: self._draw())
         # Off = real recording time, which is where the travel of the response
@@ -343,7 +348,7 @@ class ConditionViewer(QWidget):
                 ax.plot(t, aligned[k], color=ABSENT_COLOR if flag else "0.6",
                         lw=0.7 if flag else 0.6, alpha=0.9 if flag else 0.55,
                         zorder=2 if flag else 1,
-                        label="свип без ответа" if (flag and n_abs == 1) else None)
+                        label="кривая без ответа" if (flag and n_abs == 1) else None)
         if self.show_control.isChecked() and 0.0 in self.labels:
             ci = self.labels.index(0.0)
             ax.plot(t, means[ci], color="0.35", lw=1.4, ls="--", zorder=3, label="control")
@@ -367,8 +372,8 @@ class ConditionViewer(QWidget):
             ax.set_ylim(lo - pad, hi + pad)
         ax.set_xlabel("мс относительно артефакта")
         ax.set_ylabel("мВ")
-        extra = f" · {_plural_sweeps(n_abs)} без ответа" if n_abs else ""
-        ax.set_title(f"{ch} — {_fmt(self.selected)}: свипы и среднее, control пунктиром{extra}",
+        extra = f" · {_plural_curves(n_abs)} без ответа" if n_abs else ""
+        ax.set_title(f"{ch} — {_fmt(self.selected)}: кривые и среднее, control пунктиром{extra}",
                      fontsize=10, loc="left")
         ax.grid(True, color="0.92", lw=0.6)
         ax.legend(fontsize=7, frameon=False)
