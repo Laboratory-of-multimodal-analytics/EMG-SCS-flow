@@ -22,6 +22,7 @@ from .text_curves import (
     text_curves_window_defaults,
 )
 from .condition import group_conditions, is_condition_paradigm, run_condition_analysis
+from .drift import remove_drift
 from .recruitment import run_recruitment_analysis
 from .jendrassik import run_curve_group_analysis
 from .constants import (
@@ -104,6 +105,9 @@ from .constants import (
     STARTSTOP_SIM_TMIN,
     STARTSTOP_SIM_TMAX,
     THRESH,
+    SWEEP_STRONG_FRAC,
+    SWEEP_STRONG_MIN,
+    DRIFT_MEDIAN_WIN_MS,
     ART_PEAK_WIDTH_MS,
     ART_PEAK_HEIGHT,
     ANTAGONIST_PAIRS,
@@ -2645,6 +2649,34 @@ def _run_startstop_analysis(
     plot_boxplots(df, boxplot_dir)
 
 
+def _strong_epoch_indices(
+    ch_epochs: np.ndarray,
+    times: np.ndarray,
+    resp_tmin: float,
+    resp_tmax: float,
+    frac: float = SWEEP_STRONG_FRAC,
+    min_keep: int = SWEEP_STRONG_MIN,
+) -> np.ndarray:
+    """Indices of the strongest epochs of one channel, by response-window size.
+
+    A recruitment sweep is one crop whose epochs run from sub-threshold noise to
+    the maximal response, and roughly the first half of them carry no response at
+    all. Averaging all of them dilutes the very shape the template is meant to
+    capture, and asking the epochs to resemble each other — which the consistency
+    gates do — is asking a sweep not to be a sweep. Both therefore run on the top
+    slice only, while the per-curve metrics are still produced for every curve.
+    """
+    n = ch_epochs.shape[0]
+    if n <= min_keep:
+        return np.arange(n)
+    mask = (times >= resp_tmin) & (times <= resp_tmax)
+    if not mask.any():
+        return np.arange(n)
+    strength = np.ptp(ch_epochs[:, mask], axis=1)
+    keep = int(max(min_keep, round(n * float(frac))))
+    return np.sort(np.argsort(strength)[-keep:])
+
+
 def _excel_safe_sheet_name(name: str) -> str:
     name = str(name)
     name = re.sub(r"[:\\/?*\[\]]", "_", name)
@@ -2832,6 +2864,22 @@ def run_pipeline(
                 "[NEUROSOFT] One stimulus artifact per curve at a fixed latency — "
                 "the export does not carry the inter-stimulus interval. Falling "
                 "back to per-curve figures + amplitude groups (no ISI axis).",
+                flush=True,
+            )
+        # Slow drift removal. A high-pass cannot be built at this epoch length
+        # (see src/drift.py), so the baseline is estimated and subtracted; the
+        # artifact head is left alone. Without it the stimulus-recovery ramp is
+        # read as a growing response on the channels that carry a big artifact.
+        if DRIFT_MEDIAN_WIN_MS is not None:
+            cleaned = remove_drift(
+                ready.get_data(), float(ready.info["sfreq"]),
+                win_ms=float(DRIFT_MEDIAN_WIN_MS), skip_s=TEXT_CURVES_RESP_TMIN,
+            )
+            ready = mne.EpochsArray(cleaned, ready.info.copy(), tmin=ready.tmin,
+                                    baseline=None, verbose=False)
+            print(
+                f"[NEUROSOFT] slow drift removed "
+                f"(running median, {DRIFT_MEDIAN_WIN_MS:.0f} ms window).",
                 flush=True,
             )
         pre_epoched = {text_curves_crop_name(edf_path): ready}
@@ -3092,8 +3140,15 @@ def run_pipeline(
         for ch_idx, ch_name in enumerate(epochs.ch_names):
             if ch_name in art_set:
                 continue
+            ch_epochs = data_epoched[:, ch_idx, :]
+            if neurosoft_scenario is not None:
+                # Fit the template on the strong end of the sweep — see
+                # _strong_epoch_indices for why the full mean is the wrong input.
+                ch_epochs = ch_epochs[
+                    _strong_epoch_indices(ch_epochs, times, resp_tmin, resp_tmax)
+                ]
             config_waveforms[configuration][ch_name].append(
-                (amp_num, stim_amp_raw, np.mean(data_epoched[:, ch_idx, :], axis=0))
+                (amp_num, stim_amp_raw, np.mean(ch_epochs, axis=0))
             )
 
     # ── Match each config/channel mean to the best template from the bank ──
@@ -3645,7 +3700,19 @@ def run_pipeline(
             valid_flags = []
             ch_idx_for_itc = epochs.ch_names.index(ch)
             ep_resp_segs = []
+            # On a sweep the gates run on the strong end only. Judging a
+            # recruitment channel on all of its curves asks the sub-threshold
+            # ones to look like the supra-threshold ones, which is the opposite
+            # of what the file is; it wiped the strongest channels in the file.
+            # Detections themselves are still produced for every curve.
+            gate_eps = None
+            if neurosoft_scenario is not None:
+                gate_eps = set(_strong_epoch_indices(
+                    data_epoched[:, ch_idx_for_itc, :], times, resp_tmin, resp_tmax,
+                ).tolist())
             for e in entries:
+                if gate_eps is not None and e["ep"] not in gate_eps:
+                    continue
                 is_valid = not np.isnan(e["p1"])
                 valid_flags.append(is_valid)
                 sig_ep = data_epoched[e["ep"], ch_idx_for_itc, :]

@@ -217,6 +217,22 @@ RESP_TMAX = 0.02
 # top of the responses. These defaults apply only when the caller leaves
 # RESP_TMIN/RESP_TMAX at their values above.
 # Response search start (s) — past the stimulus artifact.
+# ── Neurosoft curve sweeps ───────────────────────────────────────────────────
+# A sweep is one crop running from sub-threshold noise to the maximal response.
+# The template and the channel-consistency gates are computed on the strongest
+# slice of it, not on all curves: the weak half carries no response, and
+# including it both dilutes the template and makes the epochs look inconsistent
+# with each other, which is what a sweep is supposed to be.
+SWEEP_STRONG_FRAC = 0.3      # share of curves treated as "the strong end"
+SWEEP_STRONG_MIN = 8         # but never fewer than this many
+
+# Slow drift removal for pre-cut curves. These epochs are 100 ms at 20 kHz, far
+# too short for a high-pass FIR (a 10 Hz cutoff would need a filter longer than
+# the epoch), so the drift is estimated directly and subtracted: a running
+# median over a window several times wider than any response, taken on a
+# decimated copy and interpolated back. Set the window to None to switch off.
+DRIFT_MEDIAN_WIN_MS = 25.0
+
 TEXT_CURVES_RESP_TMIN = 0.002
 # Response search end (s) — covers the 20-25 ms responses seen in these files.
 TEXT_CURVES_RESP_TMAX = 0.04
