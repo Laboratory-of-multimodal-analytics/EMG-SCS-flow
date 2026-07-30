@@ -30,7 +30,7 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QHeaderView, QLabel, QListWidget, QSplitter,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..results import COND_DIR, mode_dir
@@ -57,6 +57,8 @@ class ConditionViewer(QWidget):
         self.selected: float | None = None
         self._aligned: dict[str, np.ndarray] = {}
         self._means: dict[str, np.ndarray] = {}
+        self._markers: dict[str, np.ndarray] = {}
+        self._present: dict[str, np.ndarray] = {}
 
         self.header = QLabel("<b>No Condition results in this run</b>")
         self.header.setWordWrap(True)
@@ -75,6 +77,12 @@ class ConditionViewer(QWidget):
         self.show_control = QCheckBox("наложить control")
         self.show_control.setChecked(True)
         self.show_control.toggled.connect(lambda _: self._draw())
+        self.show_markers = QCheckBox("маркеры onset/P1/P2")
+        self.show_markers.setChecked(True)
+        self.show_markers.toggled.connect(lambda _: self._draw())
+        self.mark_absent = QCheckBox("красным — свипы без ответа")
+        self.mark_absent.setChecked(True)
+        self.mark_absent.toggled.connect(lambda _: self._draw())
 
         self.stats = QTableWidget(0, 4)
         self.stats.setHorizontalHeaderLabels(["ISI", "N", "ампл. мВ", "persist."])
@@ -91,6 +99,8 @@ class ConditionViewer(QWidget):
         lv.addWidget(self.cond_list, 1)
         lv.addWidget(self.show_sweeps)
         lv.addWidget(self.show_control)
+        lv.addWidget(self.show_markers)
+        lv.addWidget(self.mark_absent)
         lv.addWidget(QLabel("<b>По условиям</b>"))
         lv.addWidget(self.stats, 1)
 
@@ -99,12 +109,28 @@ class ConditionViewer(QWidget):
         self.canvas.mpl_connect("button_press_event", self._on_click)
         hint = QLabel("Клик по точке на графике амплитуды — поднять этот интервал ниже.")
         hint.setStyleSheet("color: gray; font-size: 10px;")
+        page_amp = QWidget()
+        pv = QVBoxLayout(page_amp)
+        pv.setContentsMargins(2, 2, 2, 2)
+        pv.addWidget(self.canvas, 1)
+        pv.addWidget(hint)
 
-        right = QWidget()
-        rv = QVBoxLayout(right)
-        rv.setContentsMargins(2, 2, 2, 2)
-        rv.addWidget(self.canvas, 1)
-        rv.addWidget(hint)
+        # Waterfall lives on its own page: it wants the full height, and it
+        # answers a different question — how the whole ISI series moves at once,
+        # rather than one interval against the control.
+        self.wf_fig = Figure(figsize=(8, 10), layout="constrained")
+        self.wf_canvas = FigureCanvasQTAgg(self.wf_fig)
+        wf_scroll = QWidget()
+        wv = QVBoxLayout(wf_scroll)
+        wv.setContentsMargins(2, 2, 2, 2)
+        wv.addWidget(self.wf_canvas, 1)
+        wf_hint = QLabel("Control внизу, интервал растёт вверх. Выбранный выделен красным.")
+        wf_hint.setStyleSheet("color: gray; font-size: 10px;")
+        wv.addWidget(wf_hint)
+
+        right = QTabWidget()
+        right.addTab(page_amp, "Ответ vs интервал")
+        right.addTab(wf_scroll, "Waterfall")
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(left)
@@ -143,6 +169,10 @@ class ConditionViewer(QWidget):
             self._aligned[f.name[: -len("_curves_aligned.npy")]] = np.load(f)
         for f in sorted(arr.glob("*_condition_means.npy")):
             self._means[f.name[: -len("_condition_means.npy")]] = np.load(f)
+        for f in sorted(arr.glob("*_markers_ms.npy")):
+            self._markers[f.name[: -len("_markers_ms.npy")]] = np.load(f)
+        for f in sorted(arr.glob("*_present.npy")):
+            self._present[f.name[: -len("_present.npy")]] = np.load(f)
 
         chans = sorted(self.summary["Channel"].astype(str).unique(),
                        key=lambda s: (len(s), s))
@@ -254,6 +284,7 @@ class ConditionViewer(QWidget):
 
         self._draw_curves(ax_cur, ch)
         self.canvas.draw_idle()
+        self._draw_waterfall(ch)
         self._fill_stats(d, tags, amp, pers)
 
     def _draw_curves(self, ax, ch: str) -> None:
@@ -266,16 +297,33 @@ class ConditionViewer(QWidget):
             ax.set_axis_off(); return
 
         i = self.labels.index(self.selected) if self.selected in self.labels else 0
+        present = self._present.get(ch)
+        n_abs = 0
         if self.show_sweeps.isChecked() and aligned is not None and self.curve_cond is not None:
             rows = np.where(self.curve_cond == float(self.selected))[0]
             for k in rows:
-                if k < len(aligned):
-                    ax.plot(t, aligned[k], color="0.6", lw=0.6, alpha=0.55, zorder=1)
+                if k >= len(aligned):
+                    continue
+                ok = True if present is None or k >= len(present) else bool(present[k])
+                if not ok:
+                    n_abs += 1
+                red = self.mark_absent.isChecked() and not ok
+                ax.plot(t, aligned[k], color="#d62728" if red else "0.6",
+                        lw=0.6, alpha=0.85 if red else 0.55, zorder=2 if red else 1)
         if self.show_control.isChecked() and 0.0 in self.labels:
             ci = self.labels.index(0.0)
             ax.plot(t, means[ci], color="0.35", lw=1.4, ls="--", zorder=3, label="control")
         ax.plot(t, means[i], color="#d73027", lw=2.0, zorder=4, label=_fmt(self.selected))
         ax.axvline(0, color="tab:blue", lw=1.0, ls=":", zorder=2)
+        # The latencies the amplitudes were actually sampled at — this is how you
+        # check the numbers came off the response and not off the artifact tail.
+        mk = self._markers.get(ch)
+        if self.show_markers.isChecked() and mk is not None:
+            for t_ms, col, nm in zip(mk, ("tab:blue", "tab:red", "tab:green"),
+                                     ("onset", "P1", "P2")):
+                if np.isfinite(t_ms):
+                    ax.axvline(float(t_ms), color=col, lw=1.1, ls="--", alpha=0.85,
+                               zorder=5, label=nm)
 
         seg = means[np.isfinite(means)]
         if seg.size:
@@ -284,12 +332,51 @@ class ConditionViewer(QWidget):
             ax.set_ylim(lo - pad, hi + pad)
         ax.set_xlabel("мс относительно артефакта")
         ax.set_ylabel("мВ")
-        ax.set_title(f"{ch} — {_fmt(self.selected)}: свипы и среднее, control пунктиром",
+        extra = f" · {n_abs} свипов без ответа" if n_abs else ""
+        ax.set_title(f"{ch} — {_fmt(self.selected)}: свипы и среднее, control пунктиром{extra}",
                      fontsize=10, loc="left")
         ax.grid(True, color="0.92", lw=0.6)
         ax.legend(fontsize=7, frameon=False)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
+
+    def _draw_waterfall(self, ch: str) -> None:
+        """Every condition stacked and aligned on the artifact, selected in red.
+
+        The per-interval view answers "how does this one compare with control";
+        this one answers "where along the series does the response turn over",
+        which is only visible with all the intervals in one picture.
+        """
+        self.wf_fig.clear()
+        means = self._means.get(ch)
+        t = self.times
+        if means is None or t is None or not self.labels:
+            ax = self.wf_fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Нет сохранённых кривых.", ha="center", va="center",
+                    color="gray"); ax.set_axis_off(); self.wf_canvas.draw_idle(); return
+
+        ax = self.wf_fig.add_subplot(111)
+        span = np.nanmax([np.nanmax(w) - np.nanmin(w) for w in means]) or 1.0
+        step = span * 1.1
+        for row, lab in enumerate(self.labels):
+            y = means[row] + row * step
+            sel = self.selected is not None and float(lab) == float(self.selected)
+            ax.plot(t, y, color="#d73027" if sel else "k", lw=1.6 if sel else 0.8, zorder=3 if sel else 2)
+            ax.text(t[0], row * step, _fmt(lab) + "  ", ha="right", va="center",
+                    fontsize=8, color="#d73027" if sel else "0.25",
+                    fontweight="bold" if sel else "normal")
+            ax.plot(0, row * step, "|", color="tab:blue", ms=9, mew=1.4, zorder=4)
+        mk = self._markers.get(ch)
+        if self.show_markers.isChecked() and mk is not None:
+            for t_ms, col in zip(mk, ("tab:blue", "tab:red", "tab:green")):
+                if np.isfinite(t_ms):
+                    ax.axvline(float(t_ms), color=col, lw=1.0, ls="--", alpha=0.6, zorder=1)
+        ax.set_yticks([])
+        ax.set_xlabel("мс относительно артефакта")
+        ax.set_title(f"{ch} — все интервалы, выровнено по артефакту", fontsize=10, loc="left")
+        for s in ("top", "right", "left"):
+            ax.spines[s].set_visible(False)
+        self.wf_canvas.draw_idle()
 
     def _fill_stats(self, d, tags, amp, pers) -> None:
         n = d["N"].to_numpy()

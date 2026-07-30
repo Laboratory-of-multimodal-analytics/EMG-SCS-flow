@@ -442,23 +442,37 @@ def _grid_axes(n, ncol=2):
     return fig, axes, nrow, ncol
 
 
-def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path):
+def _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name, out_path,
+                               markers_ms=None, present_by_curve=None):
     """Every curve of one channel, one row per condition (mean ± SD on top).
 
     The waterfall shows one mean per condition; A. Militskova also asks for the
     individual curves, which is where sweep-to-sweep failures of the response
     (the thing paired stimulation is measuring) actually show up.
+
+    The onset/P1/P2 the amplitudes were measured at are drawn as vertical
+    guides, and a sweep the presence gate rejected is drawn in red rather than
+    grey — this figure is also how you check that the numbers came off the right
+    part of the curve.
     """
     rows = [lab for lab in labels if segs_by_lab.get(lab, (None, []))[1]]
     if not rows:
         return
+    present_by_curve = present_by_curve or {}
     fig, axes = plt.subplots(len(rows), 1, figsize=(9, 2.4 * len(rows)),
                              squeeze=False, sharex=True, sharey=True)
     for r, lab in enumerate(rows):
         ax = axes[r][0]
+        idx_list = segs_by_lab[lab][0]
         block = np.asarray(segs_by_lab[lab][1], dtype=float)
-        for w in block:
-            ax.plot(tw_ms, w, color="0.55", lw=0.6, alpha=0.6)
+        for k, w in zip(idx_list, block):
+            ok = present_by_curve.get(int(k), True)
+            ax.plot(tw_ms, w, color=("0.55" if ok else "#d62728"),
+                    lw=0.6, alpha=0.6 if ok else 0.85)
+        if markers_ms is not None:
+            for t_ms, col in zip(markers_ms, ("tab:blue", "tab:red", "tab:green")):
+                if t_ms is not None and np.isfinite(t_ms):
+                    ax.axvline(t_ms, color=col, lw=1.0, ls="--", alpha=0.8, zorder=5)
         m = np.nanmean(block, axis=0)
         sd = np.nanstd(block, axis=0, ddof=1) if len(block) > 1 else np.zeros_like(m)
         ax.fill_between(tw_ms, m - sd, m + sd, color="tab:blue", alpha=0.20, lw=0)
@@ -657,8 +671,21 @@ def run_condition_analysis(
                         markers_ms=(on_ms, p1_ms, p2_ms))
         _plot_waterfall_time(data_mv, ch, isi_labels, labels, pos_ms, t_ms, ch_name,
                              wf_dir / f"{ch_name}_by_time.png")
+        present_map = {int(row["Curve"]) - 1: bool(row["Response present"])
+                       for row in per_curve_rows if row["Channel"] == ch_name}
         _plot_curves_per_condition(segs_by_lab, tw_ms, labels, ch_name,
-                                   curves_dir / f"{ch_name}_curves.png")
+                                   curves_dir / f"{ch_name}_curves.png",
+                                   markers_ms=(on_ms, p1_ms, p2_ms),
+                                   present_by_curve=present_map)
+        # For the GUI: the markers the amplitudes were sampled at, which sweeps
+        # the presence gate accepted, and the matched template to overlay.
+        np.save(arr_dir / f"{ch_name}_markers_ms.npy",
+                np.array([on_ms, p1_ms, p2_ms], dtype=float))
+        np.save(arr_dir / f"{ch_name}_present.npy",
+                np.array([present_map.get(k, False) for k in range(n_curves)], dtype=bool))
+        if match is not None:
+            np.save(arr_dir / f"{ch_name}_template.npy",
+                    np.asarray(match["template"], dtype=float))
         amp_by_channel[ch_name] = (amp_mean, amp_se)
         box_by_channel[ch_name] = box
         persist_by_channel[ch_name] = persistence
