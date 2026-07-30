@@ -121,6 +121,7 @@ from .detection import (
 )
 from .io_utils import build_output_dirs, ensure_dir, list_crop_files
 from .neurosoft import (
+    CONDITION,
     JENDRASSIK,
     PAIRED,
     RECRUITMENT,
@@ -2833,39 +2834,20 @@ def run_pipeline(
                 "paired stimulation. Going with the name.",
                 flush=True,
             )
-        # Paired stimulation splits in two, and only the signal can tell which:
-        #
-        #  - the inter-stimulus interval IS in the export (the artifact, and the
-        #    response with it, moves from curve to curve — the TMS-conditioning
-        #    files): group by real ISI in the Condition analysis and return.
-        #  - it is NOT (every tSCS "двойная стимуляция" export in this dataset:
-        #    one artifact per curve, fixed at t=0): there is no ISI axis to
-        #    recover, so the file stays on the fixed-t0 path and gets the same
-        #    per-curve + amplitude-group deliverable as the Jendrassik files.
-        if not use_startstop and neurosoft_scenario == PAIRED:
+        # The Condition test measures the response RELATIVE to an artifact that
+        # steps along the curve, so nothing about the fixed-t0 SIR path applies.
+        # Its own analysis writes the complete deliverable and returns.
+        if not use_startstop and neurosoft_scenario == CONDITION:
             cond_info = scen_info.get("signal")
             if cond_info is None:
                 _, cond_info = is_condition_paradigm(arr, float(ready.info["sfreq"]))
-            _, isi_labels = group_conditions(cond_info["positions_ms"])
-            if len(isi_labels) > 1:
-                print(
-                    f"[NEUROSOFT] {len(isi_labels)} inter-stimulus intervals in the "
-                    "artifact positions -> Condition test.",
-                    flush=True,
-                )
-                run_condition_analysis(
-                    arr, float(ready.info["sfreq"]), list(ready.ch_names),
-                    output_root, info=cond_info,
-                )
-                if old_mne_log_level is not None:
-                    mne.set_log_level(old_mne_log_level)
-                return output_root
-            print(
-                "[NEUROSOFT] One stimulus artifact per curve at a fixed latency — "
-                "the export does not carry the inter-stimulus interval. Falling "
-                "back to per-curve figures + amplitude groups (no ISI axis).",
-                flush=True,
+            run_condition_analysis(
+                arr, float(ready.info["sfreq"]), list(ready.ch_names),
+                output_root, info=cond_info,
             )
+            if old_mne_log_level is not None:
+                mne.set_log_level(old_mne_log_level)
+            return output_root
         # Slow drift removal. A high-pass cannot be built at this epoch length
         # (see src/drift.py), so the baseline is estimated and subtracted; the
         # artifact head is left alone. Without it the stimulus-recovery ramp is

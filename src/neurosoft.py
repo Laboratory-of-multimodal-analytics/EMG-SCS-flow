@@ -1,4 +1,4 @@
-"""Which of the three Neurosoft protocols a text ``curves`` export holds.
+"""Which of the four Neurosoft protocols a text ``curves`` export holds.
 
 Applies ONLY to the Neurosoft station's .txt exports. Per A. Militskova, the
 file name carries the stimulation level (Th9-10, Th12-L1, C3-4 ...) followed by
@@ -15,8 +15,21 @@ a token naming the test, and each test wants a different deliverable:
      the curves themselves, plus amplitude groups with their means and spreads.
 
   3. PAIRED       ("2 stim", "2ст", "двойная стим", "парная", "paired")
-     Paired-pulse test: spinal inhibition as a function of the pause between the
-     two stimuli. Deliverable: as for (2), grouped by inter-stimulus interval.
+     Paired-pulse test. NOTE: in this dataset these exports show a single
+     stimulus artifact fixed at ~1 ms in a 100 ms window — no second pulse is
+     visible even at an 8 % threshold or in the average across curves — so the
+     inter-stimulus interval cannot be recovered from the file. They get the same
+     deliverable as (2).
+
+  4. CONDITION    (recognised from the SIGNAL, not the name)
+     A. Militskova: "необходимо считать ответ после артефакта прямо на кривой,
+     сам ответ как бы сдвигается по кривой". The station triggers on a fixed
+     event and the stimulus follows at a programmed delay that steps from curve
+     to curve, so the artifact — and the response behind it — slides along a
+     longer epoch (250 ms rather than 100). Names carry the conditioning
+     modality instead of the protocol (ТМС, ткмс, нерв, ulnaris, "в сочетании"),
+     which is why this one is detected from the data. Deliverable: response
+     measured RELATIVE to the artifact, grouped by inter-stimulus interval.
 
 Anything else in these folders (H-reflex, SEP/ССВП, TMS, n. ulnaris) is out of
 scope and keeps the generic path.
@@ -36,12 +49,14 @@ from pathlib import Path
 RECRUITMENT = "recruitment"
 JENDRASSIK = "jendrassik"
 PAIRED = "paired"
+CONDITION = "condition"
 
 #: Human-readable scenario names for logs and figure titles.
 SCENARIO_LABELS = {
     RECRUITMENT: "Recruitment curve",
     JENDRASSIK: "Jendrassik manoeuvre",
     PAIRED: "Paired stimulation",
+    CONDITION: "Condition test",
 }
 
 #: Cyrillic letters visually identical to Latin ones, so "Тh11-12 JМ" folds to
@@ -133,11 +148,11 @@ def detect_scenario(
 ) -> tuple[str, dict]:
     """Resolve the scenario for one Neurosoft export.
 
-    The file name wins whenever it carries a token — that is the convention the
-    protocol is actually recorded in. The signal is consulted only when the name
-    is silent (a bare ``Th11-12.txt``): a stimulus artifact that MOVES from curve
-    to curve means paired-pulse, a fixed one means a recruitment sweep (the
-    common default for unlabelled files).
+    A stepping artifact settles it first: that shift IS the Condition test, and
+    its files are named after the conditioning modality rather than the protocol,
+    so the name cannot answer for them. Otherwise the name wins — that is the
+    convention the protocol is recorded in — and a name with no token falls back
+    to a recruitment sweep, the common case for a bare ``Th11-12.txt``.
 
     A name/signal disagreement is reported in the info dict so the run log can
     show it instead of silently picking one.
@@ -145,27 +160,31 @@ def detect_scenario(
     named = scenario_from_name(path)
     info: dict = {"from_name": named, "from_signal": None, "conflict": False}
 
-    signal_paired = False
+    moving = False
+    n_isi = 1
     if data is not None and sfreq:
-        from .condition import is_condition_paradigm
+        from .condition import group_conditions, is_condition_paradigm
 
-        signal_paired, cond_info = is_condition_paradigm(data, float(sfreq))
+        moving, cond_info = is_condition_paradigm(data, float(sfreq))
         info["signal"] = cond_info
-        info["from_signal"] = PAIRED if signal_paired else None
+        _, isi = group_conditions(cond_info["positions_ms"])
+        n_isi = len(isi)
+        info["n_isi"] = n_isi
+        info["from_signal"] = CONDITION if (moving and n_isi > 1) else None
+
+    # The Condition test is DEFINED by the shift, so the signal decides it —
+    # its files are named after the conditioning modality (ТМС, нерв, ulnaris),
+    # never after the protocol, so the name cannot be asked.
+    if moving and n_isi > 1:
+        info["conflict"] = bool(named is not None and named != CONDITION)
+        info["scenario"] = CONDITION
+        info["reason"] = f"artifact steps across curves ({n_isi} intervals)"
+        return CONDITION, info
 
     if named is not None:
-        # A moving artifact on a file named RC/JM is worth flagging: it usually
-        # means the export mixes protocols, or a muscle channel is louder than
-        # the stimulus channel and is being read as the artifact.
-        info["conflict"] = bool(signal_paired and named != PAIRED)
         info["scenario"] = named
         info["reason"] = "file name"
         return named, info
-
-    if signal_paired:
-        info["scenario"] = PAIRED
-        info["reason"] = "moving stimulus artifact"
-        return PAIRED, info
 
     info["scenario"] = RECRUITMENT
     info["reason"] = "no protocol token in the name; fixed artifact -> recruitment sweep"
