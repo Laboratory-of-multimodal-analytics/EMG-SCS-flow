@@ -126,7 +126,7 @@ def save_overrides(output_root: Path, data: dict) -> Path:
     return p
 
 
-def _manual_match(per_cond_mean, labels, tw_s, window_ms) -> dict | None:
+def _manual_match(per_cond_mean, labels, tw_s, window_ms, markers_ms=None) -> dict | None:
     """Template taken from a window the clinician drew, instead of the bank.
 
     The reference stays the strongest condition — that is where the response is
@@ -153,6 +153,13 @@ def _manual_match(per_cond_mean, labels, tw_s, window_ms) -> dict | None:
     ref = np.nan_to_num(per_cond_mean[best_lab], nan=0.0)
     match = {"template": ref, "name": "окно вручную", "corr": np.nan,
              "onset": np.nan, "p1": np.nan, "p2": np.nan}
+    if markers_ms:
+        # Markers placed by hand win outright — disagreeing with the automatic
+        # placement is the whole reason for drawing them.
+        for key, src in (("onset", "onset"), ("p1", "p1"), ("p2", "p2")):
+            v = markers_ms.get(src)
+            match[key] = float(v) / 1e3 if v is not None else np.nan
+        return match
     return _refine_markers_on_mean(ref, tw_s, match, window=(lo, hi))
 
 
@@ -747,8 +754,10 @@ def run_condition_analysis(
         if ov.get("reject"):
             match, source = None, "отклонён вручную"
         elif ov.get("window_ms"):
-            match = _manual_match(per_cond_mean, labels, tw_s, ov["window_ms"])
-            source = "окно вручную" if match else "окно вручную (не удалось)"
+            match = _manual_match(per_cond_mean, labels, tw_s, ov["window_ms"],
+                                  ov.get("markers_ms"))
+            source = ("маркеры вручную" if (match and ov.get("markers_ms"))
+                      else "окно вручную" if match else "окно вручную (не удалось)")
         else:
             match = _match_channel_template(per_cond_mean, labels, tw_s, sfreq, bank) if bank else None
         resp_mask = (tw_s >= CONDITION_DET_TMIN) & (tw_s <= CONDITION_DET_TMAX)

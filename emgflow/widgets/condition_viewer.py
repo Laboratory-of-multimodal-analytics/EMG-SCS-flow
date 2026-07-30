@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
 from src.condition import load_overrides, save_overrides
 
 from ..results import COND_DIR, mode_dir
+from ..templates import build_template
+from .template_editor import TemplateEditor
 
 CONTROL = "control"
 
@@ -128,7 +130,8 @@ class ConditionViewer(QWidget):
         self.btn_window.setEnabled(False)
         self.btn_window.setToolTip(
             "Протяните мышью по нижнему графику над нужным ответом, затем нажмите.\n"
-            "Шаблон будет взят из этого окна, а не из банка."
+            "Откроется редактор, где onset, P1 и P2 можно расставить кликами.\n"
+            "Правка сохраняется только для этого канала, в общий банк не идёт."
         )
         self.btn_window.clicked.connect(self._set_window)
         self.btn_reject = QPushButton("Ответа нет")
@@ -489,11 +492,42 @@ class ConditionViewer(QWidget):
         self._draw()
 
     def _set_window(self) -> None:
+        """Window -> editor -> per-channel override.
+
+        The same editor the SIR review uses, so onset/P1/P2 mean the same thing
+        and are placed the same way. What is saved is the channel's own
+        correction, NOT a new entry in the shared bank: a template added to the
+        bank changes matching for every channel in the run, which is not what
+        drawing on one channel should do.
+        """
         if not self.channel or self._span is None or self.root is None:
             return
+        lo, hi = self._span
+        means = self._means.get(self.channel)
+        if means is None or self.times is None:
+            return
+        t_s = np.asarray(self.times) / 1e3
+        win = (self.times >= lo) & (self.times <= hi)
+        ref = int(np.argmax([np.ptp(np.nan_to_num(m)[win]) for m in means]))
+        wave = np.nan_to_num(means[ref])
+        try:
+            tpl = build_template(t_s, wave, lo / 1e3, hi / 1e3,
+                                 source=f"{self.channel} · {_fmt(self.labels[ref])} · "
+                                        f"{lo:.0f}–{hi:.0f} мс от артефакта")
+        except Exception as exc:
+            self.ov_label.setText(f"<span style='color:#b00'>Не удалось построить шаблон: {exc}</span>")
+            return
+        dlg = TemplateEditor(tpl, self)
+        if not dlg.exec():
+            return
+        t = dlg.edited_template()
         self.overrides.setdefault(self.channel, {}).pop("reject", None)
-        self.overrides[self.channel]["window_ms"] = [round(self._span[0], 2),
-                                                     round(self._span[1], 2)]
+        self.overrides[self.channel]["window_ms"] = [round(lo, 2), round(hi, 2)]
+        self.overrides[self.channel]["markers_ms"] = {
+            "onset": round(float(t.times[int(t.onset_idx)]) * 1e3, 2),
+            "p1": round(float(t.times[int(t.peak1_idx)]) * 1e3, 2),
+            "p2": round(float(t.times[int(t.peak2_idx)]) * 1e3, 2),
+        }
         self._save_overrides()
 
     def _toggle_reject(self) -> None:
@@ -526,7 +560,11 @@ class ConditionViewer(QWidget):
             txt = f"<b>{self.channel}</b>: помечен как без ответа"
         elif cur.get("window_ms"):
             a, b = cur["window_ms"]
-            txt = f"<b>{self.channel}</b>: окно {a:.0f}–{b:.0f} мс (шаблон из окна)"
+            txt = f"<b>{self.channel}</b>: окно {a:.0f}–{b:.0f} мс"
+            mk = cur.get("markers_ms")
+            if mk:
+                txt += (f", маркеры onset {mk['onset']:.1f} / P1 {mk['p1']:.1f}"
+                        f" / P2 {mk['p2']:.1f} мс")
         else:
             txt = "правок нет"
         others = [c for c in self.overrides if c != self.channel]
