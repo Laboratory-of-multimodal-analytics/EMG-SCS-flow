@@ -27,14 +27,16 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QSlider, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QListWidget, QPushButton, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from src.jendrassik import CURVE_GROUPS
 from src.neurosoft import intensities_from_name
 from src.plotting import SWEEP_CMAP
 from src.recruitment import RECRUITMENT_N_GROUPS, cluster_amplitudes
+from src.sir_review import (FALSE, MISSED, curve_mark, load_overrides, mark_curve,
+                            recompute_corrections, save_overrides)
 
 from ..results import SIRResults
 
@@ -78,6 +80,8 @@ class ScenarioViewer(QWidget):
         self.waves: dict[str, np.ndarray] = {}
         self.channel: str | None = None
         self.n_groups: int = RECRUITMENT_N_GROUPS
+        self.root: Path | None = None
+        self.overrides: dict = {}
         self.selected_curve: int | None = None
         self._points = None          # curve numbers behind the top plot, for click hit-testing
 
@@ -106,6 +110,28 @@ class ScenarioViewer(QWidget):
         self.slider.valueChanged.connect(self._on_slider)
         self.curve_label = QLabel("curve: —")
 
+        # ---- per-curve corrections ----
+        # Detection here is per curve, so its mistakes are per curve: one sweep
+        # picks up something spurious, another loses a response its neighbours
+        # kept. Neither is worth moving a global threshold for.
+        self.btn_false = QPushButton("Ложный ответ")
+        self.btn_false.setToolTip("Убрать детекцию с выбранной кривой.")
+        self.btn_false.clicked.connect(lambda: self._mark(FALSE))
+        self.btn_missed = QPushButton("Потерянный ответ")
+        self.btn_missed.setToolTip(
+            "Досчитать ответ на выбранной кривой по латентностям,\n"
+            "на которых сходятся принятые кривые этого канала."
+        )
+        self.btn_missed.clicked.connect(lambda: self._mark(MISSED))
+        self.btn_unmark = QPushButton("Снять пометку")
+        self.btn_unmark.clicked.connect(lambda: self._mark(None))
+        self.btn_apply = QPushButton("Пересчитать по правкам")
+        self.btn_apply.setToolTip("Отметьте всё нужное, затем нажмите один раз.")
+        self.btn_apply.clicked.connect(self._recompute)
+        self.mark_label = QLabel("пометок нет")
+        self.mark_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.mark_label.setWordWrap(True)
+
         self.stats = QTableWidget(0, 5)
         self.stats.setHorizontalHeaderLabels(["Group", "N", "mean µV", "SD", "median"])
         self.stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -123,6 +149,10 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.show_band)
         lv.addWidget(self.curve_label)
         lv.addWidget(self.slider)
+        lv.addWidget(QLabel("<b>Правка выбранной кривой</b>"))
+        for b in (self.btn_false, self.btn_missed, self.btn_unmark, self.btn_apply):
+            lv.addWidget(b)
+        lv.addWidget(self.mark_label)
         lv.addWidget(QLabel("<b>Amplitude groups</b>"))
         lv.addWidget(self.stats)
 
@@ -153,6 +183,8 @@ class ScenarioViewer(QWidget):
 
     # ------------------------------------------------------------------ #
     def load(self, root: Path) -> None:
+        self.root = Path(root)
+        self.overrides = load_overrides(self.root)
         self.results = SIRResults(Path(root))
         self.scenario = self.results.scenario
         self.by_curve = None
@@ -311,6 +343,19 @@ class ScenarioViewer(QWidget):
         n_missing = int((~got).sum())
         if len(curves):
             ax_top.set_xlim(0.5, float(curves.max()) + 0.5)
+        # Marked curves: a cross where a detection was called false, a hollow
+        # ring where one was called missed — both visible before recomputing.
+        per_ch = self.overrides.get(ch, {})
+        for cno in per_ch.get(FALSE, []):
+            if cno in set(curves.tolist()):
+                j = list(curves).index(cno)
+                if got[j]:
+                    ax_top.plot([cno], [amps[j]], "x", ms=9, mew=2, color="#d62728", zorder=6)
+        for cno in per_ch.get(MISSED, []):
+            if cno in set(curves.tolist()):
+                j = list(curves).index(cno)
+                y = amps[j] if got[j] else float(np.nanmin(amps[got])) if got.any() else 0.0
+                ax_top.plot([cno], [y], "o", ms=10, mfc="none", mec="#2ca02c", mew=2, zorder=6)
         if (self.selected_curve is not None and self.selected_curve in set(curves.tolist())
                 and got[list(curves).index(self.selected_curve)]):
             y = float(amps[list(curves).index(self.selected_curve)])
@@ -372,6 +417,7 @@ class ScenarioViewer(QWidget):
             )
         else:
             self.curve_label.setText("curve: —")
+        self._refresh_mark_label()
 
         seg = waves[:, post]
         if seg.size and np.isfinite(seg).any():
@@ -392,6 +438,62 @@ class ScenarioViewer(QWidget):
 
         self.canvas.draw_idle()
         self._fill_stats(g, labels)
+
+    # ---- per-curve corrections --------------------------------------- #
+    def _mark(self, kind) -> None:
+        if not self.channel or self.selected_curve is None or self.root is None:
+            self.mark_label.setText("Сначала выберите кривую — кликом по графику или слайдером.")
+            return
+        self.overrides = mark_curve(self.overrides, self.channel,
+                                    int(self.selected_curve), kind)
+        save_overrides(self.root, self.overrides)
+        self._refresh_mark_label()
+        self._draw()
+
+    def _refresh_mark_label(self) -> None:
+        cur = curve_mark(self.overrides, self.channel or "", int(self.selected_curve or -1))
+        word = {FALSE: "ложный", MISSED: "потерянный"}.get(cur, "нет пометки")
+        total = sum(len(v.get(FALSE, [])) + len(v.get(MISSED, []))
+                    for v in self.overrides.values())
+        per_ch = self.overrides.get(self.channel or "", {})
+        bits = []
+        if per_ch.get(FALSE):
+            bits.append(f"ложные: {', '.join(map(str, per_ch[FALSE]))}")
+        if per_ch.get(MISSED):
+            bits.append(f"потерянные: {', '.join(map(str, per_ch[MISSED]))}")
+        txt = f"кривая {self.selected_curve}: <b>{word}</b>"
+        if bits:
+            txt += "<br>" + f"{self.channel}: " + "; ".join(bits)
+        if total:
+            txt += f"<br>всего пометок в файле: {total}"
+        self.mark_label.setText(txt)
+
+    def _recompute(self) -> None:
+        if self.root is None:
+            return
+        ch, cur = self.channel, self.selected_curve
+        try:
+            done = recompute_corrections(self.root, self.scenario_key())
+        except Exception as exc:
+            self.mark_label.setText(f"<span style='color:#b00'>Не удалось пересчитать: {exc}</span>")
+            return
+        if not done:
+            self.mark_label.setText("Пометок нет — пересчитывать нечего.")
+            return
+        self.load(self.root)
+        rows = [self.channel_list.item(i).text() for i in range(self.channel_list.count())]
+        if ch in rows:
+            self.channel_list.setCurrentRow(rows.index(ch))
+        if cur is not None:
+            self.selected_curve = cur
+            self._draw()
+        self.mark_label.setText("Пересчитано: " + "; ".join(
+            f"{d['channel']}/{d['curve']} — {d['kind']}" for d in done))
+
+    def scenario_key(self) -> str | None:
+        from src.neurosoft import JENDRASSIK, PAIRED, RECRUITMENT
+        return {"Recruitment": RECRUITMENT, "Jendrassik": JENDRASSIK,
+                "Paired stimulation": PAIRED}.get(self.scenario or "")
 
     def _fill_stats(self, g: pd.DataFrame, labels: list[str]) -> None:
         rows = []
