@@ -35,8 +35,13 @@ from src.jendrassik import CURVE_GROUPS
 from src.neurosoft import intensities_from_name
 from src.plotting import SWEEP_CMAP
 from src.recruitment import RECRUITMENT_N_GROUPS, cluster_amplitudes
-from src.sir_review import (FALSE, MISSED, curve_mark, load_overrides, mark_curve,
-                            recompute_corrections, save_overrides)
+from matplotlib.widgets import SpanSelector
+
+from src.sir_review import (FALSE, MARKERS, MISSED, WINDOW, curve_mark, load_overrides,
+                            mark_curve, recompute_corrections, save_overrides)
+
+from ..templates import build_template
+from .template_editor import TemplateEditor
 
 from ..results import SIRResults
 
@@ -82,6 +87,8 @@ class ScenarioViewer(QWidget):
         self.n_groups: int = RECRUITMENT_N_GROUPS
         self.root: Path | None = None
         self.overrides: dict = {}
+        self._span: tuple[float, float] | None = None
+        self._selector = None
         self.selected_curve: int | None = None
         self._points = None          # curve numbers behind the top plot, for click hit-testing
 
@@ -125,6 +132,14 @@ class ScenarioViewer(QWidget):
         self.btn_missed.clicked.connect(lambda: self._mark(MISSED))
         self.btn_unmark = QPushButton("Снять пометку")
         self.btn_unmark.clicked.connect(lambda: self._mark(None))
+        self.btn_window = QPushButton("Задать окно и маркеры")
+        self.btn_window.setEnabled(False)
+        self.btn_window.setToolTip(
+            "Протяните мышью по нижнему графику над ответом, затем нажмите.\n"
+            "Откроется редактор, где onset, P1 и P2 ставятся кликами.\n"
+            "Канал перемеряется по ним целиком; в общий банк это не идёт."
+        )
+        self.btn_window.clicked.connect(self._set_window)
         self.btn_apply = QPushButton("Пересчитать по правкам")
         self.btn_apply.setToolTip("Отметьте всё нужное, затем нажмите один раз.")
         self.btn_apply.clicked.connect(self._recompute)
@@ -150,7 +165,8 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.curve_label)
         lv.addWidget(self.slider)
         lv.addWidget(QLabel("<b>Правка выбранной кривой</b>"))
-        for b in (self.btn_false, self.btn_missed, self.btn_unmark, self.btn_apply):
+        for b in (self.btn_false, self.btn_missed, self.btn_unmark,
+                  self.btn_window, self.btn_apply):
             lv.addWidget(b)
         lv.addWidget(self.mark_label)
         lv.addWidget(QLabel("<b>Amplitude groups</b>"))
@@ -424,6 +440,17 @@ class ScenarioViewer(QWidget):
             lo, hi = float(np.nanmin(seg)), float(np.nanmax(seg))
             pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.1
             ax_bot.set_ylim(lo - pad, hi + pad)
+        cur_win = self.overrides.get(ch, {}).get(WINDOW)
+        if cur_win:
+            ax_bot.axvspan(cur_win[0], cur_win[1], color="#ffb703", alpha=0.18, lw=0, zorder=0)
+        elif self._span is not None:
+            ax_bot.axvspan(self._span[0], self._span[1], color="#ffb703", alpha=0.12, lw=0, zorder=0)
+        mk = self.overrides.get(ch, {}).get(MARKERS)
+        if mk:
+            for key, col in (("onset", "tab:blue"), ("p1", "tab:red"), ("p2", "tab:green")):
+                v = mk.get(key)
+                if v is not None and np.isfinite(v):
+                    ax_bot.axvline(float(v), color=col, lw=1.1, ls="--", alpha=0.85, zorder=6)
         ax_bot.axhline(0, color="0.8", lw=0.6)
         ax_bot.set_xlabel("ms from stimulus")
         ax_bot.set_ylabel("µV")
@@ -436,10 +463,55 @@ class ScenarioViewer(QWidget):
         for side in ("top", "right"):
             ax_bot.spines[side].set_visible(False)
 
+        self._selector = SpanSelector(
+            ax_bot, self._on_span, "horizontal", useblit=False,
+            props=dict(alpha=0.25, facecolor="#ffb703"),
+        )
         self.canvas.draw_idle()
         self._fill_stats(g, labels)
 
     # ---- per-curve corrections --------------------------------------- #
+    def _on_span(self, lo: float, hi: float) -> None:
+        if hi - lo < 0.5:
+            return
+        self._span = (float(lo), float(hi))
+        self.btn_window.setEnabled(True)
+        self.btn_window.setText(f"Задать окно {lo:.0f}–{hi:.0f} мс")
+        self._draw()
+
+    def _set_window(self) -> None:
+        """Window -> the shared marker editor -> a per-channel correction."""
+        if not self.channel or self._span is None or self.root is None:
+            return
+        lo, hi = self._span
+        waves = self.waves.get(self.channel)
+        if waves is None or self.times is None:
+            return
+        t_s = np.asarray(self.times)
+        win = (self.times * 1e3 >= lo) & (self.times * 1e3 <= hi)
+        strongest = int(np.argmax(np.ptp(np.nan_to_num(waves)[:, win], axis=1)))
+        try:
+            tpl = build_template(t_s, np.nan_to_num(waves[strongest]), lo / 1e3, hi / 1e3,
+                                 source=f"{self.channel} · кривая {strongest + 1} · "
+                                        f"{lo:.0f}–{hi:.0f} мс")
+        except Exception as exc:
+            self.mark_label.setText(f"<span style='color:#b00'>Не удалось построить шаблон: {exc}</span>")
+            return
+        dlg = TemplateEditor(tpl, self)
+        if not dlg.exec():
+            return
+        t = dlg.edited_template()
+        ch = self.overrides.setdefault(self.channel, {})
+        ch[WINDOW] = [round(lo, 2), round(hi, 2)]
+        ch[MARKERS] = {
+            "onset": round(float(t.times[int(t.onset_idx)]) * 1e3, 2),
+            "p1": round(float(t.times[int(t.peak1_idx)]) * 1e3, 2),
+            "p2": round(float(t.times[int(t.peak2_idx)]) * 1e3, 2),
+        }
+        save_overrides(self.root, self.overrides)
+        self._refresh_mark_label()
+        self._draw()
+
     def _mark(self, kind) -> None:
         if not self.channel or self.selected_curve is None or self.root is None:
             self.mark_label.setText("Сначала выберите кривую — кликом по графику или слайдером.")
@@ -462,6 +534,9 @@ class ScenarioViewer(QWidget):
         if per_ch.get(MISSED):
             bits.append(f"потерянные: {', '.join(map(str, per_ch[MISSED]))}")
         txt = f"кривая {self.selected_curve}: <b>{word}</b>"
+        mk = per_ch.get(MARKERS)
+        if mk:
+            bits.append(f"маркеры onset {mk['onset']:.1f} / P1 {mk['p1']:.1f} / P2 {mk['p2']:.1f} мс")
         if bits:
             txt += "<br>" + f"{self.channel}: " + "; ".join(bits)
         if total:

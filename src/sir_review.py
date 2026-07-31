@@ -36,6 +36,11 @@ OVERRIDES_NAME = "sir_curve_overrides.json"
 
 FALSE = "false"
 MISSED = "missed"
+#: Per-channel entry, alongside the per-curve marks:
+#:   {"ch4": {"false": [12], "window_ms": [18, 30],
+#:            "markers_ms": {"onset": 19, "p1": 21, "p2": 26}}}
+WINDOW = "window_ms"
+MARKERS = "markers_ms"
 
 
 def overrides_path(output_root: Path) -> Path:
@@ -104,13 +109,24 @@ def _load_epochs(output_root: Path):
     return ep
 
 
-def _channel_reference(df: pd.DataFrame, channel: str) -> dict | None:
-    """Latencies and polarity the channel's own detected curves agree on.
+def _channel_reference(df: pd.DataFrame, channel: str, marks: dict | None = None) -> dict | None:
+    """Where to measure this channel's responses.
 
-    A curve the clinician says was missed has to be measured somewhere, and the
-    only defensible place is where this channel's accepted responses sit. The
-    median is used rather than the mean so one stray detection cannot drag it.
+    Markers placed by hand win outright — disagreeing with the automatic
+    placement is the only reason to draw them. Otherwise the latencies come from
+    what this channel's own accepted curves agree on, by median rather than mean
+    so one stray detection cannot drag them.
     """
+    marks = marks or {}
+    mk = marks.get(MARKERS)
+    if mk:
+        p1 = float(mk["p1"]) / 1e3
+        p2 = float(mk["p2"]) / 1e3 if mk.get("p2") is not None and np.isfinite(mk["p2"]) else np.nan
+        onset = float(mk["onset"]) / 1e3 if mk.get("onset") is not None else np.nan
+        d = df[(df["Channel"].astype(str) == channel) & df["Peak1 latency"].notna()]
+        pol1 = 1 if (d.empty or float(d["Peak1 value"].median()) >= 0) else -1
+        return {"p1": p1, "p2": p2, "onset": onset, "pol1": pol1, "pol2": -pol1,
+                "source": "маркеры вручную"}
     d = df[(df["Channel"].astype(str) == channel) & df["Peak1 latency"].notna()]
     if d.empty:
         return None
@@ -120,7 +136,25 @@ def _channel_reference(df: pd.DataFrame, channel: str) -> dict | None:
     p2v = float(d["Peak2 value"].median()) if d["Peak2 value"].notna().any() else np.nan
     onset = float(d["Onset latency"].median()) if d["Onset latency"].notna().any() else np.nan
     return {"p1": p1, "p2": p2, "onset": onset,
-            "pol1": 1 if p1v >= 0 else -1, "pol2": 1 if p2v >= 0 else -1}
+            "pol1": 1 if p1v >= 0 else -1, "pol2": 1 if p2v >= 0 else -1,
+            "source": "медиана принятых кривых"}
+
+
+def _measure_at(df, row, sig, times, sfreq, ref) -> None:
+    """Sample one curve at the reference latencies, no gates applied."""
+    p1l, p1v = pick_epoch_value_near_latency(
+        sig, times, ref["p1"], sfreq, win_ms=2.0, polarity=ref["pol1"])
+    p2l, p2v = (np.nan, np.nan)
+    if np.isfinite(ref["p2"]):
+        p2l, p2v = pick_epoch_value_near_latency(
+            sig, times, ref["p2"], sfreq, win_ms=2.0, polarity=ref["pol2"])
+    df.at[row, "Onset latency"] = ref["onset"]
+    df.at[row, "Peak1 latency"] = p1l
+    df.at[row, "Peak1 value"] = p1v
+    df.at[row, "Peak2 latency"] = p2l
+    df.at[row, "Peak2 value"] = p2v
+    df.at[row, "PTP amplitude"] = (abs(p1v - p2v)
+                                   if (np.isfinite(p1v) and np.isfinite(p2v)) else np.nan)
 
 
 def recompute_corrections(output_root: Path, scenario: str | None = None) -> list[dict]:
@@ -147,7 +181,20 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
 
     done: list[dict] = []
     for channel, marks in ov.items():
-        ref = _channel_reference(df, channel)
+        ref = _channel_reference(df, channel, marks)
+        # Hand-placed markers re-measure the WHOLE channel, not just the curves
+        # singled out: the point of moving them is that the automatic placement
+        # was wrong everywhere on this channel.
+        if marks.get(MARKERS) and ref is not None and channel in ch_index:
+            rows = df.index[(df["Channel"].astype(str) == channel)
+                            & df["Peak1 latency"].notna()]
+            for r in rows:
+                curve = int(df.at[r, "Epoch"]) + 1
+                if curve in marks.get(FALSE, []):
+                    continue
+                _measure_at(df, r, data[curve - 1, ch_index[channel], :], times, sfreq, ref)
+            done.append({"channel": channel, "curve": len(rows),
+                         "kind": "перемерено по ручным маркерам (кривых)"})
         for curve in marks.get(FALSE, []):
             m = (df["Channel"].astype(str) == channel) & (df["Epoch"] == int(curve) - 1)
             if not m.any():
@@ -161,22 +208,12 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
                 done.append({"channel": channel, "curve": int(curve),
                              "kind": "пропущенный — не удалось (нет опорных латентностей)"})
                 continue
-            sig = data[int(curve) - 1, ch_index[channel], :]
-            p1l, p1v = pick_epoch_value_near_latency(
-                sig, times, ref["p1"], sfreq, win_ms=2.0, polarity=ref["pol1"])
-            p2l, p2v = (np.nan, np.nan)
-            if np.isfinite(ref["p2"]):
-                p2l, p2v = pick_epoch_value_near_latency(
-                    sig, times, ref["p2"], sfreq, win_ms=2.0, polarity=ref["pol2"])
-            ptp = abs(p1v - p2v) if (np.isfinite(p1v) and np.isfinite(p2v)) else np.nan
-            df.loc[m, "Onset latency"] = ref["onset"]
-            df.loc[m, "Peak1 latency"] = p1l
-            df.loc[m, "Peak1 value"] = p1v
-            df.loc[m, "Peak2 latency"] = p2l
-            df.loc[m, "Peak2 value"] = p2v
-            df.loc[m, "PTP amplitude"] = ptp
+            r = df.index[m][0]
+            _measure_at(df, r, data[int(curve) - 1, ch_index[channel], :], times, sfreq, ref)
+            p1l = df.at[r, "Peak1 latency"]
             done.append({"channel": channel, "curve": int(curve),
-                         "kind": f"пропущенный — досчитан, P1 {p1l * 1e3:.1f} мс"})
+                         "kind": f"пропущенный — досчитан, P1 {p1l * 1e3:.1f} мс"
+                                 if np.isfinite(p1l) else "пропущенный — пик не найден"})
 
     df.to_csv(csv, index=False)
 

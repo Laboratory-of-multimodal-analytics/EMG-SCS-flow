@@ -77,6 +77,18 @@ _JM_CYR = re.compile(r"ендр")
 _RC_CYR = re.compile(r"\bкр\b|кр\s*рек\w*|кривой\s*рекрут")
 
 
+def _stem(path: str | Path) -> str:
+    """Bare name without the .txt extension.
+
+    Not ``Path.stem``: these names are full of dots — the crop label the pipeline
+    builds replaces every hyphen with one, so ``Т11-12 ендрассик 80 и 90мА``
+    becomes ``Т11.12 ендрассик 80 и 90мА`` and ``Path.stem`` reads everything
+    after ``Т11`` as an extension and throws the intensities away.
+    """
+    name = Path(path).name
+    return name[:-4] if name.lower().endswith(".txt") else name
+
+
 def _fold(name: str) -> str:
     """Lower-case *name* with Cyrillic homoglyphs mapped onto Latin."""
     return name.translate(_HOMOGLYPHS).lower()
@@ -109,7 +121,7 @@ def intensities_from_name(path: str | Path) -> list[int]:
 
     Returns [] when the name says nothing, which is the common case.
     """
-    name = _fold(Path(path).stem)
+    name = _fold(_stem(path))
     found: list[int] = []
     for rx in (_TWO_INTENSITIES, _ONE_THEN_MORE, _BARE_PAIR):
         for m in rx.finditer(name):
@@ -128,7 +140,7 @@ def scenario_from_name(path: str | Path) -> str | None:
     Paired is tested first: ``Т11-12 2ст`` also contains an RC-looking ``ст``
     fragment, and the paired token is the more specific of the two.
     """
-    stem = Path(path).stem
+    stem = _stem(path)
     raw = stem.lower()
     folded = _fold(stem)
 
