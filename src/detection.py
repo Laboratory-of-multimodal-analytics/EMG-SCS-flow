@@ -526,6 +526,75 @@ def small_misshapen_responses(
     return out
 
 
+def onsets_anchored_to_channel(
+    sigs: np.ndarray,
+    times: np.ndarray,
+    sfreq: float,
+    baseline_mask: np.ndarray,
+    onsets: np.ndarray,
+    p1_lats: np.ndarray,
+    amps: np.ndarray,
+    win_ms: float = 2.0,
+    k: float = 2.5,
+    sustain_ms: float = 2.0,
+    noise_after_s: float = 0.04,
+    min_ref: int = 3,
+) -> np.ndarray:
+    """Re-place each curve's onset near where this channel's onset actually is.
+
+    Found curve by curve, an onset is not a latency: it is where the response
+    rose above THAT curve's noise, which moves with the response's size. On one
+    channel here P1 sits at 25.8 ms with a spread of 0.24 ms across 42 curves,
+    while the onset jumps between 17-19 and 22-24 ms — because an early component
+    at 17 ms clears the threshold on the strong curves and is buried in noise on
+    the weak ones. Nothing about the pathway changed; only the SNR did.
+
+    So the onset-to-P1 interval is measured once, on the curves where the
+    threshold crossing is trustworthy (the strongest quarter), and each curve's
+    onset is then looked for within ``win_ms`` of its own P1 minus that interval.
+    A curve that shows no crossing there is given the interval outright: at that
+    point the channel's latency is far better determined than one weak curve's
+    threshold crossing.
+
+    Anchoring to P1 rather than to a fixed latency matters — a channel can carry
+    two response latencies at once (two stimulus intensities in one file), and
+    each curve keeps its own.
+
+    Returns the refined onsets; the input is returned unchanged when the channel
+    has too few usable ones to measure an interval from.
+    """
+    out = np.array(onsets, dtype=float, copy=True)
+    ok = np.isfinite(onsets) & np.isfinite(p1_lats) & np.isfinite(amps)
+    if int(np.sum(ok)) < min_ref + 1:
+        return out
+
+    idx = np.flatnonzero(ok)
+    gaps = (p1_lats - onsets)[idx]
+    strongest = np.argsort(amps[idx])[-max(min_ref, len(idx) // 4):]
+    interval = float(np.median(gaps[strongest]))
+    if not np.isfinite(interval) or interval <= 0:
+        return out
+
+    ww = max(1, int((sustain_ms / 1000.0) * sfreq))
+    w = win_ms / 1000.0
+    for j in range(len(p1_lats)):
+        if not np.isfinite(p1_lats[j]):
+            out[j] = np.nan
+            continue
+        target = p1_lats[j] - interval
+        sd = noise_std_from_tail(sigs[j], times, noise_after_s)
+        out[j] = target
+        if not np.isfinite(sd) or sd <= 0:
+            continue
+        bmean = float(np.mean(sigs[j][baseline_mask]))
+        rect_s = _smoothed_deviation(sigs[j], bmean, ww)
+        m = (times >= target - w) & (times <= target + w) & (times < p1_lats[j])
+        below = np.flatnonzero(m & (rect_s <= k * sd))
+        if below.size:
+            out[j] = float(times[below[-1]])
+    return out
+
+
 def noise_std_from_tail(
     sig_f: np.ndarray,
     times: np.ndarray,

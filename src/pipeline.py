@@ -123,6 +123,7 @@ from .detection import (
     add_extra_peak_to_p1,
     detect_onset_near_template,
     noise_std_from_tail,
+    onsets_anchored_to_channel,
     small_misshapen_responses,
     detect_peak_in_window,
     find_extra_p1_peak,
@@ -3804,6 +3805,27 @@ def run_pipeline(
         if n_misshapen:
             print(f"[SIR] {n_misshapen} small responses dropped as unlike their "
                   f"channel's own shape.", flush=True)
+
+        # ── Onsets: one latency per channel, not one per curve's noise floor ──
+        # Only for the pre-epoched exports, whose onsets are found by walking back
+        # from P1 because they have no pre-stimulus baseline to threshold against.
+        if pre_epoched is not None:
+            for ch in eligible_channels:
+                entries = channel_epoch_results[ch]
+                if not entries:
+                    continue
+                refined = onsets_anchored_to_channel(
+                    np.array([e["sig"] for e in entries], dtype=float), times, sfreq,
+                    baseline_mask,
+                    np.array([e["onset"] for e in entries], dtype=float),
+                    np.array([e["p1"] for e in entries], dtype=float),
+                    np.array([e["ptp"] if np.isfinite(e["ptp"]) else abs(e["pv1"])
+                              for e in entries], dtype=float),
+                    k=STIM_ONSET_K,
+                    noise_after_s=resp_tmax,
+                )
+                for e, val in zip(entries, refined):
+                    e["onset"] = val
 
         # ── Channel-level consistency / artifact rejection ──
         corr_min_median = float(STIM_CHANNEL_MIN_MEDIAN_CORR)
