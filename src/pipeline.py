@@ -1053,6 +1053,26 @@ def _resolve_startstop_template_dir() -> Path:
     return candidates[0]
 
 
+def _template_dir_for_run(output_root: Path) -> Path:
+    """The template bank this run should detect with.
+
+    A bank sitting next to the results wins over the shared one. Templates drawn
+    by hand in the GUI are saved there, and deliberately not into the shared bank:
+    they are answers to one channel of one recording, not shapes worth trying on
+    every file. But that only holds up if re-running the SAME recording keeps
+    finding them, and until now only the GUI did — it remembered the path in
+    session.json, while ``run.py`` went to the shared bank and quietly detected
+    without the templates the clinician had just drawn.
+
+    A run-local bank always contains a copy of the shared one as it stood when it
+    was made, so preferring it loses nothing except stock templates added later.
+    """
+    local = Path(output_root) / "templates"
+    if local.is_dir() and any(local.glob("template_*.npy")):
+        return local
+    return _resolve_startstop_template_dir()
+
+
 def _load_startstop_template_bank(
     template_dir: Path,
     template_native_sfreq: float,
@@ -3032,7 +3052,10 @@ def run_pipeline(
         )
 
     # ── SIR: load pre-computed template bank ──
-    template_dir = _resolve_startstop_template_dir()
+    template_dir = _template_dir_for_run(output_root)
+    n_user = len(list(Path(template_dir).glob("template_*.source.txt")))
+    print(f"[SIR] Template bank: {template_dir}"
+          + (f" ({n_user} drawn by hand)" if n_user else ""), flush=True)
     template_bank = _load_startstop_template_bank(
         template_dir=template_dir,
         template_native_sfreq=float(STARTSTOP_TM_TEMPLATE_SFREQ),

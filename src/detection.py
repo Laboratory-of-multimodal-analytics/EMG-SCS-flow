@@ -385,17 +385,26 @@ def detect_onset_near_template(
     if np.sum(m) < 5:
         return np.nan
 
-    seg = sig_f[m]
+    ww = max(1, int((sustain_ms / 1000.0) * sfreq))
+    rect_s = _smoothed_deviation(sig_f, bmean, ww)[m]
     seg_t = times[m]
 
-    rect = np.abs(seg - bmean)
-    thr = k * bstd
-
-    ww = max(1, int((sustain_ms / 1000.0) * sfreq))
-    rect_s = _moving_mean(rect, ww)
-
-    idx = np.where(rect_s > thr)[0]
+    idx = np.where(rect_s > k * bstd)[0]
     return np.nan if len(idx) == 0 else float(seg_t[idx[0]])
+
+
+def _smoothed_deviation(sig_f: np.ndarray, bmean: float, ww: int) -> np.ndarray:
+    """|signal - baseline|, smoothed over ``ww`` samples, for the WHOLE curve.
+
+    Smoothing must happen before the search window is cut out, not after. The
+    moving average is a same-length convolution, so it pads with zeros at the
+    ends of whatever array it is given: smoothing a slice halves the values at
+    that slice's own edges. Since the search for an onset ends AT P1, that put a
+    fake dip immediately before the peak — on channels where the threshold is a
+    large fraction of the response, the walk back from P1 stopped in that dip and
+    every onset came out 0.1 ms before its peak.
+    """
+    return _moving_mean(np.abs(sig_f - bmean), ww)
 
 
 def detect_onset_before_peak(
@@ -431,9 +440,9 @@ def detect_onset_before_peak(
     if i1 - lo < 5:
         return np.nan
 
-    rect = np.abs(sig_f[lo:i1] - bmean)
     ww = max(1, int((sustain_ms / 1000.0) * sfreq))
-    below = np.where(_moving_mean(rect, ww) <= k * noise_std)[0]
+    rect_s = _smoothed_deviation(sig_f, bmean, ww)[lo:i1]
+    below = np.where(rect_s <= k * noise_std)[0]
     return float(times[lo + below[-1]]) if below.size else np.nan
 
 
@@ -441,20 +450,35 @@ def noise_std_from_tail(
     sig_f: np.ndarray,
     times: np.ndarray,
     after_s: float,
+    sub_win_s: float = 0.02,
     min_samples: int = 100,
 ) -> float:
-    """Noise scale from the quiet part of a curve that follows the response.
+    """Noise scale from the quietest stretch of curve that follows the response.
 
     For recordings that carry no pre-stimulus data this is the only place left to
-    measure noise. Estimated by MAD rather than SD so a late response inside the
-    window inflates it by almost nothing, and returned as an SD equivalent so it
-    can be used with the same ``k`` as a baseline SD.
+    measure noise. MAD rather than SD, and returned as an SD equivalent so the
+    same ``k`` works as with a baseline SD.
+
+    Taken over the QUIETEST sub-window rather than the whole tail, because the
+    tail is not always silent: late activity and movement sit there too, and MAD
+    over the whole stretch then reports the activity instead of the noise floor.
+    That is not a rare case — it doubled the estimate on exactly the low-amplitude
+    channels that need it most (7.4 against 4.0 uV on one channel whose responses
+    peak at 27 uV), which pushed the onset threshold to two thirds of the response
+    height and left the onset almost on top of the peak. Strong channels are
+    barely affected either way.
     """
     m = times >= after_s
     if int(np.sum(m)) < min_samples:
         return np.nan
     tail = sig_f[m]
-    mad = float(np.median(np.abs(tail - np.median(tail))))
+    n = len(tail)
+    w = max(min_samples, int(round(sub_win_s * float(len(times)) / (times[-1] - times[0]))))
+    step = max(1, w // 2)
+    starts = range(0, max(1, n - w + 1), step)
+    mads = [float(np.median(np.abs(seg - np.median(seg))))
+            for seg in (tail[s:s + w] for s in starts) if len(seg) >= min_samples]
+    mad = min(mads) if mads else float(np.median(np.abs(tail - np.median(tail))))
     return 1.4826 * mad if mad > 0 else np.nan
 
 
