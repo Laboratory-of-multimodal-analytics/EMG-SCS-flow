@@ -323,6 +323,36 @@ class ScenarioViewer(QWidget):
         self.stats.setRowCount(0)
         self.canvas.draw_idle()
 
+    def _provisional_amplitudes(self, g: pd.DataFrame, waves: np.ndarray) -> np.ndarray:
+        """What each undetected curve reads where its neighbours' response sits.
+
+        Undetected curves have no point to click and no place on the plot, which
+        makes the one thing they are there for — deciding whether a response was
+        missed or genuinely absent — impossible to do by eye. Each is measured at
+        the P1 latency of the NEAREST curve on this channel that did get one, so
+        a missed response shows up at roughly its neighbours' height while a
+        truly silent curve sits near zero.
+
+        Returns NaN for curves that already have an amplitude, and for every
+        curve when the channel has no detection at all to borrow a latency from.
+        These values are for the plot only; the tables keep the NaN.
+        """
+        curves = g["curve"].to_numpy(int)
+        amps = g["amp_uv"].to_numpy(float)
+        p1 = g["p1_ms"].to_numpy(float)
+        out = np.full(len(curves), np.nan)
+        ref = np.flatnonzero(np.isfinite(amps) & np.isfinite(p1))
+        if not ref.size or self.times is None:
+            return out
+        t_ms = np.asarray(self.times) * 1e3
+        for j in np.flatnonzero(~np.isfinite(amps)):
+            if not (0 < curves[j] <= len(waves)):
+                continue
+            nearest = ref[int(np.argmin(np.abs(curves[ref] - curves[j])))]
+            i = int(np.argmin(np.abs(t_ms - p1[nearest])))
+            out[j] = abs(float(waves[curves[j] - 1][i]))
+        return out
+
     def _groups_for(self, ch: str) -> pd.DataFrame:
         g = self.by_curve[self.by_curve["Channel"] == ch].sort_values("curve").copy()
         g["group"] = _assign_groups(g["amp_uv"], self.n_groups)
@@ -352,6 +382,11 @@ class ScenarioViewer(QWidget):
         amps = g["amp_uv"].to_numpy(float)
         self._points = curves
         got = np.isfinite(amps)
+        # What the curves with no detection would read, measured where the
+        # nearest detected curve has its P1. Drawn hollow and never written to
+        # the tables, which keep the NaN: this is something to aim at and to
+        # judge by eye, not a measurement.
+        shown = self._provisional_amplitudes(g, waves)
         # The line is drawn over the full curve range; NaNs break it, so curves
         # with no detection show up as gaps instead of shifting the axis.
         if by_group:
@@ -367,6 +402,11 @@ class ScenarioViewer(QWidget):
             ax_top.plot(curves, amps, "-", lw=0.9, color="0.75", zorder=0)
             ax_top.scatter(curves[got], amps[got], s=26,
                            c=[SWEEP_CMAP(norm(c)) for c in curves[got]], zorder=3)
+        miss = (~got) & np.isfinite(shown)
+        if miss.any():
+            ax_top.plot(curves[miss], shown[miss], "o", ls="none", ms=6,
+                        mfc="none", mec="0.45", mew=1.1, zorder=2,
+                        label="без детекции")
         n_missing = int((~got).sum())
         if len(curves):
             ax_top.set_xlim(0.5, float(curves.max()) + 0.5)
@@ -381,14 +421,17 @@ class ScenarioViewer(QWidget):
         for cno in per_ch.get(MISSED, []):
             if cno in set(curves.tolist()):
                 j = list(curves).index(cno)
-                y = amps[j] if got[j] else float(np.nanmin(amps[got])) if got.any() else 0.0
-                ax_top.plot([cno], [y], "o", ms=10, mfc="none", mec="#2ca02c", mew=2, zorder=6)
-        if (self.selected_curve is not None and self.selected_curve in set(curves.tolist())
-                and got[list(curves).index(self.selected_curve)]):
-            y = float(amps[list(curves).index(self.selected_curve)])
+                y = amps[j] if got[j] else shown[j]
+                if np.isfinite(y):
+                    ax_top.plot([cno], [y], "o", ms=10, mfc="none", mec="#2ca02c",
+                                mew=2, zorder=6)
+        if self.selected_curve is not None and self.selected_curve in set(curves.tolist()):
+            j = list(curves).index(self.selected_curve)
             ax_top.axvline(self.selected_curve, color="#ffb703", lw=1.2, zorder=1)
-            ax_top.plot([self.selected_curve], [y], "o", ms=11, mfc="none",
-                        mec="#ff8800", mew=2.0, zorder=4)
+            y = amps[j] if got[j] else shown[j]
+            if np.isfinite(y):
+                ax_top.plot([self.selected_curve], [y], "o", ms=11, mfc="none",
+                            mec="#ff8800", mew=2.0, zorder=4)
         ax_top.set_xlabel(
             "curve number"
             + (f"   ({n_missing} of {len(curves)} without a detection)" if n_missing else "")
@@ -447,10 +490,12 @@ class ScenarioViewer(QWidget):
                 p1 = float(row["p1_ms"].iloc[0])
                 idx = int(np.argmin(np.abs(t_ms - p1)))
                 ax_bot.plot([p1], [sel[idx]], "o", color="red", ms=7, zorder=6)
-            self.curve_label.setText(
-                f"curve: {self.selected_curve}"
-                + (f" · {row['amp_uv'].iloc[0]:.1f} µV" if not row.empty else "")
-            )
+            if not row.empty and np.isfinite(row["amp_uv"].iloc[0]):
+                self.curve_label.setText(
+                    f"curve: {self.selected_curve} · {row['amp_uv'].iloc[0]:.1f} µV")
+            else:
+                self.curve_label.setText(
+                    f"curve: {self.selected_curve} · ответ не найден")
         else:
             self.curve_label.setText("curve: —")
         self._refresh_mark_label()
