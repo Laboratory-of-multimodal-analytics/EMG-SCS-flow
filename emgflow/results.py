@@ -39,10 +39,11 @@ METRIC_COLS = [
 def _read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=METRIC_COLS)
-    # "Time series" holds every epoch's waveform as a stringified list, which is what makes
-    # these files 50-120 MB. Skipping the column at PARSE time (not after) is the difference
-    # between seconds and a minute on a network drive; waveforms come from the epoch .fif
-    # files anyway.
+    # Runs made before mid-2026 carry a "Time series" column: an attempt at storing each
+    # epoch's waveform inline, which numpy's repr silently truncated to seven numbers and an
+    # ellipsis, so it was never usable data — only bulk, up to 120 MB a file. It is no longer
+    # written, and skipped at PARSE time (not after) for the runs that still have it.
+    # Waveforms live in the epoch .fif files.
     try:
         return pd.read_csv(path, usecols=lambda c: c != "Time series")
     except ValueError:
@@ -56,8 +57,8 @@ def _read_csv(path: Path) -> pd.DataFrame:
 class ProcessedRun:
     """One output root that already holds results.
 
-    Deliberately cheap to build: no metrics CSV is read here. Those files run to 50-120 MB
-    (the 'Time series' column), and reading one per run would make a scan take minutes.
+    Deliberately cheap to build: no metrics CSV is read here. Older ones run to 50-120 MB
+    (the dead 'Time series' column), and reading one per run would make a scan take minutes.
     """
     root: Path
     mode: str            # "sir" | "startstop" | "condition"

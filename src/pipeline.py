@@ -1991,7 +1991,6 @@ def _run_startstop_analysis(
             "Peak1 value",
             "Peak2 value",
             "PTP amplitude",
-            "Time series",
         ]}
 
         channel_epoch_results = {ch: [] for ch in epochs.ch_names if ch not in art_set}
@@ -2383,7 +2382,6 @@ def _run_startstop_analysis(
                 results["Peak1 value"].append(e["pv1"])
                 results["Peak2 value"].append(e["pv2"])
                 results["PTP amplitude"].append(e["ptp"])
-                results["Time series"].append(e["sig"])
 
             valid_epochs = [e["ep"] for e in entries if not np.isnan(e["p1"])]
             if valid_epochs:
@@ -3409,7 +3407,7 @@ def run_pipeline(
         "Configuration", "Stim. amplitude", "Epoch", "Channel",
         "Onset latency", "Peak1 latency", "Peak2 latency",
         "Peak1 value", "Peak2 value", "PTP amplitude",
-        "Inter-trial corr", "Time series",
+        "Inter-trial corr",
     ]}
 
     print("[SIR] Detecting epochs...", flush=True)
@@ -3909,7 +3907,6 @@ def run_pipeline(
                 results["Peak2 value"].append(e["pv2"])
                 results["PTP amplitude"].append(e["ptp"])
                 results["Inter-trial corr"].append(inter_trial_corr)
-                results["Time series"].append(e["sig"])
 
         base_name = file_name.split(".fif")[0]
         # Neurosoft curves are single stimuli of growing intensity, so the panel
