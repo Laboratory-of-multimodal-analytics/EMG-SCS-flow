@@ -3,10 +3,19 @@
 Run the EMG pipeline from the command line.
 
 Usage (from project root):
-  python run.py <input_file> [--startstop | --no-startstop] [--output-dir DIR]
+  python run.py <input_file> [--startstop] [--output-dir DIR]
 
 Input: EDF, FIF, MAT, or a text "curves" export (.txt, pre-cut epochs).
-Outputs go to results/ or --output-dir.
+
+Results go NEXT TO the recording by default, in a folder named "<subject> <file>"
+where the subject is the name of the folder the recording sits in:
+
+  (Zh14)/Th11-12.txt  ->  (Zh14)/(Zh14) Th11-12/
+
+Half the subjects have a "Th11-12.txt", so the prefix is what keeps their result
+folders apart once opened side by side or copied out. Nothing needs to be passed
+for this -- pass --output-dir only to deliberately put results somewhere else,
+which also gives up the prefix and the run-local template bank.
 """
 
 from __future__ import annotations
@@ -49,7 +58,9 @@ def main() -> None:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory root (default: results/<filename_stem>).",
+        help="Put results here instead of next to the recording. "
+             "Skips the subject prefix; templates drawn for this recording are "
+             "not picked up from the default location either.",
     )
     args = parser.parse_args()
 
