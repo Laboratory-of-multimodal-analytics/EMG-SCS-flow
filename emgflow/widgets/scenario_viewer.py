@@ -395,18 +395,27 @@ class ScenarioViewer(QWidget):
         # ---- bottom: the curves themselves ----
         post = np.asarray(self.times) >= 0.002     # scale past the stimulus artifact
         group_of = dict(zip(g["curve"], g["group"]))
+        # Curves whose response was not found are still drawn, in pale grey. The
+        # colour scale says where a curve sits in the run, not whether anything
+        # was measured on it, so without this a missed response is invisible —
+        # and telling "no response here" from "the detector lost it" is the whole
+        # point of looking at the curves.
+        found = set(g.loc[g["amp_uv"].notna(), "curve"].astype(int))
         if self.show_all.isChecked():
             norm = mcolors.Normalize(vmin=1, vmax=max(len(waves), 2))
             for i in range(len(waves)):
                 cno = i + 1
+                missing = cno not in found
                 if by_group:
                     lab = group_of.get(cno)
                     if lab is None:
                         continue
                     col = GROUP_COLORS[labels.index(lab)] if lab in labels else "0.6"
                 else:
-                    col = SWEEP_CMAP(norm(cno))
-                ax_bot.plot(t_ms, waves[i], color=col, lw=0.5, alpha=0.35, zorder=1)
+                    col = "0.78" if missing else SWEEP_CMAP(norm(cno))
+                ax_bot.plot(t_ms, waves[i], color=col, lw=0.5,
+                            alpha=0.30 if missing else 0.35,
+                            zorder=0 if missing else 1)
 
         if by_group and self.show_band.isChecked():
             for gi, lab in enumerate(labels):
