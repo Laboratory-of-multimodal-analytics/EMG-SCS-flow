@@ -256,6 +256,20 @@ STIM_ONSET_MAX_DEV_S = 0.003
 # peak. At 2.5 the response starts a median 4-5 ms before P1, which is what a
 # spinal reflex should look like.
 STIM_ONSET_K = 2.5
+
+# A curve is dropped when its response is BOTH smaller than this fraction of the
+# channel's median and shaped unlike the channel's strongest curves. Swept over the
+# Neurosoft exports: together they remove 2% of detections, none above 30 uV, which is
+# the "false peak on a weak curve" case. Either condition alone is wrong -- poor shape
+# alone throws away a genuine second response shape at full amplitude, low amplitude
+# alone throws away the foot of every recruitment curve.
+STIM_SHAPE_REL_AMP_MAX = 0.4
+STIM_SHAPE_MIN_CORR = 0.5
+# ...and it must also stand clear of its own noise by this many SDs. Shape alone
+# let through bumps correlating at 0.5-0.7 by accident at four SDs high. Applied
+# only to curves already under REL_AMP_MAX: a noisy channel's biggest responses
+# can sit at six SDs, so this is not usable as a global threshold.
+STIM_SHAPE_MIN_SNR = 8.0
 # Time-scale factors tested when matching pre-computed templates in SIR mode.
 # Keep scales near 1.0 so the synthesized template preserves the shape of the
 # original .npy templates (small scales compress them into ringing).

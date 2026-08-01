@@ -69,6 +69,9 @@ from .constants import (
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
     STIM_ONSET_K,
+    STIM_SHAPE_MIN_CORR,
+    STIM_SHAPE_MIN_SNR,
+    STIM_SHAPE_REL_AMP_MAX,
     STIM_ONSET_MAX_DEV_S,
     STIM_P1_ABS_MIN_UV,
     STIM_PEAK_AMP_MIN_UV,
@@ -120,6 +123,7 @@ from .detection import (
     add_extra_peak_to_p1,
     detect_onset_near_template,
     noise_std_from_tail,
+    small_misshapen_responses,
     detect_peak_in_window,
     find_extra_p1_peak,
     pick_epoch_value_near_latency,
@@ -3720,7 +3724,7 @@ def run_pipeline(
                 # is a constant pad with no spread to threshold against, so the
                 # noise scale comes from the quiet tail of the curve and the
                 # search runs back from this curve's own P1 — hence after it.
-                if np.isfinite(t_on_tmpl):
+                if np.isfinite(t_on_tmpl) or np.isfinite(peak1_latency):
                     onset_latency = detect_onset_near_template(
                         sig, times, sfreq, baseline_mask, t_on_tmpl,
                         win_ms=2, k=STIM_ONSET_K, sustain_ms=2,
@@ -3776,6 +3780,30 @@ def run_pipeline(
                      "pv1": peak1_value, "pv2": peak2_value,
                      "ptp": ptp_amp, "sig": sig}
                 )
+
+        # ── Drop small responses that do not look like this channel's own ──
+        n_misshapen = 0
+        for ch in eligible_channels:
+            entries = channel_epoch_results[ch]
+            if not entries:
+                continue
+            amps = np.array([
+                e["ptp"] if np.isfinite(e["ptp"]) else abs(e["pv1"]) for e in entries
+            ], dtype=float)
+            drop = small_misshapen_responses(
+                np.array([e["sig"] for e in entries], dtype=float), times,
+                np.array([e["p1"] for e in entries], dtype=float), amps,
+                rel_amp_max=STIM_SHAPE_REL_AMP_MAX, min_corr=STIM_SHAPE_MIN_CORR,
+                min_snr=STIM_SHAPE_MIN_SNR, noise_after_s=resp_tmax,
+            )
+            for e, bad in zip(entries, drop):
+                if bad:
+                    e["onset"] = e["p1"] = e["p2"] = np.nan
+                    e["pv1"] = e["pv2"] = e["ptp"] = np.nan
+                    n_misshapen += 1
+        if n_misshapen:
+            print(f"[SIR] {n_misshapen} small responses dropped as unlike their "
+                  f"channel's own shape.", flush=True)
 
         # ── Channel-level consistency / artifact rejection ──
         corr_min_median = float(STIM_CHANNEL_MIN_MEDIAN_CORR)

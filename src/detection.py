@@ -368,18 +368,25 @@ def detect_onset_near_template(
     ``detect_onset_before_peak``. Recordings that do carry pre-stimulus data keep
     the original behaviour untouched.
     """
-    if np.isnan(t_on_tmpl):
-        return np.nan
-
     base = sig_f[baseline_mask]
     bmean, bstd = base.mean(), base.std()
     w = win_ms / 1000.0
 
     if bstd == 0 or np.isnan(bstd):
+        # The backward search is anchored on P1 and never reads the template's
+        # onset marker, so it must not be gated on having one. It was, and that
+        # silently cost whole channels: a template whose onset sits more than P1's
+        # own latency ahead of it places that marker before the response window
+        # begins, where the matcher drops it as implausible. Every curve of such a
+        # channel then reported no onset while its P1 sat on a perfectly clean
+        # rise — ch7 and ch8 of the 80/90 mA run, 56 curves between them.
         return detect_onset_before_peak(
             sig_f, times, sfreq, bmean, float(noise_std), p1_lat,
             t_min=t_min, k=k, sustain_ms=sustain_ms,
         )
+
+    if np.isnan(t_on_tmpl):
+        return np.nan
 
     m = (times >= t_on_tmpl - w) & (times <= t_on_tmpl + w)
     if np.sum(m) < 5:
@@ -444,6 +451,79 @@ def detect_onset_before_peak(
     rect_s = _smoothed_deviation(sig_f, bmean, ww)[lo:i1]
     below = np.where(rect_s <= k * noise_std)[0]
     return float(times[lo + below[-1]]) if below.size else np.nan
+
+
+def small_misshapen_responses(
+    sigs: np.ndarray,
+    times: np.ndarray,
+    p1_lats: np.ndarray,
+    amps: np.ndarray,
+    win_ms: float = 6.0,
+    rel_amp_max: float = 0.4,
+    min_corr: float = 0.5,
+    min_snr: float = 8.0,
+    noise_after_s: float = 0.04,
+    min_ref: int = 3,
+) -> np.ndarray:
+    """Which of a channel's accepted curves are noise wearing a peak.
+
+    Amplitude thresholds cannot tell a small response from a lucky bump: both
+    clear them. Shape can, because a muscle's response on one recording is
+    stereotyped — so each curve is compared against what this channel's OWN
+    strongest curves look like, around the latency where its responses live. No
+    generic shape is imposed; a channel whose response is unusual is judged
+    against its own.
+
+    Being small is what makes a curve suspect; it is not what condemns it. Only
+    curves under ``rel_amp_max`` of their channel's median are judged at all —
+    the foot of a recruitment curve is small and real, and so is a channel that
+    simply responds weakly. What condemns a small curve is failing to justify
+    itself EITHER by shape OR by standing clear of its own noise.
+
+    Both escape routes are needed. Shape alone lets through bumps that correlate
+    at 0.5-0.7 by accident while sitting four noise SDs high — two such on one
+    channel here, 5 and 7 uV against that channel's 80. Noise alone cannot be
+    used as a global rule: a noisy channel's LARGEST responses can sit at six
+    SDs, and cutting on that would delete the very responses being measured.
+
+    ``sigs`` is (n_curves, n_samples) for one channel, ``amps`` its per-curve
+    response sizes. Noise is measured per curve, after ``noise_after_s``.
+    Returns a boolean mask of curves to drop.
+    """
+    out = np.zeros(len(sigs), dtype=bool)
+    ok = np.isfinite(amps) & np.isfinite(p1_lats)
+    if int(np.sum(ok)) < min_ref + 1:
+        return out
+
+    centre = float(np.median(p1_lats[ok]))
+    w = (times >= centre - win_ms / 1e3) & (times <= centre + win_ms / 1e3)
+    if int(np.sum(w)) < 5:
+        return out
+
+    idx = np.flatnonzero(ok)
+    segs = np.asarray([sigs[i][w] for i in idx], dtype=float)
+    segs = segs - segs.mean(axis=1, keepdims=True)
+
+    strongest = idx[np.argsort(amps[idx])[-max(min_ref, len(idx) // 4):]]
+    ref = np.mean([sigs[i][w] for i in strongest], axis=0)
+    ref = ref - ref.mean()
+    ref_norm = float(np.linalg.norm(ref))
+    if ref_norm == 0:
+        return out
+
+    norms = np.linalg.norm(segs, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = (segs @ ref) / (norms * ref_norm)
+    corr[~np.isfinite(corr)] = 0.0
+
+    rel = amps[idx] / max(float(np.median(amps[idx])), 1e-12)
+    snr = np.array([
+        amps[i] / max(noise_std_from_tail(sigs[i], times, noise_after_s), 1e-12)
+        for i in idx
+    ], dtype=float)
+    snr[~np.isfinite(snr)] = np.inf          # no noise estimate: do not condemn
+    out[idx] = (rel < rel_amp_max) & ((corr < min_corr) | (snr < min_snr))
+    return out
 
 
 def noise_std_from_tail(
