@@ -94,6 +94,8 @@ class MainWindow(QMainWindow):
         self.spontaneous_viewer.rerun_requested.connect(self.run)
         self.condition_viewer = ConditionViewer(self.session)
         self.condition_viewer.rerun_requested.connect(self.run)
+        self.recruitment_viewer.results_changed.connect(self._refresh_after_corrections)
+        self.condition_viewer.results_changed.connect(self._refresh_after_corrections)
 
         self.raw_browser = RawBrowser()
 
@@ -290,6 +292,28 @@ class MainWindow(QMainWindow):
         self.show_results(output_root, actual)
 
     # ------------------------------------------------------------------ #
+    def _refresh_after_corrections(self) -> None:
+        """Re-read the OTHER surfaces onto this run after corrections were applied.
+
+        The viewer that ran the recompute reloads itself and puts the selection
+        back. The rest are still drawing the tables from before it — two windows
+        onto one run quietly disagreeing about how many responses it has is worse
+        than either being merely out of date.
+
+        Deliberately does not touch the current tab: this is a correction, not a
+        new run, and moving the user somewhere else mid-pass is the behaviour
+        being fixed here.
+        """
+        root = self.session.output_dir
+        if root is None:
+            return
+        # Only the SIR mode has a second surface onto the same tables: Crop review
+        # draws its recruitment panel from them too. A Condition run has none.
+        if self.sender() is self.recruitment_viewer:
+            results = SIRResults(Path(root))
+            if results.ok:
+                self.sir_viewer.load(results)
+
     def show_results(self, output_root: Path, mode: str) -> None:
         """Populate the review surfaces from an output root — freshly produced or loaded."""
         output_root = Path(output_root)

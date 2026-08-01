@@ -24,7 +24,7 @@ import pandas as pd
 from matplotlib import colors as mcolors
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
     QListWidget, QPushButton, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
@@ -74,6 +74,10 @@ def _assign_groups(amps: pd.Series, n_groups: int) -> pd.Series:
 
 class ScenarioViewer(QWidget):
     """Response-vs-curve plot + the curves themselves, for one Neurosoft run."""
+
+    #: Emitted once corrections have been applied and the tables on disk rewritten,
+    #: so the other surfaces onto the same run stop showing the previous numbers.
+    results_changed = Signal()
 
     def __init__(self, session=None) -> None:
         super().__init__()
@@ -546,7 +550,7 @@ class ScenarioViewer(QWidget):
     def _recompute(self) -> None:
         if self.root is None:
             return
-        ch, cur = self.channel, self.selected_curve
+        ch, cur, colour = self.channel, self.selected_curve, self.color_box.currentIndex()
         try:
             done = recompute_corrections(self.root, self.scenario_key())
         except Exception as exc:
@@ -556,14 +560,30 @@ class ScenarioViewer(QWidget):
             self.mark_label.setText("Пометок нет — пересчитывать нечего.")
             return
         self.load(self.root)
+        # Put the view back exactly where it was. Correcting is iterative — mark,
+        # recompute, look, mark again — and having to find the channel and the
+        # curve again after every pass is what makes it unusable.
         rows = [self.channel_list.item(i).text() for i in range(self.channel_list.count())]
         if ch in rows:
             self.channel_list.setCurrentRow(rows.index(ch))
+        elif ch:
+            # The channel can leave the responder list once its detections are
+            # taken away. Say so rather than silently landing on another one.
+            self.mark_label.setText(
+                f"<span style='color:#b00'>{ch} больше не проходит как отвечающий "
+                "канал — все его ответы сняты.</span>")
+        self.color_box.blockSignals(True)
+        self.color_box.setCurrentIndex(colour)
+        self.color_box.blockSignals(False)
         if cur is not None:
             self.selected_curve = cur
-            self._draw()
-        self.mark_label.setText("Пересчитано: " + "; ".join(
+        self._draw()
+        self._refresh_mark_label()
+        self.mark_label.setText(self.mark_label.text() + "<br>Пересчитано: " + "; ".join(
             f"{d['channel']}/{d['curve']} — {d['kind']}" for d in done))
+        # Crop review shows the same run from its own copy of the tables; left
+        # alone it keeps drawing the numbers from before the correction.
+        self.results_changed.emit()
 
     def scenario_key(self) -> str | None:
         from src.neurosoft import JENDRASSIK, PAIRED, RECRUITMENT

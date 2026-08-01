@@ -72,6 +72,8 @@ class ConditionViewer(QWidget):
     """Amplitude vs ISI + the curves behind it, for one Condition run."""
 
     rerun_requested = Signal()
+    #: Corrections applied and the tables on disk rewritten — see ScenarioViewer.
+    results_changed = Signal()
 
     def __init__(self, session=None) -> None:
         super().__init__()
@@ -562,7 +564,7 @@ class ConditionViewer(QWidget):
         but the run is judged as a whole."""
         if self.root is None:
             return
-        ch = self.channel
+        ch, sel = self.channel, self.selected
         try:
             done = recompute_corrections(self.root)
         except Exception as exc:
@@ -572,9 +574,15 @@ class ConditionViewer(QWidget):
             self.ov_label.setText("Правок нет — пересчитывать нечего.")
             return
         self.load(self.root)                     # re-read the updated tables and arrays
+        # Back to the same channel AND the same condition: corrections are made
+        # one interval at a time, and losing the place after each pass turns a
+        # quick pass over a run into re-navigating it.
         rows = [self.channel_list.item(i).text() for i in range(self.channel_list.count())]
         if ch in rows:
             self.channel_list.setCurrentRow(rows.index(ch))
+        if sel is not None and sel in self.labels:
+            self.cond_list.setCurrentRow(self.labels.index(sel))
+        self.results_changed.emit()
         parts = [(f"{d['channel']}: {d['error']}" if "error" in d
                   else f"{d['channel']} — {d['source']}") for d in done]
         self.ov_label.setText("Пересчитано: " + "; ".join(parts))
