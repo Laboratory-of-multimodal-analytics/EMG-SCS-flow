@@ -413,6 +413,25 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._log(f"Could not restore session.json ({exc}); using defaults.")
 
+        # Recover the recording these results came from, so "Apply edits and
+        # re-run" acts on the run being looked at instead of asking for a file.
+        # session.json only exists for GUI runs; the manifest covers the rest.
+        from src.pipeline import input_from_run_manifest
+
+        src_path = self.session.input_path
+        if src_path is None or not Path(src_path).exists():
+            src_path = input_from_run_manifest(root)
+        if src_path is not None:
+            self.session.input_path = Path(src_path)
+            self._log(f"These results came from {src_path}")
+            self._adapt_to_text_curves(Path(src_path))
+        else:
+            self.session.input_path = None
+            self._log(
+                "The source recording could not be located from this folder — "
+                "re-running will ask for it. Everything else works."
+            )
+
         self.session.output_dir = root
         self.session.set_mode(mode)
         self.mode_box.blockSignals(True)
@@ -421,7 +440,11 @@ class MainWindow(QMainWindow):
         self.settings_panel.rebuild()
         self._sync_tabs()
 
-        self.file_label.setText(f"{root.name}   (loaded results)")
+        self.file_label.setText(
+            f"{root.name}   (loaded results)"
+            if self.session.input_path is None
+            else f"{Path(self.session.input_path).name}   (loaded results — re-run works)"
+        )
         self.run_btn.setEnabled(self.session.input_path is not None)
         self._log(f"Loaded {mode.upper()} results from {root}")
         self.show_results(root, mode)

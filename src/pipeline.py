@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, Counter
 from pathlib import Path
+import json
 import re
 
 import mne
@@ -2714,6 +2715,63 @@ def _default_output_root_for_input(edf_path: Path) -> Path:
     return edf_path.parent / name
 
 
+RUN_MANIFEST_NAME = "run.json"
+
+
+def run_manifest_path(output_root: str | Path) -> Path:
+    return Path(output_root) / "review" / RUN_MANIFEST_NAME
+
+
+def write_run_manifest(output_root: Path, edf_path: Path, scenario: str | None) -> None:
+    """Record which recording produced these results.
+
+    Without it a results folder is a dead end: opened later — in the GUI's run
+    list, or after the session that made it is gone — nothing in the tree says
+    what it was computed FROM, so anything that needs to touch the source again
+    (re-running with corrections, in particular) has to ask the user to find the
+    file by hand.
+
+    Written after the recording has loaded, so a file that fails to parse leaves
+    no folder behind.
+    """
+    p = run_manifest_path(output_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(
+        {"input": str(Path(edf_path).resolve()),
+         "input_name": Path(edf_path).name,
+         "scenario": scenario},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def input_from_run_manifest(output_root: str | Path) -> Path | None:
+    """The recording these results came from, or None if it cannot be located.
+
+    Falls back to the folder name for runs made before the manifest existed:
+    the default layout puts results beside the recording as ``<subject> <stem>``
+    (see ``_default_output_root_for_input``), which is enough to find it again.
+    """
+    root = Path(output_root)
+    p = run_manifest_path(root)
+    if p.exists():
+        try:
+            src = Path(json.loads(p.read_text(encoding="utf-8"))["input"])
+            if src.exists():
+                return src
+        except Exception:
+            pass
+    name = root.name
+    subject = root.parent.name
+    stems = [name]
+    if subject and name.startswith(subject + " "):
+        stems.append(name[len(subject) + 1:])
+    for stem in stems:
+        for suffix in (".txt", ".mat", ".fif", ".edf"):
+            cand = root.parent / f"{stem}{suffix}"
+            if cand.exists():
+                return cand
+    return None
+
+
 def run_pipeline(
     edf_path: str | Path,
     output_dir: str | Path | None = None,
@@ -2851,6 +2909,7 @@ def run_pipeline(
         # steps along the curve, so nothing about the fixed-t0 SIR path applies.
         # Its own analysis writes the complete deliverable and returns.
         if not use_startstop and neurosoft_scenario == CONDITION:
+            write_run_manifest(output_root, edf_path, neurosoft_scenario)
             cond_info = scen_info.get("signal")
             if cond_info is None:
                 _, cond_info = is_condition_paradigm(arr, float(ready.info["sfreq"]))
@@ -2890,6 +2949,8 @@ def run_pipeline(
         )
     else:
         raw = mne.io.read_raw_edf(edf_path, preload=True)
+
+    write_run_manifest(output_root, edf_path, neurosoft_scenario)
 
     original_fif_path = ensure_dir(paths["data_dir"]) / f"{edf_path.stem}_original_raw.fif"
     raw.save(original_fif_path, overwrite=True)
