@@ -64,15 +64,19 @@ per channel, with a 95 % CI band across the epochs of each crop (a single-trial 
 a zero-width band rather than a fabricated interval). A histogram view is a dropdown away.
 The pipeline still writes its own summary tables — this is for looking.
 
-### Crop review — Markers mode
+### Crop review — channel decisions
 
 | Action | Effect | Global it writes |
 |---|---|---|
-| click a peak | force P1 onto it, polarity from the dropdown (or the sign under the cursor) | `SIR_FORCE_POS_P1_AFTER` / `SIR_FORCE_NEG_P1_AFTER` |
 | Shift+click, or double-click a table row | reject as a false positive | `SIR_SUPPRESS_KEYS` |
 | Ctrl+click | whitelist — bypass the consistency gates | `SIR_FORCE_KEYS` |
 | Alt+click | exclude the whole channel | `SIR_EXCLUDE_CHANNELS` |
-| right-click | clear the forced marker | — |
+
+What is edited here is which channels count, not where their response is. Placing P1 by hand
+used to live here too — click a peak, pick a polarity from a dropdown, bind it to a window —
+and it is gone: a template drawn over the response says the same thing better, since it carries
+the whole shape and its markers instead of one latency and an arrow. Draw one in Template mode,
+or place onset/P1/P2 directly on the scenario and Condition tabs.
 
 **Rejection is immediate and everywhere at once**: the markers vanish from the plot, the channel
 row in the table drops to 0 detections and reads `rejected`, the crop's count in the list falls,
@@ -81,14 +85,7 @@ match what you see — and because it is stored as `SIR_SUPPRESS_KEYS`, the next
 reproduces the same decision.
 
 Edits are written at the most specific `(config, amp, channel)` precedence level, so they are
-**additive**: forcing or rejecting on one crop cannot alter a crop you did not name. Clicking left
-of `t = 0` forces a peak *before* the stimulus, which is allowed and sometimes correct.
-
-“Bind P1 to ±3 ms” writes `(min_lat, max_lat)` so P1 cannot drift to a stronger later peak;
-unchecked, it writes a bare `min_lat` and P1 becomes the dominant deflection at or after the click.
-
-A forced marker is drawn explicitly: the bound window (or the minimum latency) is shaded in
-purple, labelled with the latency in ms, and an arrow shows which way P1 was forced to point.
+**additive**: rejecting on one crop cannot alter a crop you did not name.
 
 ### Crop review — Template mode
 

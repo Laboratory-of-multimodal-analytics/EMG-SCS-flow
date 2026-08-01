@@ -57,9 +57,7 @@ class Session:
     template_dir: Path | None = None
     template_only_user: bool = False
 
-    # ---- manual edits (SIR) — the force/suppress/exclude system ----
-    force_pos_p1: dict[ForceKey, Any] = field(default_factory=dict)
-    force_neg_p1: dict[ForceKey, Any] = field(default_factory=dict)
+    # ---- manual edits (SIR) — the whitelist/suppress/exclude system ----
     force_keys: set[tuple[str, str, str]] = field(default_factory=set)      # bypass the gates
     suppress_keys: set[tuple[str, str, str]] = field(default_factory=set)   # force-drop
     exclude_channels: set[str] = field(default_factory=set)
@@ -91,32 +89,6 @@ class Session:
     # Edits. Every one is ADDITIVE: it touches only the named
     # (config, amp, channel) and never overwrites unmentioned detections.
     # ------------------------------------------------------------------ #
-    def force_p1(
-        self,
-        config: str,
-        amp: str,
-        channel: str,
-        positive: bool,
-        min_lat: float,
-        max_lat: float | None = None,
-    ) -> None:
-        """Force P1 onto a deflection of the chosen polarity inside [min_lat, max_lat].
-
-        A negative `min_lat` forces a peak BEFORE t=0 (used for early near-zero peaks).
-        Writing the most specific 3-level key so the edit cannot leak onto other crops.
-        """
-        key = (config, amp, channel)
-        value = min_lat if max_lat is None else (min_lat, max_lat)
-        target = self.force_pos_p1 if positive else self.force_neg_p1
-        other = self.force_neg_p1 if positive else self.force_pos_p1
-        other.pop(key, None)  # a peak cannot be forced to both polarities
-        target[key] = value
-
-    def clear_force(self, config: str, amp: str, channel: str) -> None:
-        key = (config, amp, channel)
-        self.force_pos_p1.pop(key, None)
-        self.force_neg_p1.pop(key, None)
-
     def toggle_suppress(self, config: str, amp: str, channel: str) -> bool:
         key = (config, amp, channel)
         if key in self.suppress_keys:
@@ -152,13 +124,7 @@ class Session:
     def edit_state(self, config: str, amp: str, channel: str) -> dict[str, Any]:
         """What the viewer needs to render the current state of one (config, amp, channel)."""
         key = (config, amp, channel)
-        forced = None
-        if key in self.force_pos_p1:
-            forced = ("pos", self.force_pos_p1[key])
-        elif key in self.force_neg_p1:
-            forced = ("neg", self.force_neg_p1[key])
         return {
-            "forced": forced,
             "suppressed": key in self.suppress_keys,
             "whitelisted": key in self.force_keys,
             "channel_excluded": channel in self.exclude_channels,
@@ -197,9 +163,7 @@ class Session:
             elif lever.target == "default":
                 _rebind_default(P, lever.owner, name, _coerce(name, value))
 
-        # The force/suppress/exclude system.
-        P.SIR_FORCE_POS_P1_AFTER = dict(self.force_pos_p1)
-        P.SIR_FORCE_NEG_P1_AFTER = dict(self.force_neg_p1)
+        # The whitelist/suppress/exclude system.
         P.SIR_FORCE_KEYS = set(self.force_keys)
         P.SIR_SUPPRESS_KEYS = set(self.suppress_keys)
         P.SIR_EXCLUDE_CHANNELS = set(self.exclude_channels)
@@ -223,8 +187,6 @@ class Session:
             "template_dir": str(self.template_dir) if self.template_dir else None,
             "template_only_user": self.template_only_user,
             "settings": {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.settings.items()},
-            "force_pos_p1": [[list(k), v] for k, v in self.force_pos_p1.items()],
-            "force_neg_p1": [[list(k), v] for k, v in self.force_neg_p1.items()],
             "force_keys": [list(k) for k in sorted(self.force_keys)],
             "suppress_keys": [list(k) for k in sorted(self.suppress_keys)],
             "exclude_channels": sorted(self.exclude_channels),
@@ -241,10 +203,6 @@ class Session:
             template_dir=Path(d["template_dir"]) if d.get("template_dir") else None,
             template_only_user=bool(d.get("template_only_user", False)),
         )
-        s.force_pos_p1 = {tuple(k): (tuple(v) if isinstance(v, list) else v)
-                          for k, v in d.get("force_pos_p1", [])}
-        s.force_neg_p1 = {tuple(k): (tuple(v) if isinstance(v, list) else v)
-                          for k, v in d.get("force_neg_p1", [])}
         s.force_keys = {tuple(k) for k in d.get("force_keys", [])}
         s.suppress_keys = {tuple(k) for k in d.get("suppress_keys", [])}
         s.exclude_channels = set(d.get("exclude_channels", []))
@@ -283,8 +241,6 @@ class Session:
         ]
 
         edit_lines = [
-            f"P.SIR_FORCE_POS_P1_AFTER = {dict(self.force_pos_p1)!r}",
-            f"P.SIR_FORCE_NEG_P1_AFTER = {dict(self.force_neg_p1)!r}",
             f"P.SIR_FORCE_KEYS = {set(self.force_keys) or set()!r}",
             f"P.SIR_SUPPRESS_KEYS = {set(self.suppress_keys) or set()!r}",
             f"P.SIR_EXCLUDE_CHANNELS = {set(self.exclude_channels) or set()!r}",

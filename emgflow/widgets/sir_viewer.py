@@ -8,9 +8,10 @@ Markers are drawn the way the pipeline's own panels draw them: a point per epoch
 blue, P1 red, P2 green — not a line at the median, which hid how consistent the detection
 actually was across trials.
 
-Two interaction modes:
-  * Markers  — click a peak to force P1; shift/ctrl/alt-click to reject, whitelist, exclude.
-  * Template — drag over a response, check its markers, and it becomes a matching template.
+Editing here is about which channels count, not about where the response is: shift /
+ctrl / alt-click reject a channel, whitelist it past the gates, or drop it from the run.
+Saying where the response IS, and which way it points, is the template's job — draw one
+over the response and the detector matches that shape instead.
 """
 
 from __future__ import annotations
@@ -22,8 +23,8 @@ from matplotlib import colors as mcolors
 from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSplitter,
+    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLabel,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -64,22 +65,12 @@ class SIRViewer(QWidget):
         lv.addWidget(self.exclude_config_btn)
 
         # ---- middle: the channel column ----
-        self.mode_markers = QRadioButton("Markers")
-        self.mode_markers.setChecked(True)
-        self.mode_markers.toggled.connect(self._on_mode_changed)
-        self.mode_template = QRadioButton("Template")
-        self.mode_template.setToolTip("Drag over a response to turn it into a matching template.")
-        self.mode_template.toggled.connect(self._on_mode_changed)
-
-        self.polarity = QComboBox()
-        self.polarity.addItems(["auto", "force ↑", "force ↓"])
-        self.polarity.setToolTip("Polarity of the forced P1. 'auto' = the sign under the cursor.")
-        self.bind_window = QCheckBox("±3 ms")
-        self.bind_window.setChecked(True)
-        self.bind_window.setToolTip(
-            "On: writes (min_lat, max_lat) so P1 cannot drift to a stronger later peak.\n"
-            "Off: writes a bare min_lat — P1 = the dominant deflection at or after the click."
+        self.mode_template = QCheckBox("Template mode")
+        self.mode_template.setToolTip(
+            "On: drag over a response to turn it into a matching template.\n"
+            "Off: clicks select channels for rejecting, whitelisting and excluding."
         )
+        self.mode_template.toggled.connect(self._on_mode_changed)
 
         self.make_template_btn = QPushButton("Make template…")
         self.make_template_btn.setEnabled(False)
@@ -96,8 +87,7 @@ class SIRViewer(QWidget):
         # One compact row: every pixel spent here is a pixel the channel stack loses.
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
-        for wdg in (self.mode_markers, self.mode_template, self.polarity,
-                    self.bind_window, self.make_template_btn, self.only_user_templates):
+        for wdg in (self.mode_template, self.make_template_btn, self.only_user_templates):
             bar.addWidget(wdg)
         bar.addStretch()
 
@@ -197,16 +187,14 @@ class SIRViewer(QWidget):
     # ------------------------------------------------------------------ #
     def _on_mode_changed(self) -> None:
         template = self.mode_template.isChecked()
-        self.polarity.setEnabled(not template)
-        self.bind_window.setEnabled(not template)
         self.only_user_templates.setEnabled(template)
         self.make_template_btn.setEnabled(template and self._selection is not None)
         self.hint.setText(
             "Template mode — drag over the response you want detected, then "
             "“Make template from selection…” to check its markers and save it."
             if template else
-            "Click: force P1 · Shift+click: reject · Ctrl+click: whitelist · "
-            "Alt+click: exclude channel · right-click: clear."
+            "Shift+click: reject · Ctrl+click: whitelist · "
+            "Alt+click: exclude channel."
         )
         self._draw()
 
@@ -272,9 +260,6 @@ class SIRViewer(QWidget):
             if detected and not rejected:
                 self._scatter_markers(ax, m, times, data[:, idx, :])
 
-            if state["forced"]:
-                self._draw_forced(ax, state["forced"])
-
             style_channel_axis(
                 ax, ch + (self._tag(state) or ""),
                 bold=detected and not rejected, muted=rejected, compact=True,
@@ -306,9 +291,6 @@ class SIRViewer(QWidget):
     @staticmethod
     def _tag(state) -> str:
         tags = []
-        if state["forced"]:
-            pol, val = state["forced"]
-            tags.append(f"forced {'↑' if pol == 'pos' else '↓'}")
         if state["suppressed"]:
             tags.append("REJECTED")
         if state["whitelisted"]:
@@ -331,31 +313,6 @@ class SIRViewer(QWidget):
                     continue
                 i = int(np.argmin(np.abs(times - float(t))))
                 ax.scatter(float(t), ch_data[ep, i], color=colour, s=MARKER_SIZE, zorder=5)
-
-    def _draw_forced(self, ax, forced) -> None:
-        """Show exactly which latency was forced and which way P1 must point."""
-        pol, val = forced
-        up = pol == "pos"
-        colour = "#8e44ad"
-        if isinstance(val, (tuple, list)):
-            lo, hi = float(val[0]), float(val[1])
-            ax.axvspan(lo, hi, color=colour, alpha=0.12, lw=0, zorder=0)
-            t = 0.5 * (lo + hi)
-            label = f"forced {'↑' if up else '↓'}  {1000 * lo:.0f}…{1000 * hi:.0f} ms"
-        else:
-            t = float(val)
-            ax.axvline(t, color=colour, lw=1.0, ls="--", zorder=4)
-            label = f"forced {'↑' if up else '↓'}  ≥ {1000 * t:.0f} ms"
-        ax.annotate(
-            label, xy=(t, 1.0), xycoords=("data", "axes fraction"),
-            xytext=(0, -10), textcoords="offset points",
-            ha="center", va="top", fontsize=7, color=colour,
-        )
-        lo_y, hi_y = ax.get_ylim()
-        ax.annotate(
-            "↑" if up else "↓", xy=(t, hi_y * 0.6 if up else lo_y * 0.6),
-            ha="center", va="center", fontsize=14, color=colour, zorder=6,
-        )
 
     # ------------------------------------------------------------------ #
     def _refresh_table(self) -> None:
@@ -431,22 +388,14 @@ class SIRViewer(QWidget):
         cfg, amp = self.crop.config, self.crop.amp
         mods = event.guiEvent.modifiers() if event.guiEvent is not None else Qt.NoModifier
 
-        if event.button == 3:
-            self.session.clear_force(cfg, amp, ch)
-        elif mods & Qt.AltModifier:
+        if mods & Qt.AltModifier:
             self.session.toggle_exclude_channel(ch)
         elif mods & Qt.ShiftModifier:
             self.session.toggle_suppress(cfg, amp, ch)
         elif mods & Qt.ControlModifier:
             self.session.toggle_whitelist(cfg, amp, ch)
         else:
-            t = float(event.xdata)
-            mode = self.polarity.currentIndex()
-            positive = (mode == 1) if mode in (1, 2) else float(event.ydata) >= 0.0
-            if self.bind_window.isChecked():
-                self.session.force_p1(cfg, amp, ch, positive, t - 0.003, t + 0.003)
-            else:
-                self.session.force_p1(cfg, amp, ch, positive, t)
+            return
 
         self._draw()
         self._refresh_crop_list()
