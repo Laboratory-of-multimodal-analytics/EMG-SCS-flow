@@ -40,8 +40,38 @@ def _sir_dir(output_root: Path) -> Path:
     return find_mode_dir(output_root, STIMULATION_INDUCED_FOLDER)
 
 
+def shared_excel_dir(output_root: Path) -> Path:
+    """The one folder holding every table this run produced.
+
+    Deliberately not one per scenario: the tables are what gets opened months
+    later, and hunting for them across Recruitment/Excel, Jendrassik/Excel and
+    results/Excel means having to remember which protocol a recording was.
+    """
+    return _sir_dir(output_root) / "Excel"
+
+
 def _metrics_csv(output_root: Path) -> Path:
-    return _sir_dir(output_root) / "Excel" / "Large_dataset_emg_response_metrics.csv"
+    return shared_excel_dir(output_root) / "Large_dataset_emg_response_metrics.csv"
+
+
+def drop_legacy_excel_dir(scenario_dir: Path) -> None:
+    """Clear the per-scenario Excel folder earlier versions wrote.
+
+    Re-running a recording would otherwise leave the old copies sitting beside
+    the new ones, differing by however much detection has changed since — and
+    nothing marks which is which. Only files this module writes are removed, and
+    the folder only if that empties it.
+    """
+    d = Path(scenario_dir) / "Excel"
+    if not d.is_dir():
+        return
+    for f in d.glob("*.csv"):
+        if (f.name.startswith(("recruitment_", "stats_", "curves_by_amplitude_group"))):
+            f.unlink()
+    try:
+        d.rmdir()
+    except OSError:
+        pass          # something unexpected in there — leave it alone
 
 
 def _stats(series: pd.Series) -> dict:
@@ -112,7 +142,7 @@ def run_recruitment_analysis(
         return None
 
     out_dir = _sir_dir(output_root) / "Recruitment"
-    excel_dir = ensure_dir(out_dir / "Excel")
+    excel_dir = ensure_dir(shared_excel_dir(output_root))
 
     # On these files P2 and PTP are routinely undetected (monophasic responses),
     # and an all-NaN table, column or box-plot panel is just noise. Report only
@@ -167,8 +197,9 @@ def run_recruitment_analysis(
                                   "Metric": metric, **_stats(dg[metric])})
     pd.DataFrame(grp_stats).to_csv(excel_dir / "stats_amplitude_groups.csv", index=False)
 
-    print(f"[RECRUITMENT] {len(responders)} channels, {len(curves)} curves -> {out_dir}",
-          flush=True)
+    drop_legacy_excel_dir(out_dir)
+    print(f"[RECRUITMENT] {len(responders)} channels, {len(curves)} curves -> {out_dir}"
+          f"; tables -> {excel_dir}", flush=True)
     return out_dir
 
 

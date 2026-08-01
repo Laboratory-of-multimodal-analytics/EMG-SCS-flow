@@ -109,6 +109,11 @@ def build_output_dirs(output_root: Path, startstop_mode: bool = False) -> dict[s
         "results_dir": output_root / "results",
         "stim_results_dir": stim_results_dir,
         "epochs_dir": stim_results_dir / "Stimulus-centered epochs",
+        # Every table of a run goes here, whatever produced it — the per-epoch
+        # metrics, the scenario deliverables, the condition summaries. They used
+        # to be split between this folder and one inside each scenario's, which
+        # meant knowing which scenario a file was before knowing where to look
+        # for its numbers. Figures still live with their scenario.
         "excel_dir": results_dir / "Excel",
         "boxplot_dir": results_dir / "Boxplots",
         "plots_grid_dir": results_dir / "Plots with grid and markers",

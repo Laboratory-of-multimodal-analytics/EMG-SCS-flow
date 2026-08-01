@@ -38,6 +38,8 @@ from .io_utils import ensure_dir
 from .neurosoft import JENDRASSIK, PAIRED
 from .recruitment import (
     channel_group_labels,
+    drop_legacy_excel_dir,
+    shared_excel_dir,
     _assign_amplitude_groups,
     _grid,
     _metrics_csv,
@@ -139,7 +141,7 @@ def run_curve_group_analysis(
         return None
 
     out_dir = _sir_dir(output_root) / style["folder"]
-    excel_dir = ensure_dir(out_dir / "Excel")
+    excel_dir = ensure_dir(shared_excel_dir(output_root))
 
     tidy = _assign_amplitude_groups(tidy, responders, n_groups)
     n_seen = max((len(channel_group_labels(tidy, ch)) for ch in responders), default=1)
@@ -192,11 +194,12 @@ def run_curve_group_analysis(
     _plot_group_boxplots(tidy, responders, labels, colors,
                          out_dir / "amplitude_by_group_boxplots.png")
 
+    drop_legacy_excel_dir(out_dir)
     per_ch = sorted({len(channel_group_labels(tidy, ch)) for ch in responders})
     how = (f"{n_groups} amplitude groups" if n_groups is not None
            else f"amplitude groups from the data ({'/'.join(map(str, per_ch))} per channel)")
     print(f"[{log}] {len(responders)} channels, {tidy['Curve'].nunique()} curves, "
-          f"{how} -> {out_dir}", flush=True)
+          f"{how} -> {out_dir}; tables -> {excel_dir}", flush=True)
     return out_dir
 
 
