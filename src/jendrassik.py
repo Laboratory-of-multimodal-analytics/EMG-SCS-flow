@@ -37,6 +37,7 @@ from .constants import TEXT_CURVES_RESP_TMIN
 from .io_utils import ensure_dir
 from .neurosoft import JENDRASSIK, PAIRED
 from .recruitment import (
+    channel_group_labels,
     _assign_amplitude_groups,
     _grid,
     _metrics_csv,
@@ -109,12 +110,21 @@ def _load_epoch_waveforms(output_root: Path):
 def run_curve_group_analysis(
     output_root: Path,
     scenario: str = JENDRASSIK,
-    n_groups: int = CURVE_GROUPS,
+    n_groups: int | None = None,
 ) -> Path | None:
     """Build the curve/amplitude-group tables and figures from a finished SIR run.
 
+    ``n_groups=None`` lets each channel's own amplitudes decide how many groups
+    it has. That is right for paired stimulation, where nothing fixes the number.
+    The Jendrassik protocol does fix it — a block without the manoeuvre and a
+    block with it, per intensity — so its caller passes the count; falling back
+    to the data there would let a channel whose two blocks happen to overlap
+    collapse into one group and lose the comparison the test is for.
+
     Returns the output directory, or None when there is nothing to report.
     """
+    if n_groups is None and scenario == JENDRASSIK:
+        n_groups = _jendrassik_groups_from_name(output_root)
     style = _SCENARIO_STYLE.get(scenario, _SCENARIO_STYLE[JENDRASSIK])
     log = style["log"]
     output_root = Path(output_root)
@@ -132,8 +142,9 @@ def run_curve_group_analysis(
     excel_dir = ensure_dir(out_dir / "Excel")
 
     tidy = _assign_amplitude_groups(tidy, responders, n_groups)
-    labels = [f"G{i + 1}" for i in range(n_groups)]
-    colors = _group_colors(n_groups)
+    n_seen = max((len(channel_group_labels(tidy, ch)) for ch in responders), default=1)
+    labels = [f"G{i + 1}" for i in range(n_seen)]
+    colors = _group_colors(n_seen)
 
     # ── per-curve table (with the group each curve landed in) ──
     out = tidy.copy()
@@ -181,12 +192,25 @@ def run_curve_group_analysis(
     _plot_group_boxplots(tidy, responders, labels, colors,
                          out_dir / "amplitude_by_group_boxplots.png")
 
+    per_ch = sorted({len(channel_group_labels(tidy, ch)) for ch in responders})
+    how = (f"{n_groups} amplitude groups" if n_groups is not None
+           else f"amplitude groups from the data ({'/'.join(map(str, per_ch))} per channel)")
     print(f"[{log}] {len(responders)} channels, {tidy['Curve'].nunique()} curves, "
-          f"{n_groups} amplitude groups -> {out_dir}", flush=True)
+          f"{how} -> {out_dir}", flush=True)
     return out_dir
 
 
-def run_jendrassik_analysis(output_root: Path, n_groups: int = CURVE_GROUPS):
+def _jendrassik_groups_from_name(output_root: Path) -> int:
+    """Two groups per intensity named in the recording's file name."""
+    from .neurosoft import intensities_from_name
+    from .pipeline import input_from_run_manifest
+
+    src = input_from_run_manifest(output_root)
+    n = len(intensities_from_name(src)) if src is not None else 0
+    return 2 * max(n, 1)
+
+
+def run_jendrassik_analysis(output_root: Path, n_groups: int | None = None):
     """Backwards-compatible entry point for the Jendrassik scenario."""
     return run_curve_group_analysis(output_root, JENDRASSIK, n_groups)
 
@@ -257,6 +281,8 @@ def _plot_group_boxplots(tidy, responders, labels, colors, out_path):
     for i, ch in enumerate(responders):
         ax = axes[i // ncol][i % ncol]
         d = tidy[tidy["Channel"] == ch]
+        # A channel keeps only the groups its own amplitudes produced.
+        labels = channel_group_labels(tidy, ch) or labels
         data = [d.loc[d["Amplitude group"] == g, "Amplitude uV"].dropna().values
                 for g in labels]
         bp = ax.boxplot(data, positions=np.arange(len(labels)), widths=0.6,

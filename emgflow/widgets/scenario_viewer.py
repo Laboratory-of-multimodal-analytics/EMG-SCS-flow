@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from src.jendrassik import CURVE_GROUPS
 from src.neurosoft import intensities_from_name
 from src.plotting import SWEEP_CMAP
-from src.recruitment import RECRUITMENT_N_GROUPS, cluster_amplitudes
+from src.recruitment import choose_n_groups, cluster_amplitudes
 from matplotlib.widgets import SpanSelector
 
 from src.sir_review import (FALSE, MARKERS, MISSED, WINDOW, curve_mark, load_overrides,
@@ -46,26 +46,32 @@ from .template_editor import TemplateEditor
 from ..results import SIRResults
 
 #: Folder the pipeline wrote -> (tab label, default colouring, number of groups).
-#: Two groups on the Jendrassik/paired files: those runs are a block of test
-#: stimuli and a block with the manoeuvre at the same intensity, which is the
-#: split the clinician reads off them.
+#: Only Jendrassik fixes the count, and from the protocol: a block of test stimuli
+#: and a block with the manoeuvre, per intensity. Elsewhere None means each
+#: channel's own amplitudes decide — nothing about a recruitment ramp or a
+#: paired-pulse run says how many response levels it should have.
 SCENARIOS = {
-    "Recruitment": ("Recruitment curve", "curve order", RECRUITMENT_N_GROUPS),
+    "Recruitment": ("Recruitment curve", "curve order", None),
     "Jendrassik": ("Jendrassik manoeuvre", "amplitude group", CURVE_GROUPS),
-    "Paired stimulation": ("Paired stimulation", "amplitude group", CURVE_GROUPS),
+    "Paired stimulation": ("Paired stimulation", "amplitude group", None),
 }
 
 #: Group colours, matching src/jendrassik.py so the GUI and the PNGs agree.
 GROUP_COLORS = ["#4575b4", "#f0a202", "#d73027", "#4d9221", "#7b3294"]
 
 
-def _assign_groups(amps: pd.Series, n_groups: int) -> pd.Series:
+def _assign_groups(amps: pd.Series, n_groups: int | None) -> pd.Series:
     """Group one channel's curves by response amplitude (low..high).
 
     Uses the pipeline's own clustering so the on-screen grouping is exactly the
     one in the exported tables — equal-sized quantile bins would cut through the
     two protocol blocks instead of finding them.
+
+    ``n_groups=None`` means the channel's own amplitudes decide, as they do for
+    recruitment and paired stimulation.
     """
+    if n_groups is None:
+        n_groups = choose_n_groups(amps.to_numpy(float))
     labels = [f"G{i + 1}" for i in range(n_groups)]
     idx = cluster_amplitudes(amps.to_numpy(float), n_groups)
     return pd.Series([labels[i] if i >= 0 else None for i in idx],
@@ -88,7 +94,7 @@ class ScenarioViewer(QWidget):
         self.times: np.ndarray | None = None
         self.waves: dict[str, np.ndarray] = {}
         self.channel: str | None = None
-        self.n_groups: int = RECRUITMENT_N_GROUPS
+        self.n_groups: int | None = None
         self.root: Path | None = None
         self.overrides: dict = {}
         self._span: tuple[float, float] | None = None
@@ -223,7 +229,7 @@ class ScenarioViewer(QWidget):
             return
 
         label, default_colour, self.n_groups = SCENARIOS.get(
-            self.scenario, (self.scenario, "curve order", RECRUITMENT_N_GROUPS))
+            self.scenario, (self.scenario, "curve order", None))
         crops = self.results.crops
         if not crops:
             self.header.setText(f"<b>{label}</b>")
@@ -233,7 +239,7 @@ class ScenarioViewer(QWidget):
         crop = crops[0]                      # a curve export is always a single crop
         # Group count follows the intensities named in the file, exactly as the
         # pipeline does it, so the on-screen groups are the exported ones.
-        if self.scenario != "Recruitment":
+        if self.scenario == "Jendrassik":
             intensities = intensities_from_name(crop.config)
             self.n_groups = 2 * max(len(intensities), 1)
         self.by_curve = self.results.recruitment_by_curve(crop.config, self.session)
@@ -332,7 +338,8 @@ class ScenarioViewer(QWidget):
 
         g = self._groups_for(ch)
         by_group = self.color_box.currentIndex() == 1
-        labels = [f"G{i + 1}" for i in range(self.n_groups)]
+        # A channel keeps only the groups its own amplitudes produced.
+        labels = sorted(g["group"].dropna().unique(), key=lambda s: int(str(s)[1:]))
         waves = self.waves[ch]
         t_ms = np.asarray(self.times) * 1e3
 

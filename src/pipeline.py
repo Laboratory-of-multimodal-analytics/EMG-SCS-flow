@@ -4083,9 +4083,12 @@ def run_pipeline(
         # -> two response levels. A name that says "80 и 90 мА" means that pair
         # was run at each of two intensities -> four. Nothing in the export
         # itself records the current, so the name is the only source.
+        # Only the Jendrassik protocol fixes the count. Paired stimulation does
+        # not, so its channels are grouped by whatever levels they actually show.
         intensities = intensities_from_name(edf_path)
-        n_groups = 2 * max(len(intensities), 1)
-        if intensities:
+        n_groups = (2 * max(len(intensities), 1)
+                    if neurosoft_scenario == JENDRASSIK else None)
+        if intensities and n_groups is not None:
             print(
                 f"[NEUROSOFT] intensities in the name: "
                 f"{', '.join(f'{v} mA' for v in intensities)} -> "

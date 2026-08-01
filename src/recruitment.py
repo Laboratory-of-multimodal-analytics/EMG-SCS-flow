@@ -96,7 +96,7 @@ def _tidy_metrics(csv: Path):
 def run_recruitment_analysis(
     output_root: Path,
     top_n: int = RECRUITMENT_TOP_N,
-    n_groups: int = RECRUITMENT_N_GROUPS,
+    n_groups: int | None = None,
 ) -> Path | None:
     """Build the recruitment tables/plots from a finished SIR run. Returns the
     output directory, or None if the metrics CSV is missing/empty."""
@@ -212,21 +212,97 @@ def cluster_amplitudes(values: np.ndarray, k: int) -> np.ndarray:
     return out
 
 
+def _silhouette_1d(x: np.ndarray, labels: np.ndarray) -> float:
+    """Mean silhouette of a 1-D clustering. NaN when there is only one cluster."""
+    uniq = np.unique(labels)
+    if uniq.size < 2:
+        return np.nan
+    d = np.abs(x[:, None] - x[None, :])
+    s = np.empty(len(x), dtype=float)
+    for i in range(len(x)):
+        own = labels == labels[i]
+        n_own = int(own.sum())
+        a = (d[i, own].sum() / (n_own - 1)) if n_own > 1 else 0.0
+        b = min(d[i, labels == u].mean() for u in uniq if u != labels[i])
+        s[i] = 0.0 if max(a, b) == 0 else (b - a) / max(a, b)
+    return float(np.mean(s))
+
+
+def choose_n_groups(
+    values: np.ndarray,
+    k_max: int = 5,
+    min_silhouette: float = 0.70,
+    min_per_group: int = 3,
+) -> int:
+    """How many amplitude groups this channel's curves actually fall into.
+
+    A. Militskova asked for the curves "grouped by similar amplitude values" and
+    named no number, so imposing one is a guess — and the wrong guess is visible:
+    forcing three groups onto a channel whose responses form two natural levels
+    splits one of them down the middle, and forcing three onto a channel with no
+    grouping at all invents structure out of a smooth ramp.
+
+    So the count is read off the data: k-means for each k, scored by silhouette
+    (how much better a point fits its own group than the nearest other one).
+    Returns 1 — no grouping — when the best score fails ``min_silhouette``,
+    which is the honest answer for a channel whose amplitudes rise smoothly.
+
+    Groups smaller than ``min_per_group`` disqualify a k: a "group" of one curve
+    has no spread to report and is what an outlier produces.
+
+    The 0.70 cut-off is where the two cases part on synthetic checks: amplitudes
+    that really do form levels score 0.76 to 0.95 even when the levels nearly
+    touch, while a smooth ramp and a flat scatter both top out at 0.60-0.61 — a
+    ramp cut in half looks half-decent to any clustering score, which is exactly
+    the invented structure that has to be refused.
+    """
+    v = np.asarray(values, dtype=float)
+    x = v[np.isfinite(v)]
+    if x.size < 2 * min_per_group or np.unique(x).size < 2:
+        return 1
+
+    best_k, best_score = 1, -np.inf
+    for k in range(2, min(int(k_max), int(np.unique(x).size)) + 1):
+        idx = cluster_amplitudes(x, k)
+        counts = np.bincount(idx[idx >= 0], minlength=k)
+        if counts.min() < min_per_group:
+            continue
+        score = _silhouette_1d(x, idx)
+        if np.isfinite(score) and score > best_score:
+            best_k, best_score = k, score
+    return best_k if best_score >= min_silhouette else 1
+
+
 def _assign_amplitude_groups(tidy, responders, n_groups):
     """Group each channel's curves by response amplitude (low..high).
 
     Grouping is per channel: the same curve can land in different groups on
     different muscles, which is the point — the manoeuvre does not facilitate
     every muscle equally.
+
+    ``n_groups=None`` means the count is not known in advance and is read off
+    each channel's own amplitudes. That is the case wherever the protocol does
+    not fix it: a recruitment ramp and a paired-pulse run have however many
+    response levels they have. The Jendrassik protocol DOES fix it — a block
+    without the manoeuvre and a block with it, per intensity — so it passes the
+    number and this never runs.
     """
-    labels = [f"G{i + 1}" for i in range(n_groups)]
     tidy = tidy.copy()
     tidy["Amplitude group"] = pd.Series(index=tidy.index, dtype=object)
     for ch in responders:
         m = (tidy["Channel"] == ch).to_numpy()
-        idx = cluster_amplitudes(tidy.loc[m, "Amplitude uV"].to_numpy(float), n_groups)
+        amps = tidy.loc[m, "Amplitude uV"].to_numpy(float)
+        k = choose_n_groups(amps) if n_groups is None else int(n_groups)
+        labels = [f"G{i + 1}" for i in range(k)]
+        idx = cluster_amplitudes(amps, k)
         tidy.loc[m, "Amplitude group"] = [labels[i] if i >= 0 else None for i in idx]
     return tidy
+
+
+def channel_group_labels(tidy, channel) -> list[str]:
+    """The group labels this channel actually got, low → high."""
+    got = tidy.loc[tidy["Channel"] == channel, "Amplitude group"].dropna().unique()
+    return sorted(got, key=lambda s: int(str(s)[1:]))
 
 
 def _grid(n, ncol=2):
@@ -289,20 +365,22 @@ def _plot_top_boxplots(top, responders, top_curves, metrics, out_path):
 
 
 def _plot_group_boxplots(tidy, responders, n_groups, metrics, out_dir):
-    labels = [f"G{i + 1}" for i in range(n_groups)]
     for metric in metrics:
         fname = f"boxplots_by_amplitude_group_{metric.split()[0]}.png"
         fig, axes, nrow, ncol = _grid(len(responders))
         for i, ch in enumerate(responders):
             ax = axes[i // ncol][i % ncol]
             d = tidy[tidy["Channel"] == ch]
+            # Each channel keeps its own number of groups — see choose_n_groups.
+            labels = channel_group_labels(tidy, ch)
             data = [d.loc[d["Amplitude group"] == g, metric].dropna().values for g in labels]
-            ax.boxplot(data, positions=np.arange(n_groups), widths=0.6,
+            ax.boxplot(data, positions=np.arange(len(labels)), widths=0.6,
                        showfliers=False, medianprops=dict(color="tab:red"))
-            ax.set_xticks(np.arange(n_groups))
+            ax.set_xticks(np.arange(len(labels)))
             ax.set_xticklabels([f"{g}\n(low→high)" if g == labels[0] else g for g in labels],
                                fontsize=7)
-            ax.set_title(ch, fontsize=10, loc="left")
+            ax.set_title(f"{ch}   ({len(labels)} гр.)" if len(labels) > 1
+                         else f"{ch}   (без группировки)", fontsize=10, loc="left")
             ax.set_ylabel(metric); ax.grid(alpha=0.3, axis="y")
         for j in range(len(responders), nrow * ncol):
             axes[j // ncol][j % ncol].axis("off")

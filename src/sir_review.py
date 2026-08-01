@@ -218,6 +218,8 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
     df.to_csv(csv, index=False)
 
     if scenario in (JENDRASSIK, PAIRED):
+        # n_groups=None: Jendrassik re-derives its count from the file name,
+        # paired reads it off the data. Same rule as a full run.
         run_curve_group_analysis(output_root, scenario)
     elif scenario == RECRUITMENT or scenario is None:
         run_recruitment_analysis(output_root)
