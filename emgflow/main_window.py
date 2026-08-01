@@ -439,12 +439,15 @@ class MainWindow(QMainWindow):
 
         # Recover the recording these results came from, so "Apply edits and
         # re-run" acts on the run being looked at instead of asking for a file.
-        # session.json only exists for GUI runs; the manifest covers the rest.
+        # The folder is asked FIRST and the session only fills in behind it: the
+        # session outlives one load, so preferring what it already held left the
+        # previous recording's name in the header and its path in Run after
+        # opening a second set of results.
         from src.pipeline import input_from_run_manifest
 
-        src_path = self.session.input_path
-        if src_path is None or not Path(src_path).exists():
-            src_path = input_from_run_manifest(root)
+        src_path = input_from_run_manifest(root)
+        if src_path is None and sess_file.exists():
+            src_path = self.session.input_path      # written by the run in THIS folder
         if src_path is not None:
             self.session.input_path = Path(src_path)
             self._log(f"These results came from {src_path}")

@@ -261,47 +261,58 @@ def _silhouette_1d(x: np.ndarray, labels: np.ndarray) -> float:
 
 def choose_n_groups(
     values: np.ndarray,
-    k_max: int = 5,
+    k_min: int = 3,
+    k_max: int = 6,
     min_silhouette: float = 0.70,
     min_per_group: int = 3,
 ) -> int:
-    """How many amplitude groups this channel's curves actually fall into.
+    """How many amplitude groups this channel's curves fall into, at least ``k_min``.
 
     A. Militskova asked for the curves "grouped by similar amplitude values" and
-    named no number, so imposing one is a guess — and the wrong guess is visible:
-    forcing three groups onto a channel whose responses form two natural levels
-    splits one of them down the middle, and forcing three onto a channel with no
-    grouping at all invents structure out of a smooth ramp.
+    named no number, so the count is read off the data: k-means for each k,
+    scored by silhouette (how much better a point fits its own group than the
+    nearest other one), best score wins.
 
-    So the count is read off the data: k-means for each k, scored by silhouette
-    (how much better a point fits its own group than the nearest other one).
-    Returns 1 — no grouping — when the best score fails ``min_silhouette``,
-    which is the honest answer for a channel whose amplitudes rise smoothly.
+    The floor is deliberate. A recruitment ramp has no natural levels at all —
+    the responses simply grow — so an unconstrained score answers "one group",
+    which is defensible and useless: weak, middling and strong curves are what
+    the clinician wants compared, and refusing to split them leaves nothing to
+    compare. So the data chooses how MANY groups, from ``k_min`` upward, and
+    only a channel with too few curves to fill them gets fewer.
+
+    ``min_silhouette`` therefore no longer decides whether to group at all; it
+    decides whether going ABOVE ``k_min`` is justified. Splitting further is only
+    worth it when the amplitudes really do separate: real levels score 0.76-0.95
+    even when they nearly touch, while a smooth ramp cut into pieces tops out
+    around 0.60 whichever way it is cut.
 
     Groups smaller than ``min_per_group`` disqualify a k: a "group" of one curve
     has no spread to report and is what an outlier produces.
-
-    The 0.70 cut-off is where the two cases part on synthetic checks: amplitudes
-    that really do form levels score 0.76 to 0.95 even when the levels nearly
-    touch, while a smooth ramp and a flat scatter both top out at 0.60-0.61 — a
-    ramp cut in half looks half-decent to any clustering score, which is exactly
-    the invented structure that has to be refused.
     """
     v = np.asarray(values, dtype=float)
     x = v[np.isfinite(v)]
-    if x.size < 2 * min_per_group or np.unique(x).size < 2:
+    if x.size < 2 or np.unique(x).size < 2:
         return 1
 
-    best_k, best_score = 1, -np.inf
-    for k in range(2, min(int(k_max), int(np.unique(x).size)) + 1):
-        idx = cluster_amplitudes(x, k)
-        counts = np.bincount(idx[idx >= 0], minlength=k)
-        if counts.min() < min_per_group:
+    feasible = [k for k in range(2, min(int(k_max), int(np.unique(x).size)) + 1)
+                if np.bincount(cluster_amplitudes(x, k)[cluster_amplitudes(x, k) >= 0],
+                               minlength=k).min() >= min_per_group]
+    if not feasible:
+        return 1
+
+    floor = min(int(k_min), max(feasible))
+    best_k = floor
+    best_score = -np.inf
+    for k in feasible:
+        if k < floor:
             continue
-        score = _silhouette_1d(x, idx)
+        score = _silhouette_1d(x, cluster_amplitudes(x, k))
         if np.isfinite(score) and score > best_score:
             best_k, best_score = k, score
-    return best_k if best_score >= min_silhouette else 1
+    # Going beyond the floor needs the amplitudes to actually separate there.
+    if best_k > floor and best_score < min_silhouette:
+        return floor
+    return best_k
 
 
 def _assign_amplitude_groups(tidy, responders, n_groups):
