@@ -141,7 +141,10 @@ def run_recruitment_analysis(
         print("[RECRUITMENT] No responding channels; skipping.", flush=True)
         return None
 
-    out_dir = _sir_dir(output_root) / "Recruitment"
+    # Both explicitly: the figures' folder used to be created as a side effect of
+    # making the Excel folder inside it, and moving the tables out took that with
+    # it — silently, because every folder already existed on a re-run.
+    out_dir = ensure_dir(_sir_dir(output_root) / "Recruitment")
     excel_dir = ensure_dir(shared_excel_dir(output_root))
 
     # On these files P2 and PTP are routinely undetected (monophasic responses),

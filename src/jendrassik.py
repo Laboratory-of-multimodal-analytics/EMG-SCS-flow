@@ -140,7 +140,7 @@ def run_curve_group_analysis(
         print(f"[{log}] No responding channels; skipping.", flush=True)
         return None
 
-    out_dir = _sir_dir(output_root) / style["folder"]
+    out_dir = ensure_dir(_sir_dir(output_root) / style["folder"])
     excel_dir = ensure_dir(shared_excel_dir(output_root))
 
     tidy = _assign_amplitude_groups(tidy, responders, n_groups)
