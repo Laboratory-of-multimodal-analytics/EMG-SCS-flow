@@ -348,16 +348,39 @@ def detect_onset_near_template(
     win_ms: float = 10.0,
     k: float = 2.5,
     sustain_ms: float = 1.5,
+    noise_std: float = np.nan,
+    p1_lat: float = np.nan,
+    t_min: float = np.nan,
 ) -> float:
+    """When the response leaves the baseline, searched near the template's onset.
+
+    The onset is the first sustained excursion past ``k`` times the noise, so the
+    whole thing rests on having a noise scale. Normally that comes from the
+    pre-stimulus baseline — but Neurosoft curve exports begin AT the stimulus,
+    and their only pre-artifact data is a pad of one repeated sample, whose
+    standard deviation is exactly zero. ``k * 0`` is not a threshold, and this
+    function used to give up on the spot, which is why every one of those files
+    came out with peaks but no onsets at all.
+
+    ``noise_std`` is the way out: a noise estimate the caller took from somewhere
+    the baseline could not provide one (in practice the quiet tail of the curve,
+    after the response). When it is used, so is a different search: see
+    ``detect_onset_before_peak``. Recordings that do carry pre-stimulus data keep
+    the original behaviour untouched.
+    """
     if np.isnan(t_on_tmpl):
         return np.nan
 
     base = sig_f[baseline_mask]
     bmean, bstd = base.mean(), base.std()
-    if bstd == 0 or np.isnan(bstd):
-        return np.nan
-
     w = win_ms / 1000.0
+
+    if bstd == 0 or np.isnan(bstd):
+        return detect_onset_before_peak(
+            sig_f, times, sfreq, bmean, float(noise_std), p1_lat,
+            t_min=t_min, k=k, sustain_ms=sustain_ms,
+        )
+
     m = (times >= t_on_tmpl - w) & (times <= t_on_tmpl + w)
     if np.sum(m) < 5:
         return np.nan
@@ -373,6 +396,66 @@ def detect_onset_near_template(
 
     idx = np.where(rect_s > thr)[0]
     return np.nan if len(idx) == 0 else float(seg_t[idx[0]])
+
+
+def detect_onset_before_peak(
+    sig_f: np.ndarray,
+    times: np.ndarray,
+    sfreq: float,
+    bmean: float,
+    noise_std: float,
+    p1_lat: float,
+    t_min: float = np.nan,
+    k: float = 2.5,
+    sustain_ms: float = 1.5,
+) -> float:
+    """Onset as the last quiet moment before P1.
+
+    Searching a narrow window around the template's onset is the wrong tool on a
+    single curve: where the template puts its onset relative to P1 is a property
+    of the template, and the bank is generic. Curves whose response starts even a
+    few ms off that spacing simply had no onset found — on this dataset that lost
+    it on 120 of 314 detections, and placed some of the rest inside the stimulus
+    artifact.
+
+    So the search runs backwards from THIS curve's P1 instead, and the onset is
+    the last sample whose smoothed rectified deviation is still within the noise.
+    That is the foot of the response as read off the curve, needs nothing from
+    the template, and cannot land after the peak or before ``t_min`` (which keeps
+    it out of the stimulus artifact).
+    """
+    if not np.isfinite(p1_lat) or not np.isfinite(noise_std) or noise_std <= 0:
+        return np.nan
+    lo = int(np.searchsorted(times, t_min, side="left")) if np.isfinite(t_min) else 0
+    i1 = int(np.argmin(np.abs(times - p1_lat)))
+    if i1 - lo < 5:
+        return np.nan
+
+    rect = np.abs(sig_f[lo:i1] - bmean)
+    ww = max(1, int((sustain_ms / 1000.0) * sfreq))
+    below = np.where(_moving_mean(rect, ww) <= k * noise_std)[0]
+    return float(times[lo + below[-1]]) if below.size else np.nan
+
+
+def noise_std_from_tail(
+    sig_f: np.ndarray,
+    times: np.ndarray,
+    after_s: float,
+    min_samples: int = 100,
+) -> float:
+    """Noise scale from the quiet part of a curve that follows the response.
+
+    For recordings that carry no pre-stimulus data this is the only place left to
+    measure noise. Estimated by MAD rather than SD so a late response inside the
+    window inflates it by almost nothing, and returned as an SD equivalent so it
+    can be used with the same ``k`` as a baseline SD.
+    """
+    m = times >= after_s
+    if int(np.sum(m)) < min_samples:
+        return np.nan
+    tail = sig_f[m]
+    mad = float(np.median(np.abs(tail - np.median(tail))))
+    return 1.4826 * mad if mad > 0 else np.nan
 
 
 def find_extra_p1_peak(

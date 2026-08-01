@@ -249,6 +249,13 @@ STIM_EPOCH_ARTIFACT_ABS_CORR_THR = 0.5
 # Maximum allowed deviation of epoch onset from template onset (s).
 STIM_ONSET_MAX_DEV_S = 0.003
 
+
+# Onset threshold, in noise SDs. Swept on the Neurosoft curve exports: below
+# 2.5 the onset is found on ever fewer curves (68% at k=1 against 86% here)
+# without becoming any more stable, and above it the onset creeps toward the
+# peak. At 2.5 the response starts a median 4-5 ms before P1, which is what a
+# spinal reflex should look like.
+STIM_ONSET_K = 2.5
 # Time-scale factors tested when matching pre-computed templates in SIR mode.
 # Keep scales near 1.0 so the synthesized template preserves the shape of the
 # original .npy templates (small scales compress them into ringing).

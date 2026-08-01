@@ -68,6 +68,7 @@ from .constants import (
     SIR_TEMPLATE_PER_AMPLITUDE,
     STIM_EPOCH_ARTIFACT_ABS_CORR_THR,
     STIM_EPOCH_ARTIFACT_CORR_REJECTION,
+    STIM_ONSET_K,
     STIM_ONSET_MAX_DEV_S,
     STIM_P1_ABS_MIN_UV,
     STIM_PEAK_AMP_MIN_UV,
@@ -118,6 +119,7 @@ from .constants import (
 from .detection import (
     add_extra_peak_to_p1,
     detect_onset_near_template,
+    noise_std_from_tail,
     detect_peak_in_window,
     find_extra_p1_peak,
     pick_epoch_value_near_latency,
@@ -3643,20 +3645,7 @@ def run_pipeline(
                     )
                     continue
 
-                # Onset near template onset
-                onset_latency = detect_onset_near_template(
-                    sig, times, sfreq, baseline_mask, t_on_tmpl,
-                    win_ms=2, k=1, sustain_ms=2,
-                ) if np.isfinite(t_on_tmpl) else np.nan
-
-                # Clip onset to template ± max_dev
-                if np.isfinite(onset_latency) and np.isfinite(t_on_tmpl):
-                    onset_latency = float(np.clip(
-                        onset_latency,
-                        float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
-                        float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
-                    ))
-
+                onset_latency = np.nan
                 peak1_latency = peak2_latency = np.nan
                 peak1_value = peak2_value = np.nan
 
@@ -3705,6 +3694,24 @@ def run_pipeline(
                     peak2_latency, peak2_value = pick_epoch_value_near_latency(
                         sig, times, peak2_latency, sfreq, win_ms=1.0, polarity=pol2,
                     )
+
+                # Onset, once P1 is settled. On a pre-epoched export the baseline
+                # is a constant pad with no spread to threshold against, so the
+                # noise scale comes from the quiet tail of the curve and the
+                # search runs back from this curve's own P1 — hence after it.
+                if np.isfinite(t_on_tmpl):
+                    onset_latency = detect_onset_near_template(
+                        sig, times, sfreq, baseline_mask, t_on_tmpl,
+                        win_ms=2, k=STIM_ONSET_K, sustain_ms=2,
+                        noise_std=noise_std_from_tail(sig, times, resp_tmax),
+                        p1_lat=peak1_latency, t_min=resp_tmin,
+                    )
+                    if np.isfinite(onset_latency) and not np.isfinite(peak1_latency):
+                        onset_latency = float(np.clip(
+                            onset_latency,
+                            float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
+                            float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
+                        ))
 
                 # Ordering / same-sign guards
                 if (not np.isnan(peak1_latency)) and (not np.isnan(peak2_latency)):
