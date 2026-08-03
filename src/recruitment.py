@@ -206,6 +206,13 @@ def run_recruitment_analysis(
     return out_dir
 
 
+#: Below this many points a cluster's own std is noise itself (or exactly 0 on
+#: 1-2 identical readings), so spread-normalised assignment is skipped below
+#: this count and the result is plain nearest-centre k-means — matches the
+#: ``min_per_group`` floor ``choose_n_groups`` already uses to judge a cluster.
+MIN_PER_GROUP_FOR_SPREAD = 3
+
+
 def cluster_amplitudes(values: np.ndarray, k: int) -> np.ndarray:
     """Split *values* into k groups where they actually separate (1-D k-means).
 
@@ -215,6 +222,21 @@ def cluster_amplitudes(values: np.ndarray, k: int) -> np.ndarray:
     same length — A. Militskova's own example channel splits 24/21, another 36/9.
     Equal terciles would cut straight through both blocks and average the two
     conditions together.
+
+    Plain nearest-centre k-means also assumes every cluster is equally "tight",
+    which a Jendrassik file is not: the no-facilitation block sits in a few µV
+    of noise while the facilitated block's amplitude swings widely rep to rep
+    (fatigue, an imperfectly held manoeuvre). A repeat that dips low can then
+    land NUMERICALLY closer to the noise cluster's centre than to the response
+    cluster's, purely because the noise cluster is narrow and the response
+    cluster is wide — even though every one of its neighbours (same protocol
+    block) sits in the response cluster. So once every cluster has enough points
+    to estimate its own spread, assignment switches to distance normalised by
+    each cluster's own std — one hard-assignment pass of a 1-D Gaussian mixture
+    with unequal variances instead of a fixed-radius k-means — so the wide
+    cluster is allowed to reach further than the narrow one before a point is
+    considered "not mine". Below ``MIN_PER_GROUP_FOR_SPREAD`` points that std
+    cannot be trusted, and this is exactly the original plain k-means.
 
     Returns group indices 0..k-1 ordered low -> high amplitude; NaNs get -1.
     """
@@ -229,15 +251,35 @@ def cluster_amplitudes(values: np.ndarray, k: int) -> np.ndarray:
         out[ok] = 0
         return out
 
+    # A perfectly flat cluster (std == 0, e.g. 3 identical baseline readings)
+    # would divide every distance by zero. Floored at a fraction of the whole
+    # channel's own spread rather than an absolute µV number, so this behaves
+    # the same whether the channel reads in single µV or hundreds.
+    spread_floor = max(float(np.std(x)) * 0.05, 1e-9)
+
     # Lloyd's algorithm on a 1-D array, seeded at evenly spaced quantiles.
     centres = np.quantile(x, np.linspace(0, 1, k * 2 + 1)[1::2])
+    spreads = None  # None = plain nearest-centre distance (the original rule)
     for _ in range(50):
-        assign = np.argmin(np.abs(x[:, None] - centres[None, :]), axis=1)
-        new = np.array([x[assign == j].mean() if np.any(assign == j) else centres[j]
-                        for j in range(k)])
-        if np.allclose(new, centres):
+        d = np.abs(x[:, None] - centres[None, :])
+        if spreads is not None:
+            d = d / spreads[None, :]
+        assign = np.argmin(d, axis=1)
+        counts = np.bincount(assign, minlength=k)
+        new_centres = np.array([x[assign == j].mean() if counts[j] else centres[j]
+                                for j in range(k)])
+        new_spreads = (
+            np.array([max(float(x[assign == j].std()), spread_floor) for j in range(k)])
+            if counts.min() >= MIN_PER_GROUP_FOR_SPREAD else None
+        )
+        converged = (
+            np.allclose(new_centres, centres)
+            and (spreads is None) == (new_spreads is None)
+            and (spreads is None or np.allclose(new_spreads, spreads))
+        )
+        centres, spreads = new_centres, new_spreads
+        if converged:
             break
-        centres = new
     # Relabel so group 0 is the lowest-amplitude cluster.
     order = np.argsort(centres)
     remap = np.empty(k, dtype=int)
