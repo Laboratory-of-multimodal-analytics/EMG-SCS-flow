@@ -215,7 +215,15 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
             # off this channel's own mean at the marker, not the auto-detected
             # values (which point exactly where the clinician disagreed).
             mean_wave = data[:, ch_index[channel], :].mean(axis=0)
-            base = float(np.nanmean(mean_wave[times < 0.002])) if np.any(times < 0.002) else 0.0
+            # Zero reference for the polarity test: the POST-artifact stretch, not
+            # the 0-2 ms head. On a text-curves export the head holds the stimulus
+            # artifact (there is no pre-stimulus baseline), so measuring "base"
+            # there gives a large offset that flips the sign of the smaller
+            # rebound — the P2 test then reads a positive rebound as negative and
+            # the pick lands on the wrong deflection. The post-artifact signal is
+            # already drift-removed, so its median sits at ~0: a clean reference.
+            post = times > 0.002
+            base = float(np.nanmedian(mean_wave[post])) if np.any(post) else 0.0
 
             def _pol_at(t):
                 i = int(np.argmin(np.abs(times - t)))
