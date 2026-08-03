@@ -255,6 +255,12 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
 
     df.to_csv(csv, index=False)
 
+    # Rebuild EVERY table and per-crop panel from the corrected CSV, so nothing
+    # is left showing the pre-correction detection (summary workbooks + the
+    # "Plots with/without grid and markers" panels), then the scenario deliverable.
+    from .pipeline import regenerate_sir_outputs_from_metrics
+    regenerate_sir_outputs_from_metrics(output_root, scenario)
+
     if scenario in (JENDRASSIK, PAIRED):
         # n_groups=None: Jendrassik re-derives its count from the file name,
         # paired reads it off the data. Same rule as a full run.

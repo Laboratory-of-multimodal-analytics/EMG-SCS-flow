@@ -2814,6 +2814,137 @@ def input_from_run_manifest(output_root: str | Path) -> Path | None:
     return None
 
 
+def write_sir_summary_excels(df_results: "pd.DataFrame", excel_dir: Path) -> None:
+    """Per-(config, amplitude, channel) summary stats + the by-config workbooks.
+
+    Split out so the exact same tables are (re)written both at the end of a run
+    and after per-curve corrections are applied — otherwise a correction leaves
+    these stale, showing pre-correction numbers next to the corrected curves.
+    """
+    metrics = [
+        "Onset latency", "Peak1 latency", "Peak2 latency",
+        "Peak1 value", "Peak2 value", "PTP amplitude",
+        "Inter-trial corr",
+    ]
+    df = df_results.copy()
+    detection_metrics = [m for m in metrics if m != "Inter-trial corr"]
+    keep_mask = (
+        df[detection_metrics].notna().any(axis=1)
+        | (pd.to_numeric(df["Inter-trial corr"], errors="coerce").fillna(0.0) != 0)
+    )
+    df = df.loc[keep_mask].reset_index(drop=True)
+    df["Stim. amplitude"] = df["Stim. amplitude"].astype(str)
+    df["Configuration"] = df["Configuration"].astype(str)
+    df["Channel"] = df["Channel"].astype(str)
+    df["Stim_amp_num"] = df["Stim. amplitude"].apply(amp_to_number)
+
+    group_cols = ["Configuration", "Stim. amplitude", "Stim_amp_num", "Channel"]
+    summary_rows = []
+    for metric in metrics:
+        g = df[group_cols + [metric]].copy()
+        g[metric] = pd.to_numeric(g[metric], errors="coerce")
+        grouped = g.groupby(group_cols, dropna=False)[metric]
+        tmp = grouped.agg(
+            n_total="size", n_valid=lambda x: x.notna().sum(),
+            mean="mean", std="std", median="median",
+            q25=lambda x: x.quantile(0.25), q75=lambda x: x.quantile(0.75),
+            min="min", max="max",
+        ).reset_index()
+        tmp["iqr"] = tmp["q75"] - tmp["q25"]
+        tmp["Metric"] = metric
+        summary_rows.append(tmp)
+
+    summary = pd.concat(summary_rows, ignore_index=True)
+    summary = summary[[
+        "Configuration", "Stim. amplitude", "Stim_amp_num", "Channel", "Metric",
+        "n_total", "n_valid", "mean", "std", "median", "q25", "q75", "iqr", "min", "max",
+    ]]
+    summary = summary.sort_values(
+        by=["Configuration", "Stim_amp_num", "Stim. amplitude", "Channel", "Metric"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    summary.to_csv(excel_dir / "Summary_stats_by_config_amp_channel.csv", index=False)
+    with pd.ExcelWriter(
+        excel_dir / "Summary_stats_by_config_amp_channel_by_config.xlsx", engine="xlsxwriter",
+    ) as writer:
+        for config, dfc in summary.groupby("Configuration"):
+            dfc = dfc.sort_values(
+                by=["Stim_amp_num", "Stim. amplitude", "Channel", "Metric"], kind="mergesort",
+            ).reset_index(drop=True)
+            dfc.to_excel(writer, sheet_name=_excel_safe_sheet_name(config), index=False)
+    with pd.ExcelWriter(
+        excel_dir / "Large_dataset_emg_response_metrics_by_config.xlsx", engine="xlsxwriter",
+    ) as writer:
+        for config, dfc in df_results.groupby("Configuration"):
+            dfc.to_excel(writer, sheet_name=_excel_safe_sheet_name(config), index=False)
+
+
+def regenerate_sir_outputs_from_metrics(output_root: Path, scenario: str | None = None) -> None:
+    """Redraw every SIR table and per-crop panel from the metrics CSV on disk.
+
+    Called after per-curve corrections so nothing is left showing the pre-
+    correction detection: the summary workbooks and the "Plots with/without grid
+    and markers" panels are rebuilt from the corrected CSV and the saved epochs.
+    """
+    paths = build_output_dirs(Path(output_root), startstop_mode=False)
+    excel_dir = paths["excel_dir"]
+    csv = excel_dir / "Large_dataset_emg_response_metrics.csv"
+    if not csv.exists():
+        return
+    df = pd.read_csv(csv)
+    if df.empty:
+        return
+
+    write_sir_summary_excels(df, excel_dir)
+
+    # Redraw the per-crop panels from the saved epochs + corrected markers.
+    epochs_dir = paths["epochs_dir"]
+    for epo in sorted(Path(epochs_dir).glob("*-epo.fif")):
+        base_name = epo.name[: -len("-epo.fif")]
+        configuration = base_name.split("-")[0]
+        try:
+            epochs = mne.read_epochs(epo, preload=True, verbose="ERROR")
+        except Exception:
+            continue
+        data_epoched = epochs.get_data()
+        times = epochs.times
+        sub = df[df["Configuration"].astype(str) == configuration]
+        csv_channels = set(sub["Channel"].astype(str))
+        art_set = {c for c in epochs.ch_names if c not in csv_channels}
+
+        latency_markers: dict[str, list[dict[str, float]]] = {}
+        for ch in epochs.ch_names:
+            if ch in art_set:
+                continue
+            rows = sub[sub["Channel"].astype(str) == ch]
+            by_ep = {int(r["Epoch"]): r for _, r in rows.iterrows()}
+            marks = []
+            for ep in range(len(epochs)):
+                r = by_ep.get(ep)
+                marks.append({
+                    "epoch": ep,
+                    "onset": float(r["Onset latency"]) if r is not None else np.nan,
+                    "peak1": float(r["Peak1 latency"]) if r is not None else np.nan,
+                    "peak2": float(r["Peak2 latency"]) if r is not None else np.nan,
+                })
+            latency_markers[ch] = marks
+
+        title = base_name
+        if scenario is not None:
+            title = f"{base_name} — {SCENARIO_LABELS[scenario]}"
+        for grid, out_dir in ((True, paths["plots_grid_dir"]), (False, paths["plots_plain_dir"])):
+            plot_epochs_panel(
+                data_epoched=data_epoched, times=times,
+                ch_names=list(epochs.ch_names), epochs_ch_names=list(epochs.ch_names),
+                art_chans=art_set, latency_markers=latency_markers,
+                title=title, out_path=Path(out_dir) / f"{base_name}.png",
+                show_grid=grid, show_markers=grid,
+                color_by_order=scenario is not None,
+                ylim_from=0.002 if scenario is not None else None,
+            )
+
+
 def run_pipeline(
     edf_path: str | Path,
     output_dir: str | Path | None = None,
@@ -4023,70 +4154,7 @@ def run_pipeline(
     if group_store and emit_sir_diagnostics:
         plot_grouped_by_amplitude(group_store, times, plots_grouped_dir, default_art_set)
 
-    metrics = [
-        "Onset latency", "Peak1 latency", "Peak2 latency",
-        "Peak1 value", "Peak2 value", "PTP amplitude",
-        "Inter-trial corr",
-    ]
-
-    df = df_results.copy()
-    detection_metrics = [m for m in metrics if m != "Inter-trial corr"]
-    # Keep rows where any detection metric is non-NaN OR ITC is non-trivial,
-    # so the summary still surfaces ITC for channels that were wiped.
-    keep_mask = (
-        df[detection_metrics].notna().any(axis=1)
-        | (pd.to_numeric(df["Inter-trial corr"], errors="coerce").fillna(0.0) != 0)
-    )
-    df = df.loc[keep_mask].reset_index(drop=True)
-    df["Stim. amplitude"] = df["Stim. amplitude"].astype(str)
-    df["Configuration"] = df["Configuration"].astype(str)
-    df["Channel"] = df["Channel"].astype(str)
-    df["Stim_amp_num"] = df["Stim. amplitude"].apply(amp_to_number)
-
-    group_cols = ["Configuration", "Stim. amplitude", "Stim_amp_num", "Channel"]
-    summary_rows = []
-    for metric in metrics:
-        g = df[group_cols + [metric]].copy()
-        g[metric] = pd.to_numeric(g[metric], errors="coerce")
-        grouped = g.groupby(group_cols, dropna=False)[metric]
-        tmp = grouped.agg(
-            n_total="size", n_valid=lambda x: x.notna().sum(),
-            mean="mean", std="std", median="median",
-            q25=lambda x: x.quantile(0.25), q75=lambda x: x.quantile(0.75),
-            min="min", max="max",
-        ).reset_index()
-        tmp["iqr"] = tmp["q75"] - tmp["q25"]
-        tmp["Metric"] = metric
-        summary_rows.append(tmp)
-
-    summary = pd.concat(summary_rows, ignore_index=True)
-    summary = summary[[
-        "Configuration", "Stim. amplitude", "Stim_amp_num", "Channel", "Metric",
-        "n_total", "n_valid", "mean", "std", "median", "q25", "q75", "iqr", "min", "max",
-    ]]
-    summary = summary.sort_values(
-        by=["Configuration", "Stim_amp_num", "Stim. amplitude", "Channel", "Metric"],
-        kind="mergesort",
-    ).reset_index(drop=True)
-
-    summary.to_csv(excel_dir / "Summary_stats_by_config_amp_channel.csv", index=False)
-
-    with pd.ExcelWriter(
-        excel_dir / "Summary_stats_by_config_amp_channel_by_config.xlsx", engine="xlsxwriter",
-    ) as writer:
-        for config, dfc in summary.groupby("Configuration"):
-            sheet_name = _excel_safe_sheet_name(config)
-            dfc = dfc.sort_values(
-                by=["Stim_amp_num", "Stim. amplitude", "Channel", "Metric"], kind="mergesort",
-            ).reset_index(drop=True)
-            dfc.to_excel(writer, sheet_name=sheet_name, index=False)
-
-    with pd.ExcelWriter(
-        excel_dir / "Large_dataset_emg_response_metrics_by_config.xlsx", engine="xlsxwriter",
-    ) as writer:
-        for config, dfc in df_results.groupby("Configuration"):
-            sheet_name = _excel_safe_sheet_name(config)
-            dfc.to_excel(writer, sheet_name=sheet_name, index=False)
+    write_sir_summary_excels(df_results, excel_dir)
 
     # These box-plots split the metrics BY stimulation amplitude, which a
     # Neurosoft export does not have (it is one crop). Each scenario emits its
