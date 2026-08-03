@@ -147,8 +147,51 @@ class TemplateBank:
         ]
         return max(used, default=0) + 1
 
+    def _channel_of(self, name: str) -> str:
+        """The channel a stored template is bound to ('' = unbound / stock)."""
+        npz = self.dir / f"{name}_onset_and_peaks.npz"
+        if not npz.exists():
+            return ""
+        try:
+            data = np.load(npz)
+            if "channel" in data:
+                return str(np.asarray(data["channel"]).reshape(()).item())
+        except Exception:
+            pass
+        return ""
+
+    def _remove(self, name: str) -> None:
+        for suffix in (".npy", "_onset_and_peaks.npz", ".source.txt"):
+            (self.dir / f"{name}{suffix}").unlink(missing_ok=True)
+
+    def replace_channel_templates(self, channel: str) -> int:
+        """Drop the user templates already bound to *channel*.
+
+        A new hand template for a channel is the clinician's latest word on it, so
+        the earlier ones must stop competing — otherwise the matcher could keep
+        picking a template she has just replaced. Stock templates are untouched.
+        """
+        if not channel:
+            return 0
+        removed = 0
+        # Scan EVERY template, not just user_templates(): a "mine only" bank reuses
+        # the stock id range, so name alone cannot tell user from stock. The bound
+        # channel does — stock templates carry none, so they never match here.
+        for f in list(self.dir.glob("template_*.npy")):
+            if not re.fullmatch(r"template_(\d+)\.npy", f.name):
+                continue
+            if self._channel_of(f.stem) == channel:
+                self._remove(f.stem)
+                removed += 1
+        return removed
+
     def add(self, tpl: BuiltTemplate) -> str:
-        """Write a built template into the bank. Returns its name."""
+        """Write a built template into the bank. Returns its name.
+
+        A template bound to a channel replaces any earlier hand template on that
+        same channel, so only the newest one is ever matched there.
+        """
+        self.replace_channel_templates(tpl.channel)
         tid = self._next_id()
         name = f"template_{tid}"
         np.save(self.dir / f"{name}.npy", tpl.wave)
