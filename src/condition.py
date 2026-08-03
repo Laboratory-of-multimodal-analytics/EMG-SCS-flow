@@ -514,6 +514,32 @@ def _plot_waterfall_time(data, ch, isi_labels, labels, pos_ms, t_ms, ch_name, ou
     plt.close(fig)
 
 
+def _plot_waterfall_time_from_means(means_time, labels, cond_artifact_ms, t_ms, ch_name, out_path):
+    """The real-time waterfall, redrawn from the per-condition means on disk.
+
+    ``_plot_waterfall_time`` needs the full per-curve array, which a correction
+    re-run does not reload; but the picture is just the per-condition means
+    stacked with each condition's artifact tick, and both are cached
+    (``<ch>_condition_means_time.npy`` / ``condition_artifact_ms.npy``). Using
+    them keeps this deliverable regenerated alongside the artifact-aligned one,
+    so a correction never leaves one of the two waterfalls stale.
+    """
+    fig, ax = plt.subplots(figsize=(9, 11))
+    step = np.nanmax([np.nanmax(w) - np.nanmin(w) for w in means_time]) * 1.1
+    for row, lab in enumerate(labels):
+        ax.plot(t_ms, means_time[row] + row * step, "k", lw=0.7)
+        tag = "control" if lab == 0 else f"{lab:.0f}"
+        ax.text(t_ms[0], row * step, tag + " ", ha="right", va="center", fontsize=8)
+        a_ms = float(cond_artifact_ms[row]) if row < len(cond_artifact_ms) else 0.0
+        ax.plot(a_ms, row * step, "r|", ms=8, mew=1.5)
+    ax.set_yticks([])
+    ax.set_xlabel("мс (реальное время)")
+    ax.set_title(f"{ch_name}: кривые по condition, реальное время (ответ едет за артефактом)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def _plot_amp_vs_condition_grid(labels, amp_by_channel, out_path):
     """One figure, one subplot per muscle channel: amplitude vs condition."""
     tags = ["control" if l == 0 else f"{l:.0f}" for l in labels]
@@ -981,6 +1007,15 @@ def recompute_channel(output_root: Path, channel: str, rebuild_shared: bool = Tr
                     base / "Waterfall" / f"{channel}_by_artifact.png",
                     CONDITION_RESP_LO * 1e3, CONDITION_RESP_HI * 1e3,
                     markers_ms=(on_ms, p1_ms, p2_ms))
+    # The real-time waterfall too, so BOTH per-channel waterfalls are refreshed
+    # by a correction (not just the artifact-aligned one). Redrawn from the
+    # cached per-condition real-time means, which the run already saved.
+    mt_p = arr / f"{channel}_condition_means_time.npy"
+    art_p, tfull_p = arr / "condition_artifact_ms.npy", arr / "times_full_ms.npy"
+    if mt_p.exists() and art_p.exists() and tfull_p.exists():
+        _plot_waterfall_time_from_means(
+            np.load(mt_p), labels, np.load(art_p), np.load(tfull_p), channel,
+            base / "Waterfall" / f"{channel}_by_time.png")
 
     if rebuild_shared:
         _rebuild_shared_figures(base, labels)
