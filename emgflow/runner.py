@@ -133,6 +133,7 @@ class PipelineWorker(QObject):
                         self.session.input_path,
                         output_dir=self.session.output_dir,
                         startstop_mode=(self.session.mode == "startstop"),
+                        force_scenario=self.session.force_scenario,
                         **self.session.kwargs(),
                     )
                 out_stream.flush()

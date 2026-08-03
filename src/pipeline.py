@@ -2972,6 +2972,7 @@ def run_pipeline(
     sir_hard_min_valid_frac: float = 0.0,
     sir_template_ref: str = "max_amp",
     sir_min_rel_to_template: float = 0.1,
+    force_scenario: str | None = None,
 ) -> Path:
     edf_path = Path(edf_path)
     if output_dir is None:
@@ -3060,9 +3061,24 @@ def run_pipeline(
         # Neurosoft exports come in three protocols that want three different
         # deliverables (see src/neurosoft.py). Resolve which one this file is
         # BEFORE any analysis, so each scenario only produces its own outputs.
-        neurosoft_scenario, scen_info = detect_scenario(
-            edf_path, data=arr, sfreq=float(ready.info["sfreq"])
-        )
+        # A caller (the GUI's scenario selector, or a re-run of an already-tagged
+        # file) can pin the scenario explicitly; the signal-based auto-detect only
+        # runs when nothing was forced. This is what lets a clinician overrule a
+        # misfire — e.g. an H-reflex whose stepping stimulus reads as a Condition
+        # test — and keep that choice on every re-run.
+        _valid = {RECRUITMENT, JENDRASSIK, PAIRED, CONDITION}
+        if force_scenario is not None:
+            if force_scenario not in _valid:
+                raise ValueError(
+                    f"force_scenario={force_scenario!r} is not one of {sorted(_valid)}"
+                )
+            neurosoft_scenario = force_scenario
+            scen_info = {"from_name": None, "from_signal": None, "conflict": False,
+                         "scenario": force_scenario, "reason": "forced by caller"}
+        else:
+            neurosoft_scenario, scen_info = detect_scenario(
+                edf_path, data=arr, sfreq=float(ready.info["sfreq"])
+            )
         print(
             f"[NEUROSOFT] {edf_path.name}: "
             f"{SCENARIO_LABELS[neurosoft_scenario]} (by {scen_info['reason']}) — "

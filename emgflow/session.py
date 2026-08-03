@@ -52,6 +52,12 @@ class Session:
     mode: str = "sir"  # "sir" | "startstop"
     settings: dict[str, Any] = field(default_factory=dict)
 
+    # Pin the Neurosoft scenario instead of auto-detecting it from the signal.
+    # None = auto-detect (the default). Set from the GUI's scenario selector or
+    # from an already-tagged output folder, so a re-run keeps the chosen scenario
+    # rather than silently re-classifying (e.g. an H-reflex read as Condition).
+    force_scenario: str | None = None
+
     # Session-local template bank (set when the user makes a template from a selection).
     # None = the stock bank shipped with the repo.
     template_dir: Path | None = None
@@ -184,6 +190,7 @@ class Session:
             "input_path": str(self.input_path) if self.input_path else None,
             "output_dir": str(self.output_dir) if self.output_dir else None,
             "mode": self.mode,
+            "force_scenario": self.force_scenario,
             "template_dir": str(self.template_dir) if self.template_dir else None,
             "template_only_user": self.template_only_user,
             "settings": {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.settings.items()},
@@ -200,6 +207,7 @@ class Session:
             output_dir=Path(d["output_dir"]) if d.get("output_dir") else None,
             mode=d.get("mode", "sir"),
             settings=dict(d.get("settings", {})),
+            force_scenario=d.get("force_scenario"),
             template_dir=Path(d["template_dir"]) if d.get("template_dir") else None,
             template_only_user=bool(d.get("template_only_user", False)),
         )
@@ -285,6 +293,7 @@ out = run_pipeline(
     r"{self.input_path}",
     output_dir=r"{self.output_dir}",
     startstop_mode={self.mode == "startstop"},
+    force_scenario={self.force_scenario!r},
 {chr(10).join(kw_lines)}
 )
 print("Outputs saved under:", out)

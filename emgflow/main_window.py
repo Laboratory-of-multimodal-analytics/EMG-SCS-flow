@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -30,6 +31,12 @@ MODES = [("Stimulation-induced (SIR)", "sir"), ("StartStop", "startstop"),
          ("Condition test", "condition")]
 # combobox index per mode
 _MODE_INDEX = {m[1]: i for i, m in enumerate(MODES)}
+
+# Neurosoft scenario override for the scenario_box. None = auto-detect from signal.
+SCENARIO_CHOICES = [("Auto-detect", None), ("Recruitment", "recruitment"),
+                    ("Jendrassik", "jendrassik"), ("Paired", "paired"),
+                    ("Condition test", "condition")]
+_SCENARIO_INDEX = {c[1]: i for i, c in enumerate(SCENARIO_CHOICES)}
 # tab indices (kept in one place so the sync logic below stays readable)
 TAB_SETTINGS, TAB_SIR, TAB_RECRUIT, TAB_STARTSTOP, TAB_SPONT, TAB_COND, TAB_RAW = range(7)
 
@@ -66,6 +73,17 @@ class MainWindow(QMainWindow):
         self.mode_box.addItems([m[0] for m in MODES])
         self.mode_box.currentIndexChanged.connect(self._on_mode)
 
+        # Neurosoft scenario override. "Auto-detect" keeps the signal-based
+        # routing; picking one pins it, so a re-run cannot re-classify the file
+        # (e.g. an H-reflex whose stepping stimulus otherwise reads as Condition).
+        self.scenario_box = QComboBox()
+        self.scenario_box.addItems([c[0] for c in SCENARIO_CHOICES])
+        self.scenario_box.setToolTip(
+            "Which Neurosoft scenario to run. 'Auto-detect' decides from the signal; "
+            "pick one to pin it so re-runs keep it. Applies to Neurosoft .txt exports."
+        )
+        self.scenario_box.currentIndexChanged.connect(self._on_scenario)
+
         self.run_btn = QPushButton("Run")
         self.run_btn.clicked.connect(self.run)
         self.run_btn.setEnabled(False)
@@ -81,6 +99,8 @@ class MainWindow(QMainWindow):
         top.addWidget(self.file_label, 1)
         top.addWidget(QLabel("Mode:"))
         top.addWidget(self.mode_box)
+        top.addWidget(QLabel("Scenario:"))
+        top.addWidget(self.scenario_box)
         top.addWidget(self.run_btn)
         top.addWidget(self.progress)
 
@@ -182,6 +202,12 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self._log(f"Loaded {path}")
         self._log(f"Outputs will go to {self.session.output_dir}")
+        # If this file was already processed, carry its recorded scenario into the
+        # selector so a re-run keeps it rather than auto-detecting anew.
+        prior = self._scenario_of_run(self.session.output_dir)
+        self._set_scenario_box(prior)
+        if prior is not None:
+            self._log(f"Scenario pinned from previous run: {prior}")
         self._adapt_to_text_curves(Path(path))
 
     def _adapt_to_text_curves(self, path: Path) -> None:
@@ -211,6 +237,32 @@ class MainWindow(QMainWindow):
         self.session.set_mode(MODES[idx][1])
         self.settings_panel.rebuild()
         self._sync_tabs()
+
+    def _on_scenario(self, idx: int) -> None:
+        self.session.force_scenario = SCENARIO_CHOICES[idx][1]
+
+    def _set_scenario_box(self, scenario: str | None) -> None:
+        """Point the scenario selector at *scenario* without re-triggering a run.
+
+        Used when a file/folder is opened: the scenario already bound to a
+        pre-computed run is carried into the selector, so pressing Run again
+        keeps it instead of auto-detecting afresh.
+        """
+        idx = _SCENARIO_INDEX.get(scenario, 0)
+        self.scenario_box.blockSignals(True)
+        self.scenario_box.setCurrentIndex(idx)
+        self.scenario_box.blockSignals(False)
+        self.session.force_scenario = SCENARIO_CHOICES[idx][1]
+
+    @staticmethod
+    def _scenario_of_run(output_root: Path) -> str | None:
+        """The scenario recorded in a run's manifest, if any."""
+        try:
+            data = json.loads((Path(output_root) / "review" / "run.json").read_text(encoding="utf-8"))
+            scen = data.get("scenario")
+            return scen if scen in _SCENARIO_INDEX else None
+        except Exception:
+            return None
 
     def _sync_scenario_tab(self) -> None:
         """Name the scenario tab after the scenario this run actually produced.
@@ -464,6 +516,9 @@ class MainWindow(QMainWindow):
         self.mode_box.blockSignals(True)
         self.mode_box.setCurrentIndex(_MODE_INDEX.get(mode, 0))
         self.mode_box.blockSignals(False)
+        # Carry the scenario this run was tagged with into the selector, so a
+        # re-run from here keeps it instead of auto-detecting anew.
+        self._set_scenario_box(self._scenario_of_run(root))
         self.settings_panel.rebuild()
         self._sync_tabs()
 
