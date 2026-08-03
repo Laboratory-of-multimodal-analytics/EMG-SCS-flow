@@ -278,7 +278,10 @@ class SIRViewer(QWidget):
                 ))
 
         axes[-1].set_xlabel("time (s)", fontsize=8)
-        axes[-1].set_xlim(times[0], times[-1])
+        # A little room LEFT of the data start so a template selection can begin
+        # at (or just before) t=0 — you cannot start a drag on the very edge, and
+        # a response's onset sits right at zero on a Neurosoft sweep.
+        axes[-1].set_xlim(float(times[0]) - 0.005, times[-1])
         subtitle = (f"{len(epochs)} curves, coloured by order (later = darker)"
                     if sweep else f"{len(epochs)} epochs")
         self.plot.fig.suptitle(
