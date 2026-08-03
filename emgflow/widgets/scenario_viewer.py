@@ -27,8 +27,8 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QPushButton, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QPushButton, QSlider, QSplitter, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from src.jendrassik import CURVE_GROUPS
@@ -70,6 +70,10 @@ def _assign_groups(amps: pd.Series, n_groups: int | None) -> pd.Series:
     ``n_groups=None`` means the channel's own amplitudes decide, as they do for
     recruitment and paired stimulation.
     """
+    # A channel the detector found nothing on has no amplitudes to group — it is
+    # still shown (its curves plotted), just with no groups.
+    if amps.dropna().empty:
+        return pd.Series([None] * len(amps), index=amps.index, dtype=object)
     if n_groups is None:
         n_groups = choose_n_groups(amps.to_numpy(float))
     labels = [f"G{i + 1}" for i in range(n_groups)]
@@ -261,14 +265,24 @@ class ScenarioViewer(QWidget):
         self.color_box.setCurrentIndex(0 if default_colour == "curve order" else 1)
         self.color_box.blockSignals(False)
 
-        responders = self._responders()
+        # Show EVERY channel, not just the responders: a channel the detector
+        # found nothing on still needs looking at (to place markers by hand, or
+        # to confirm it really is silent). Non-responders are greyed.
+        responders = set(self._responders())
+        all_chans = sorted(self.waves, key=lambda s: (len(s), s))
         self.channel_list.blockSignals(True)
-        self.channel_list.addItems(responders or sorted(self.waves))
+        self.channel_list.clear()
+        for ch in all_chans:
+            item = QListWidgetItem(ch)
+            if ch not in responders:
+                item.setForeground(Qt.gray)
+                item.setToolTip("нет детекций")
+            self.channel_list.addItem(item)
         self.channel_list.blockSignals(False)
         if self.channel_list.count():
             self.channel_list.setCurrentRow(0)   # fires _on_channel -> _draw
         else:
-            self._blank("No responding channels.")
+            self._blank("No channels.")
 
     def _responders(self) -> list[str]:
         """Channels with at least one detected response, in natural order."""
@@ -479,7 +493,8 @@ class ScenarioViewer(QWidget):
                                     alpha=0.18, lw=0, zorder=2)
                 ax_bot.plot(t_ms, m, color=GROUP_COLORS[gi], lw=1.8, zorder=3,
                             label=f"{lab} mean")
-            ax_bot.legend(fontsize=7, frameon=False, ncol=len(labels))
+            if labels:   # a silent channel has no groups, hence no legend
+                ax_bot.legend(fontsize=7, frameon=False, ncol=len(labels))
 
         if self.selected_curve is not None and 0 < self.selected_curve <= len(waves):
             sel = waves[self.selected_curve - 1]
