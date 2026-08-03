@@ -410,7 +410,8 @@ class ScenarioViewer(QWidget):
                     ax_top.plot(curves[m], amps[m], "o", ms=5, color=GROUP_COLORS[gi],
                                 label=f"{lab} (n={int(m.sum())})")
             ax_top.plot(curves, amps, "-", lw=0.8, color="0.7", zorder=0)
-            ax_top.legend(fontsize=7, frameon=False, ncol=len(labels))
+            if labels:   # a silent channel has no groups, hence no legend
+                ax_top.legend(fontsize=7, frameon=False, ncol=len(labels))
         else:
             norm = mcolors.Normalize(vmin=1, vmax=max(int(curves.max()), 2))
             ax_top.plot(curves, amps, "-", lw=0.9, color="0.75", zorder=0)
@@ -472,11 +473,13 @@ class ScenarioViewer(QWidget):
                 missing = cno not in found
                 if by_group:
                     lab = group_of.get(cno)
-                    if lab is None:
-                        continue
-                    col = GROUP_COLORS[labels.index(lab)] if lab in labels else "0.6"
+                    # No group (a missed curve, or a channel with no detections at
+                    # all) — still draw it, in grey, so a silent channel shows its
+                    # curves instead of a blank panel.
+                    col = (GROUP_COLORS[labels.index(lab)] if lab in labels else "0.78")
                 else:
                     col = "0.78" if missing else SWEEP_CMAP(norm(cno))
+                missing = missing or (by_group and group_of.get(cno) not in labels)
                 ax_bot.plot(t_ms, waves[i], color=col, lw=0.5,
                             alpha=0.30 if missing else 0.35,
                             zorder=0 if missing else 1)
