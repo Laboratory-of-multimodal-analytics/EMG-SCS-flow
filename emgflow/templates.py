@@ -40,6 +40,7 @@ class BuiltTemplate:
     peak1_idx: int
     peak2_idx: int
     source: str               # e.g. "0+3 @ 10 / RF_R"
+    channel: str = ""         # the channel it was drawn on; matched to that channel ONLY
 
     @property
     def markers_s(self) -> dict[str, float]:
@@ -56,6 +57,7 @@ def build_template(
     t0: float,
     t1: float,
     source: str = "",
+    channel: str = "",
 ) -> BuiltTemplate:
     """Turn the selected span of a mean waveform into a bank-format template.
 
@@ -110,7 +112,7 @@ def build_template(
     while onset - 1 >= lo and sign * tpl[onset - 1] >= thr:
         onset -= 1
 
-    return BuiltTemplate(tpl, grid, onset, peak1, peak2, source)
+    return BuiltTemplate(tpl, grid, onset, peak1, peak2, source, channel)
 
 
 class TemplateBank:
@@ -155,6 +157,7 @@ class TemplateBank:
             onset=np.array(tpl.onset_idx),
             peak1=np.array(tpl.peak1_idx),
             peak2=np.array(tpl.peak2_idx),
+            channel=np.array(tpl.channel or ""),   # bind to its channel; "" = every channel
         )
         # A note to whoever opens the folder later; the pipeline ignores it.
         (self.dir / f"{name}.source.txt").write_text(

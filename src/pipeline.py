@@ -1108,15 +1108,32 @@ def _load_startstop_template_bank(
             idx = int(np.clip(round(idx_raw), 0, wave.size - 1))
             markers[key] = float(times[idx])
 
+        # A user template drawn on a specific channel carries that channel here;
+        # stock templates have no channel and stay available to every channel.
+        chan = ""
+        if "channel" in marker_idx:
+            try:
+                chan = str(np.asarray(marker_idx["channel"]).reshape(()).item())
+            except Exception:
+                chan = ""
+
         bank.append(
             {
                 "name": f"template_{template_id}",
                 "wave": wave,
                 "times": times,
                 "markers": markers,
+                "channel": chan or None,
             }
         )
     return bank
+
+
+def _bank_for_channel(template_bank: list[dict[str, object]], ch_name: str) -> list[dict[str, object]]:
+    """Templates a given channel may match: the unbound (stock) ones plus any
+    hand-made template drawn on THIS channel. A template drawn on another channel
+    is invisible here, so correcting one channel never disturbs the others."""
+    return [t for t in template_bank if not t.get("channel") or t.get("channel") == ch_name]
 
 
 def _synthesize_template_on_times(
@@ -3287,6 +3304,7 @@ def run_pipeline(
             else:
                 tmpl_global = np.mean(np.stack([w for _, _, w in waves], axis=0), axis=0)
 
+            ch_bank = _bank_for_channel(template_bank, ch_name)
             match = _match_sir_template(
                 mean_waveform=tmpl_global,
                 times=times,
@@ -3294,7 +3312,7 @@ def run_pipeline(
                 baseline_mask=baseline_mask,
                 resp_tmin=resp_tmin,
                 resp_tmax=resp_tmax,
-                template_bank=template_bank,
+                template_bank=ch_bank,
                 scales=tuple(float(s) for s in SIR_TM_SCALES),
                 min_corr=float(SIR_TM_MIN_CORR),
             )
@@ -3317,7 +3335,7 @@ def run_pipeline(
                         baseline_mask=baseline_mask,
                         resp_tmin=resp_tmin,
                         resp_tmax=resp_tmax,
-                        template_bank=template_bank,
+                        template_bank=ch_bank,
                         scales=tuple(float(s) for s in SIR_TM_SCALES),
                         min_corr=float(SIR_TM_MIN_CORR),
                     )
@@ -3775,6 +3793,15 @@ def run_pipeline(
                     onset_latency = peak1_latency = peak2_latency = np.nan
                     peak1_value = peak2_value = ptp_amp = np.nan
 
+                # Neurosoft scenarios: a detection is BOTH peaks. A lone P1
+                # (monophasic) or a P2 with no P1 is not a response — drop it whole,
+                # so nothing (amplitude, marker, count) rests on half a detection.
+                if neurosoft_scenario is not None and (
+                    np.isnan(peak1_value) or np.isnan(peak2_value)
+                ):
+                    onset_latency = peak1_latency = peak2_latency = np.nan
+                    peak1_value = peak2_value = ptp_amp = np.nan
+
                 channel_epoch_results[ch_name].append(
                     {"ep": ep, "onset": onset_latency,
                      "p1": peak1_latency, "p2": peak2_latency,
@@ -4099,6 +4126,22 @@ def run_pipeline(
             run_curve_group_analysis(output_root, neurosoft_scenario, n_groups)
         except Exception as exc:
             print(f"[{neurosoft_scenario.upper()}] skipped ({type(exc).__name__}: {exc})", flush=True)
+
+    # Re-apply any saved per-curve review corrections (scenario view). A re-run —
+    # e.g. after making a channel-bound template in Crop view — rebuilds the base
+    # metrics from scratch, which would otherwise silently revert hand corrections
+    # on OTHER channels. Channel-bound templates keep a Crop-view edit local to its
+    # channel; this keeps scenario-view edits alive across a re-run. Together they
+    # make Crop- and scenario-view corrections survive each other, in any order.
+    if neurosoft_scenario is not None:
+        try:
+            from .sir_review import recompute_corrections
+            applied = recompute_corrections(output_root, neurosoft_scenario)
+            if applied:
+                print(f"[REVIEW] re-applied {len(applied)} saved correction(s).", flush=True)
+        except Exception as exc:
+            print(f"[REVIEW] could not re-apply saved corrections "
+                  f"({type(exc).__name__}: {exc})", flush=True)
 
     if old_mne_log_level is not None:
         mne.set_log_level(old_mne_log_level)

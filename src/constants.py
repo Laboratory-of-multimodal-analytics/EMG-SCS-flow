@@ -283,9 +283,9 @@ SIR_TEMPLATE_PER_AMPLITUDE = True
 # Minimum absolute amplitude for individual detected peaks (uV).
 STIM_PEAK_AMP_MIN_UV = 3.0
 # Minimum PTP (|P1-P2|) required for a valid response (uV).
-STIM_PTP_MIN_UV = 5.0
+STIM_PTP_MIN_UV = 30.0
 # Minimum absolute P1 amplitude required (uV).
-STIM_P1_ABS_MIN_UV = 3.0
+STIM_P1_ABS_MIN_UV = 10.0
 
 # Minimum number of detected stimulus events needed to build templates.
 MIN_VALID_EPOCHS = 5

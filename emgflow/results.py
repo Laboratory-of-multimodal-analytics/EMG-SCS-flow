@@ -501,6 +501,8 @@ class SIRResults:
             "amp_uv": ptp.where(ptp.notna(), p1.abs()),
             "p1_uv": p1,
             "p1_ms": pd.to_numeric(sub["Peak1 latency"], errors="coerce") * 1e3,
+            "onset_ms": pd.to_numeric(sub.get("Onset latency"), errors="coerce") * 1e3,
+            "p2_ms": pd.to_numeric(sub.get("Peak2 latency"), errors="coerce") * 1e3,
         })
         return out.sort_values(["Channel", "curve"])
 

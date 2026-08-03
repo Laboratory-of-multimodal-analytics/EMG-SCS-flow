@@ -486,10 +486,19 @@ class ScenarioViewer(QWidget):
             ax_bot.plot(t_ms, sel, color="#111111", lw=1.8, zorder=5,
                         label=f"curve {self.selected_curve}")
             row = g[g["curve"] == self.selected_curve]
-            if not row.empty and np.isfinite(row["p1_ms"].iloc[0]):
-                p1 = float(row["p1_ms"].iloc[0])
-                idx = int(np.argmin(np.abs(t_ms - p1)))
-                ax_bot.plot([p1], [sel[idx]], "o", color="red", ms=7, zorder=6)
+            if not row.empty:
+                # all three markers on the selected curve: onset (blue), P1 (red),
+                # P2 (green) — sat on the waveform at each marker's latency.
+                for col_name, colour in (("onset_ms", "tab:blue"),
+                                         ("p1_ms", "red"),
+                                         ("p2_ms", "tab:green")):
+                    if col_name not in row.columns:
+                        continue
+                    val = row[col_name].iloc[0]
+                    if not np.isfinite(val):
+                        continue
+                    idx = int(np.argmin(np.abs(t_ms - float(val))))
+                    ax_bot.plot([float(val)], [sel[idx]], "o", color=colour, ms=7, zorder=6)
             if not row.empty and np.isfinite(row["amp_uv"].iloc[0]):
                 self.curve_label.setText(
                     f"curve: {self.selected_curve} · {row['amp_uv'].iloc[0]:.1f} µV")

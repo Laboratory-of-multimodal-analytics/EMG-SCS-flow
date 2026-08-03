@@ -141,20 +141,40 @@ def _channel_reference(df: pd.DataFrame, channel: str, marks: dict | None = None
 
 
 def _measure_at(df, row, sig, times, sfreq, ref) -> None:
-    """Sample one curve at the reference latencies, no gates applied."""
+    """Sample one curve at the reference latencies.
+
+    Hand markers say WHERE to look, so the correlation/consistency gates (which
+    is what the clinician is overruling) are skipped — but the amplitude floor
+    still holds: a response below STIM_PTP_MIN_UV / STIM_P1_ABS_MIN_UV is noise
+    wherever you point, and must not count as a detection.
+    """
+    from .constants import STIM_P1_ABS_MIN_UV, STIM_PTP_MIN_UV
+
+    def _clear():
+        for col in ("Onset latency", "Peak1 latency", "Peak1 value",
+                    "Peak2 latency", "Peak2 value", "PTP amplitude"):
+            df.at[row, col] = np.nan
+
     p1l, p1v = pick_epoch_value_near_latency(
         sig, times, ref["p1"], sfreq, win_ms=2.0, polarity=ref["pol1"])
     p2l, p2v = (np.nan, np.nan)
     if np.isfinite(ref["p2"]):
         p2l, p2v = pick_epoch_value_near_latency(
             sig, times, ref["p2"], sfreq, win_ms=2.0, polarity=ref["pol2"])
+    # A detection is BOTH peaks AND above the noise floor: a lone peak, or a
+    # PTP / |P1| under threshold, is not a response — leave the whole row empty.
+    ptp = abs(p1v - p2v) if (np.isfinite(p1v) and np.isfinite(p2v)) else np.nan
+    if (not np.isfinite(ptp)
+            or ptp < STIM_PTP_MIN_UV * 1e-6
+            or abs(p1v) < STIM_P1_ABS_MIN_UV * 1e-6):
+        _clear()
+        return
     df.at[row, "Onset latency"] = ref["onset"]
     df.at[row, "Peak1 latency"] = p1l
     df.at[row, "Peak1 value"] = p1v
     df.at[row, "Peak2 latency"] = p2l
     df.at[row, "Peak2 value"] = p2v
-    df.at[row, "PTP amplitude"] = (abs(p1v - p2v)
-                                   if (np.isfinite(p1v) and np.isfinite(p2v)) else np.nan)
+    df.at[row, "PTP amplitude"] = ptp
 
 
 def recompute_corrections(output_root: Path, scenario: str | None = None) -> list[dict]:
@@ -184,10 +204,28 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
         ref = _channel_reference(df, channel, marks)
         # Hand-placed markers re-measure the WHOLE channel, not just the curves
         # singled out: the point of moving them is that the automatic placement
-        # was wrong everywhere on this channel.
+        # was wrong everywhere on this channel. This must include curves the
+        # automatic pass left empty — otherwise a channel the auto-detector
+        # wiped (e.g. a weak channel dropped by the both-peaks rule) can never be
+        # recovered by hand, which is exactly when the clinician draws markers.
         if marks.get(MARKERS) and ref is not None and channel in ch_index:
-            rows = df.index[(df["Channel"].astype(str) == channel)
-                            & df["Peak1 latency"].notna()]
+            # The polarity of a hand-placed marker is whatever the response does
+            # AT that latency — the whole reason to move a marker is often that
+            # the automatic pick sat on the opposite-polarity deflection. Read it
+            # off this channel's own mean at the marker, not the auto-detected
+            # values (which point exactly where the clinician disagreed).
+            mean_wave = data[:, ch_index[channel], :].mean(axis=0)
+            base = float(np.nanmean(mean_wave[times < 0.002])) if np.any(times < 0.002) else 0.0
+
+            def _pol_at(t):
+                i = int(np.argmin(np.abs(times - t)))
+                return 1 if (mean_wave[i] - base) >= 0 else -1
+
+            ref = dict(ref)
+            ref["pol1"] = _pol_at(ref["p1"])
+            if np.isfinite(ref["p2"]):
+                ref["pol2"] = _pol_at(ref["p2"])
+            rows = df.index[df["Channel"].astype(str) == channel]
             for r in rows:
                 curve = int(df.at[r, "Epoch"]) + 1
                 if curve in marks.get(FALSE, []):

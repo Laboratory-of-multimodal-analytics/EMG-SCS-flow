@@ -417,7 +417,8 @@ class SIRViewer(QWidget):
         channel, t0, t1 = self._selection
         try:
             times, mean = self.results.mean_wave(self.crop, channel)
-            tpl = build_template(times, mean, t0, t1, source=f"{self.crop.label} / {channel}")
+            tpl = build_template(times, mean, t0, t1,
+                                 source=f"{self.crop.label} / {channel}", channel=channel)
         except Exception as exc:
             QMessageBox.warning(self, "Cannot build template", str(exc))
             return
