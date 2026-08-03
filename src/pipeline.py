@@ -3835,7 +3835,7 @@ def run_pipeline(
                         baseline_mask=baseline_mask, t_center=t_p1,
                         win_ms=5.0, polarity=pol1,
                         amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
-                        choose="nearest",
+                        choose="global",
                         template_peak_val=tmpl_p1_val, min_rel_to_template=sir_min_rel_to_template,
                         t_min=resp_tmin, t_max=resp_tmax,
                     )
@@ -3848,14 +3848,19 @@ def run_pipeline(
                     pol2 = np.sign(tmpl[idx_tmpl_p2] - np.mean(tmpl[baseline_mask]))
                     pol2 = +1 if pol2 >= 0 else -1
                     tmpl_p2_val = tmpl[idx_tmpl_p2]
+                    # P2 lives strictly after P1: clip the search floor to the P1
+                    # latency just found, so the global-max pick cannot wander into
+                    # the pre-P1 stretch. Window halved to ±6 ms now that it is
+                    # anchored on both sides.
+                    p2_floor = peak1_latency if not np.isnan(peak1_latency) else resp_tmin
                     peak2_latency, peak2_value = detect_peak_in_window(
                         sig_f=sig, times=times, sfreq=sfreq,
                         baseline_mask=baseline_mask, t_center=t_p2,
-                        win_ms=12.0, polarity=pol2,
+                        win_ms=6.0, polarity=pol2,
                         amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
-                        choose="nearest",
+                        choose="global",
                         template_peak_val=tmpl_p2_val, min_rel_to_template=sir_min_rel_to_template,
-                        t_min=resp_tmin, t_max=resp_tmax,
+                        t_min=p2_floor, t_max=resp_tmax,
                     )
                 else:
                     pol2 = +1

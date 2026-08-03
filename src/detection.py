@@ -97,6 +97,17 @@ def detect_peak_in_window(
     amp_thr = max(amp_thr_abs, amp_thr_rel)
 
     if polarity >= 0:
+        # "global": take the largest deflection of this polarity anywhere in the
+        # window, not a find_peaks local maximum. find_peaks needs a sharp,
+        # wide-enough hump and can miss a broad response outright or lock onto a
+        # noise spike; on a signal we already trust to hold the response, the
+        # plain window extremum is what the clinician means by "the peak".
+        if choose == "global":
+            i = int(np.argmax(seg))
+            if seg[i] < amp_thr:
+                return (np.nan, np.nan)
+            return (float(seg_t[i]), float(seg[i] + bmean))
+
         idx, _ = find_peaks(seg, width=min_w)
         if len(idx) == 0:
             return (np.nan, np.nan)
@@ -110,6 +121,12 @@ def detect_peak_in_window(
         else:
             i = int(idx[np.argmax(seg[idx])])
 
+        return (float(seg_t[i]), float(seg[i] + bmean))
+
+    if choose == "global":
+        i = int(np.argmax(-seg))
+        if -seg[i] < amp_thr:
+            return (np.nan, np.nan)
         return (float(seg_t[i]), float(seg[i] + bmean))
 
     idx, _ = find_peaks(-seg, width=min_w)
