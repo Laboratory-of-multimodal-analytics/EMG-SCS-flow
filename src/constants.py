@@ -242,6 +242,37 @@ TEXT_CURVES_RESP_TMIN = 0.002
 # Response search end (s) — covers the 20-25 ms responses seen in these files.
 TEXT_CURVES_RESP_TMAX = 0.04
 
+# ── H-reflex scenario ─────────────────────────────────────────────────────────
+# Two responses per curve: the direct motor response (M) and the reflex (H)
+# roughly 25-30 ms behind it. Everything here exists because the ordinary
+# single-response windows cut the H in half.
+#
+# Response search end (s). The reflex sits far later than anything the other
+# scenarios look for -- on the (Я37) soleus files P1 lands at 39-42 ms and its
+# rebound at 45-47, both outside TEXT_CURVES_RESP_TMAX. Clipped at run time to
+# the curve's own length minus HREFLEX_NOISE_TAIL_MS, so a 60 ms curve keeps a
+# tail to measure noise in and a 100 ms curve does not let the search wander
+# tens of ms past any physiological reflex.
+HREFLEX_RESP_TMAX = 0.060
+# Quiet stretch (ms) left at the end of the curve. The onset search has no
+# pre-stimulus baseline to threshold against on these exports and takes its
+# noise scale from the tail instead (see noise_std_from_tail), so the response
+# window must stop short of the end.
+HREFLEX_NOISE_TAIL_MS = 8.0
+# Earliest the reflex may follow the M-wave's own rebound (ms). Keeps the H
+# search off the tail of the M complex on channels where the two nearly touch.
+HREFLEX_M_GUARD_MS = 3.0
+# Minimum M-P1 -> H-P1 separation (ms). Below this the "second response" is a
+# later phase of the M complex, not a reflex: the monosynaptic loop cannot come
+# back in under this. Deliberately permissive -- it is a sanity floor, not a
+# latency criterion, which is why it sits well under the 25-30 ms actually seen.
+HREFLEX_MIN_GAP_MS = 8.0
+# Half-width (ms) of the per-curve search around the channel's reference P1/P2.
+# Wider for the reflex: its latency genuinely shifts with intensity (39-42 ms
+# across one sweep here) while the M-wave's does not.
+HREFLEX_M_WIN_MS = 4.0
+HREFLEX_H_WIN_MS = 5.0
+
 # Enable artifact-correlation channel-level rejection in stimulation mode.
 STIM_EPOCH_ARTIFACT_CORR_REJECTION = False
 # Absolute correlation threshold vs artifact channel means.

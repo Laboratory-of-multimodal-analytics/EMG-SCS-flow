@@ -133,18 +133,24 @@ def plot_epochs_panel(
                 onset = entry["onset"]
                 p1 = entry["peak1"]
                 p2 = entry["peak2"]
+                # An H-reflex curve carries two marker sets (M and H). Same three
+                # colours so onset/P1/P2 keep meaning what they always mean, and
+                # the reflex is told apart by hollow markers instead — a fourth
+                # and fifth colour would say the components are different KINDS
+                # of thing, when they are the same measurement made twice.
+                hollow = entry.get("kind") == "H"
 
-                if not np.isnan(onset):
-                    onset_idx = np.argmin(np.abs(times - onset))
-                    ax.scatter(onset, ch_data[ep_idx, onset_idx] * 1e6, color="blue", s=18)
+                def _mark(t_mark, colour):
+                    if np.isnan(t_mark):
+                        return
+                    i = np.argmin(np.abs(times - t_mark))
+                    kw = (dict(facecolors="none", edgecolors=colour, linewidths=1.1)
+                          if hollow else dict(color=colour))
+                    ax.scatter(t_mark, ch_data[ep_idx, i] * 1e6, s=18, **kw)
 
-                if not np.isnan(p1):
-                    p1_idx = np.argmin(np.abs(times - p1))
-                    ax.scatter(p1, ch_data[ep_idx, p1_idx] * 1e6, color="red", s=18)
-
-                if not np.isnan(p2):
-                    p2_idx = np.argmin(np.abs(times - p2))
-                    ax.scatter(p2, ch_data[ep_idx, p2_idx] * 1e6, color="green", s=18)
+                _mark(onset, "blue")
+                _mark(p1, "red")
+                _mark(p2, "green")
 
         if ylim_from is not None and ch_data is not None and ch_data.size:
             post = ch_data[:, np.asarray(times) >= ylim_from] * 1e6

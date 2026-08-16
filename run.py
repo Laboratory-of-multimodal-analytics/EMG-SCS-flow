@@ -29,6 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src import run_pipeline
+from src.neurosoft import SCENARIOS
 
 
 def main() -> None:
@@ -62,6 +63,13 @@ def main() -> None:
              "Skips the subject prefix; templates drawn for this recording are "
              "not picked up from the default location either.",
     )
+    parser.add_argument(
+        "--scenario",
+        choices=list(SCENARIOS),
+        default=None,
+        help="Pin the Neurosoft scenario for a .txt curves export instead of "
+             "auto-detecting it. Applies to that format only.",
+    )
     args = parser.parse_args()
 
     if not args.input_path.exists():
@@ -72,6 +80,7 @@ def main() -> None:
         args.input_path,
         output_dir=args.output_dir,
         startstop_mode=args.startstop,
+        force_scenario=args.scenario,
     )
     print(f"Outputs saved under: {output_root}")
 

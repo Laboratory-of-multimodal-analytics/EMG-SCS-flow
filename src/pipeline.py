@@ -129,15 +129,20 @@ from .detection import (
     find_extra_p1_peak,
     pick_epoch_value_near_latency,
 )
-from .io_utils import build_output_dirs, ensure_dir, list_crop_files
+from .io_utils import (
+    build_output_dirs, clear_other_scenario_outputs, ensure_dir, list_crop_files,
+)
 from .neurosoft import (
     CONDITION,
+    HREFLEX,
     JENDRASSIK,
     PAIRED,
     RECRUITMENT,
     SCENARIO_LABELS,
+    SCENARIOS,
     detect_scenario,
     intensities_from_name,
+    protocol_from_name,
 )
 from .plotting import (
     amp_to_number,
@@ -2913,6 +2918,18 @@ def regenerate_sir_outputs_from_metrics(output_root: Path, scenario: str | None 
         csv_channels = set(sub["Channel"].astype(str))
         art_set = {c for c in epochs.ch_names if c not in csv_channels}
 
+        # An H-reflex run carries a marker set per component, so the panel gets
+        # two entries per curve instead of one — the M-wave drawn as usual, the
+        # reflex with hollow markers. The plot loop takes the list as it comes,
+        # so nothing there had to learn about components.
+        from .hreflex import COMPONENTS, columns_for
+
+        component_sets: list[tuple[str | None, dict[str, str]]] = [(None, {
+            "onset": "Onset latency", "p1": "Peak1 latency", "p2": "Peak2 latency"})]
+        if scenario == HREFLEX and all(
+                columns_for(c)["p1"] in df.columns for c in COMPONENTS):
+            component_sets = [(c, columns_for(c)) for c in COMPONENTS]
+
         latency_markers: dict[str, list[dict[str, float]]] = {}
         for ch in epochs.ch_names:
             if ch in art_set:
@@ -2922,12 +2939,14 @@ def regenerate_sir_outputs_from_metrics(output_root: Path, scenario: str | None 
             marks = []
             for ep in range(len(epochs)):
                 r = by_ep.get(ep)
-                marks.append({
-                    "epoch": ep,
-                    "onset": float(r["Onset latency"]) if r is not None else np.nan,
-                    "peak1": float(r["Peak1 latency"]) if r is not None else np.nan,
-                    "peak2": float(r["Peak2 latency"]) if r is not None else np.nan,
-                })
+                for kind, cols in component_sets:
+                    marks.append({
+                        "epoch": ep,
+                        "kind": kind,
+                        "onset": float(r[cols["onset"]]) if r is not None else np.nan,
+                        "peak1": float(r[cols["p1"]]) if r is not None else np.nan,
+                        "peak2": float(r[cols["p2"]]) if r is not None else np.nan,
+                    })
             latency_markers[ch] = marks
 
         title = base_name
@@ -3066,7 +3085,7 @@ def run_pipeline(
         # runs when nothing was forced. This is what lets a clinician overrule a
         # misfire — e.g. an H-reflex whose stepping stimulus reads as a Condition
         # test — and keep that choice on every re-run.
-        _valid = {RECRUITMENT, JENDRASSIK, PAIRED, CONDITION}
+        _valid = set(SCENARIOS)
         if force_scenario is not None:
             if force_scenario not in _valid:
                 raise ValueError(
@@ -3086,14 +3105,26 @@ def run_pipeline(
             flush=True,
         )
         if scen_info.get("conflict"):
-            print(
-                "[NEUROSOFT] WARNING: the name says "
-                f"{SCENARIO_LABELS[neurosoft_scenario]} but the stimulus artifact "
-                f"moves across curves (spread "
-                f"{scen_info['signal']['spread_ms']:.0f} ms), which looks like "
-                "paired stimulation. Going with the name.",
-                flush=True,
-            )
+            _spread = scen_info.get("signal", {}).get("spread_ms", float("nan"))
+            if neurosoft_scenario == HREFLEX:
+                # Expected here rather than suspicious: the reflex moves along
+                # the curve as its latency shortens with intensity, and it is
+                # large enough on these files to be picked up as a "stimulus"
+                # by the artifact search. The name settles it.
+                print(
+                    "[NEUROSOFT] note: a moving peak was found across curves "
+                    f"(spread {_spread:.0f} ms) — on an H-reflex file that is the "
+                    "reflex itself shifting with intensity, not a second stimulus.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[NEUROSOFT] WARNING: the name says "
+                    f"{SCENARIO_LABELS[neurosoft_scenario]} but the stimulus artifact "
+                    f"moves across curves (spread {_spread:.0f} ms), which looks like "
+                    "paired stimulation. Going with the name.",
+                    flush=True,
+                )
         # The Condition test measures the response RELATIVE to an artifact that
         # steps along the curve, so nothing about the fixed-t0 SIR path applies.
         # Its own analysis writes the complete deliverable and returns.
@@ -3204,7 +3235,7 @@ def run_pipeline(
         # its mean is an exact DC estimate, which is what the amplitude metrics
         # need. Assuming a zero baseline instead would bias every peak value by
         # the channel's DC offset (hundreds of uV in these files).
-        adapted = text_curves_window_defaults(edf_path)
+        adapted = text_curves_window_defaults(edf_path, neurosoft_scenario)
         if epoch_tmin == EPOCH_TMIN and epoch_tmax == EPOCH_TMAX:
             epoch_tmin, epoch_tmax = adapted["epoch_tmin"], adapted["epoch_tmax"]
         if baseline_tmin == BASELINE_TMIN and baseline_tmax == BASELINE_TMAX:
@@ -4185,7 +4216,46 @@ def run_pipeline(
         plot_boxplots(df, boxplot_dir)
 
     # ── Scenario deliverables (Neurosoft .txt exports only) ──
-    if neurosoft_scenario == RECRUITMENT:
+    # A re-run under a different scenario must not leave the previous one's
+    # folder and tables sitting beside the new ones — see
+    # clear_other_scenario_outputs. This is how the H-reflex files are being
+    # reprocessed, so it is the normal case rather than an edge one.
+    if neurosoft_scenario is not None:
+        _removed = clear_other_scenario_outputs(
+            paths["stim_results_dir"], neurosoft_scenario)
+        if _removed:
+            print(f"[NEUROSOFT] removed outputs of the previous scenario: "
+                  f"{', '.join(_removed)}", flush=True)
+
+    if neurosoft_scenario == HREFLEX:
+        # Two responses per curve, so the single-response pass above has answered
+        # the wrong question — it took whichever of M and H was larger on each
+        # curve. Re-measure both from the epochs it saved (see src/hreflex.py),
+        # rewrite the metrics with a column set per component, then rebuild the
+        # summary tables and the per-crop panels from the corrected file so
+        # nothing is left showing the single-response numbers.
+        try:
+            from .hreflex import measure_run, run_hreflex_analysis
+            from .sir_review import load_overrides
+
+            measure_run(
+                output_root,
+                resp_tmin=resp_tmin, resp_tmax=resp_tmax,
+                baseline_tmin=baseline_tmin, baseline_tmax=baseline_tmax,
+                overrides=load_overrides(output_root),
+            )
+            regenerate_sir_outputs_from_metrics(output_root, HREFLEX)
+            run_hreflex_analysis(output_root)
+            # An H-reflex file can also be a Jendrassik run — 28 of the 75 in
+            # this dataset are. The scenario stays H-reflex (the two responses
+            # must not collapse into one column), and the block comparison the
+            # recording was made for is added on top, grouped on the reflex.
+            if protocol_from_name(edf_path) == JENDRASSIK:
+                from .hreflex import run_hreflex_jendrassik_groups
+                run_hreflex_jendrassik_groups(output_root)
+        except Exception as exc:
+            print(f"[HREFLEX] skipped ({type(exc).__name__}: {exc})", flush=True)
+    elif neurosoft_scenario == RECRUITMENT:
         try:
             run_recruitment_analysis(output_root)
         except Exception as exc:   # never let the extra step fail the whole run
@@ -4222,7 +4292,10 @@ def run_pipeline(
     # on OTHER channels. Channel-bound templates keep a Crop-view edit local to its
     # channel; this keeps scenario-view edits alive across a re-run. Together they
     # make Crop- and scenario-view corrections survive each other, in any order.
-    if neurosoft_scenario is not None:
+    # HREFLEX is excluded: its branch above already re-measured with the saved
+    # corrections in hand, and recompute_corrections would simply do the whole
+    # thing a second time.
+    if neurosoft_scenario is not None and neurosoft_scenario != HREFLEX:
         try:
             from .sir_review import recompute_corrections
             applied = recompute_corrections(output_root, neurosoft_scenario)

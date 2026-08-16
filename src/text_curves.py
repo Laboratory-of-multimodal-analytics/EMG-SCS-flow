@@ -37,7 +37,10 @@ from pathlib import Path
 import mne
 import numpy as np
 
-from .constants import TEXT_CURVES_RESP_TMAX, TEXT_CURVES_RESP_TMIN
+from .constants import (
+    HREFLEX_NOISE_TAIL_MS, HREFLEX_RESP_TMAX, TEXT_CURVES_RESP_TMAX,
+    TEXT_CURVES_RESP_TMIN,
+)
 
 #: Channels have no names in the export; label them by column position.
 CH_PREFIX = "ch"
@@ -146,24 +149,40 @@ def text_curves_crop_name(path: str | Path, amp_label: str = "all") -> str:
     return f"{safe}-_{amp_label}.fif"
 
 
-def text_curves_window_defaults(path: str | Path) -> dict[str, float]:
+def text_curves_window_defaults(
+    path: str | Path, scenario: str | None = None,
+) -> dict[str, float]:
     """Epoch/baseline/response windows that fit a text ``curves`` export.
 
     Single source of truth for both entry points: ``run_pipeline`` applies these
     to any window argument the caller left at its module default, and the GUI
     writes them into its settings when such a file is opened, so the values on
     screen are the values that run.
+
+    The H-reflex scenario needs a longer response window than the rest — the
+    reflex lands 25-30 ms behind the M-wave, past where every other scenario
+    stops looking. It is still clipped to leave a quiet tail at the end of the
+    curve, because on these exports that tail is the only place a noise scale
+    can be measured (there is no pre-stimulus baseline) and the onset search
+    depends on having one.
     """
+    from .neurosoft import HREFLEX
+
     data, sfreq, _ = read_text_curves(path)
     n_samples = data.shape[2]
     b_tmin, b_tmax = flat_prestim_baseline(data, sfreq=sfreq)
+    epoch_tmax = (n_samples - 1) / sfreq
+    if scenario == HREFLEX:
+        resp_tmax = min(HREFLEX_RESP_TMAX, epoch_tmax - HREFLEX_NOISE_TAIL_MS / 1e3)
+    else:
+        resp_tmax = TEXT_CURVES_RESP_TMAX
     return {
         "epoch_tmin": 0.0,
-        "epoch_tmax": (n_samples - 1) / sfreq,
+        "epoch_tmax": epoch_tmax,
         "baseline_tmin": b_tmin,
         "baseline_tmax": b_tmax,
         "resp_tmin": TEXT_CURVES_RESP_TMIN,
-        "resp_tmax": TEXT_CURVES_RESP_TMAX,
+        "resp_tmax": float(max(resp_tmax, TEXT_CURVES_RESP_TMAX)),
     }
 
 

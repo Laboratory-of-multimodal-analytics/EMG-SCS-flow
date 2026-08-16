@@ -1,4 +1,4 @@
-"""Which of the four Neurosoft protocols a text ``curves`` export holds.
+"""Which of the five Neurosoft protocols a text ``curves`` export holds.
 
 Applies ONLY to the Neurosoft station's .txt exports. Per A. Militskova, the
 file name carries the stimulation level (Th9-10, Th12-L1, C3-4 ...) followed by
@@ -31,8 +31,19 @@ a token naming the test, and each test wants a different deliverable:
      which is why this one is detected from the data. Deliverable: response
      measured RELATIVE to the artifact, grouped by inter-stimulus interval.
 
-Anything else in these folders (H-reflex, SEP/ССВП, TMS, n. ulnaris) is out of
-scope and keeps the generic path.
+  5. HREFLEX     ("H reflex", "Н рефлекс", or a muscle name on its own)
+     Peripheral-nerve stimulation with TWO responses on the same curve: the
+     direct motor response (M) and, ~25-30 ms behind it, the monosynaptic
+     reflex response (H). Everything the other scenarios measure once is
+     measured twice here — onset, P1, P2 and PTP for M and for H separately —
+     because the pair is the measurement: H grows and then RECEDES as M grows,
+     and a detector that takes "the response" on such a curve reports whichever
+     of the two happens to be larger at that intensity, silently mixing the two
+     down one column. In the FCBRN dataset that is 75 of the 415 files, and 23
+     of them carry exactly that complaint in the processing journal.
+
+Anything else in these folders (SEP/ССВП, TMS, n. ulnaris) is out of scope and
+keeps the generic path.
 
 Naming is inconsistent: Latin and Cyrillic mix inside one token (``Тh11-12``,
 ``JМ``), case varies, and Cyrillic homoglyphs stand in for Latin letters. So the
@@ -50,6 +61,7 @@ RECRUITMENT = "recruitment"
 JENDRASSIK = "jendrassik"
 PAIRED = "paired"
 CONDITION = "condition"
+HREFLEX = "hreflex"
 
 #: Human-readable scenario names for logs and figure titles.
 SCENARIO_LABELS = {
@@ -57,7 +69,12 @@ SCENARIO_LABELS = {
     JENDRASSIK: "Jendrassik manoeuvre",
     PAIRED: "Paired stimulation",
     CONDITION: "Condition test",
+    HREFLEX: "H-reflex",
 }
+
+#: Every scenario a caller may pin, in one place so the CLI, the GUI selector and
+#: ``run_pipeline``'s validation cannot drift apart.
+SCENARIOS = (RECRUITMENT, JENDRASSIK, PAIRED, CONDITION, HREFLEX)
 
 #: Cyrillic letters visually identical to Latin ones, so "Тh11-12 JМ" folds to
 #: "th11-12 jm" and one Latin pattern covers every spelling.
@@ -71,10 +88,30 @@ _PAIRED_LAT = re.compile(r"2\s*stim|\bpaired\b|\bparied\b|double\s*stim")
 _JM_LAT = re.compile(r"\bjm\b|jendrassik")
 _RC_LAT = re.compile(r"\brc\b|rec\s*curve|recru[it]tment|recrutment|\bkr\b")
 
+_HR_LAT = re.compile(r"h[\s\-_]*reflex|\bhreflex\b")
+
 # Cyrillic tokens — matched on the plain lower-cased name.
 _PAIRED_CYR = re.compile(r"\b2\s*ст|двойн\w*\s*стим\w*|парн\w*\s*стим|\bпарн")
 _JM_CYR = re.compile(r"ендр")
 _RC_CYR = re.compile(r"\bкр\b|кр\s*рек\w*|кривой\s*рекрут")
+#: "Н рефлекс" with a Cyrillic Н — never folded, or it would read as Latin "H".
+_HR_CYR = re.compile(r"\bн[\s\-_]*рефл\w*|\bн[\s\-_]*reflex")
+
+#: The muscle a peripheral-nerve run was recorded from, standing in for the
+#: protocol. Half of these files are named after nothing else — ``сол лев.txt``,
+#: ``GM Right JM.txt``, ``челюсть сол прав.txt`` — because to the clinician who
+#: named them "soleus" already means the H-reflex study; nothing else is
+#: recorded from a single muscle over a stimulation ramp of a peripheral nerve.
+#:
+#: Read off the dataset rather than guessed: these patterns select exactly the
+#: 75 files the processing journal marks as H-reflex out of all 415, with no
+#: false positive and none missed.
+#:
+#: Split Latin/Cyrillic like every other token here, and for the same reason:
+#: folding maps ``с`` and ``о`` onto Latin, so ``сол`` folds to ``col`` and a
+#: single pattern over the folded name cannot see it.
+_HR_MUSCLE_LAT = re.compile(r"\bsol\b|soleus|\bgm\b|\bfcu\b")
+_HR_MUSCLE_CYR = re.compile(r"\bсол\w*|гастри\w*|камбал\w*")
 
 
 def _stem(path: str | Path) -> str:
@@ -139,6 +176,15 @@ def scenario_from_name(path: str | Path) -> str | None:
 
     Paired is tested first: ``Т11-12 2ст`` also contains an RC-looking ``ст``
     fragment, and the paired token is the more specific of the two.
+
+    H-reflex comes before Jendrassik and recruitment, and beats both. Those two
+    name a PROTOCOL — how the stimuli were delivered — while H-reflex names what
+    is on the curve, and a file is routinely both (``Н рефлекс СОЛ лев
+    Ендрассик``, ``H reflex rec curve сол прав``). Which one the run must follow
+    is settled by what would be lost: measured as a Jendrassik file, the M and H
+    responses collapse into one column and the comparison the file exists for is
+    gone. The protocol is not lost — it is kept in ``protocol_from_name`` and
+    drives the deliverable.
     """
     stem = _stem(path)
     raw = stem.lower()
@@ -146,11 +192,31 @@ def scenario_from_name(path: str | Path) -> str | None:
 
     if _PAIRED_LAT.search(folded) or _PAIRED_CYR.search(raw):
         return PAIRED
+    if (_HR_LAT.search(folded) or _HR_CYR.search(raw)
+            or _HR_MUSCLE_LAT.search(folded) or _HR_MUSCLE_CYR.search(raw)):
+        return HREFLEX
     if _JM_LAT.search(folded) or _JM_CYR.search(raw):
         return JENDRASSIK
     if _RC_LAT.search(folded) or _RC_CYR.search(raw):
         return RECRUITMENT
     return None
+
+
+def protocol_from_name(path: str | Path) -> str:
+    """How the stimuli were delivered, for a file whose scenario is H-reflex.
+
+    An H-reflex run is still driven by one of the ordinary protocols — a ramp of
+    intensities, or a block with the Jendrassik manoeuvre against a block
+    without. ``scenario_from_name`` deliberately answers HREFLEX for both, so the
+    protocol is read separately and decides the deliverable: a ramp gets the
+    recruitment curves, a Jendrassik run additionally gets its amplitude groups.
+    """
+    stem = _stem(path)
+    raw = stem.lower()
+    folded = _fold(stem)
+    if _JM_LAT.search(folded) or _JM_CYR.search(raw):
+        return JENDRASSIK
+    return RECRUITMENT
 
 
 def detect_scenario(
@@ -170,7 +236,8 @@ def detect_scenario(
     show it instead of silently picking one.
     """
     named = scenario_from_name(path)
-    info: dict = {"from_name": named, "from_signal": None, "conflict": False}
+    info: dict = {"from_name": named, "from_signal": None, "conflict": False,
+                  "protocol": protocol_from_name(path)}
 
     moving = False
     n_isi = 1
@@ -183,6 +250,19 @@ def detect_scenario(
         n_isi = len(isi)
         info["n_isi"] = n_isi
         info["from_signal"] = CONDITION if (moving and n_isi > 1) else None
+
+    # An H-reflex named in the file beats the signal. The signal argument for
+    # Condition is that its files are named after the conditioning modality and
+    # so cannot be asked — but "Н рефлекс СОЛ лев" names neither a modality nor
+    # a conditioning stimulus, it names the study. These files do sometimes read
+    # as a stepping artifact (a stimulator whose delay drifts, a broad M-wave
+    # taken for an artifact), which is how four of them were classified as
+    # Condition tests and had to be re-run by hand.
+    if named == HREFLEX:
+        info["conflict"] = bool(moving and n_isi > 1)
+        info["scenario"] = HREFLEX
+        info["reason"] = "file name (H-reflex wins over the signal)"
+        return HREFLEX, info
 
     # The Condition test is DEFINED by the shift, so the signal decides it —
     # its files are named after the conditioning modality (ТМС, нерв, ulnaris),

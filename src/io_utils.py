@@ -14,7 +14,7 @@ CONDITION_FOLDER = "Condition test"
 _MODE_MARKERS: dict[str, tuple[str, ...]] = {
     STIMULATION_INDUCED_FOLDER: (
         "Stimulus-centered epochs", "Recruitment", "Jendrassik",
-        "Paired stimulation", "Template overlays",
+        "Paired stimulation", "H-reflex", "Template overlays",
     ),
     STARTSTOP_FOLDER: (
         "Detections raw", "Spontaneous EMG", "Raw epochs",
@@ -122,6 +122,52 @@ def build_output_dirs(output_root: Path, startstop_mode: bool = False) -> dict[s
         "templates_dir": results_dir / "Templates",
         "startstop_dir": startstop_dir,
     }
+
+
+#: Per-scenario deliverable: the figure folder, and the tables it owns in the
+#: shared Excel folder. Filenames are exact or prefixes, matched by ``startswith``.
+SCENARIO_OUTPUTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "recruitment": ("Recruitment", ("recruitment_", "stats_top", "stats_amplitude_groups")),
+    "jendrassik": ("Jendrassik", ("curves_by_amplitude_group", "stats_amplitude_groups")),
+    "paired": ("Paired stimulation", ("curves_by_amplitude_group", "stats_amplitude_groups")),
+    "hreflex": ("H-reflex", ("hreflex_", "stats_hm")),
+}
+
+
+def clear_other_scenario_outputs(results_dir: Path, keep: str) -> list[str]:
+    """Remove the deliverables of every scenario except *keep*.
+
+    A recording can be re-run under a different scenario — that is what the GUI's
+    scenario selector is for, and it is how the H-reflex files are being
+    reprocessed. Without this the previous scenario's folder and tables simply
+    stay put, and the run root then claims two mutually exclusive protocols at
+    once with nothing marking which numbers are current. The reader picks one and
+    the other silently becomes a trap, differing by however much detection has
+    changed since.
+
+    Only this pipeline's own output names are touched, and only inside
+    ``results/``. Returns what was removed, for the run log.
+    """
+    import shutil
+
+    results_dir = Path(results_dir)
+    removed: list[str] = []
+    excel = results_dir / "Excel"
+    for scenario, (folder, prefixes) in SCENARIO_OUTPUTS.items():
+        if scenario == keep:
+            continue
+        d = results_dir / folder
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(folder + "/")
+        if not excel.is_dir():
+            continue
+        keep_prefixes = SCENARIO_OUTPUTS.get(keep, ("", ()))[1]
+        for f in excel.glob("*.csv"):
+            if f.name.startswith(prefixes) and not f.name.startswith(keep_prefixes):
+                f.unlink(missing_ok=True)
+                removed.append(f.name)
+    return removed
 
 
 def list_crop_files(crops_dir: Path) -> list[str]:

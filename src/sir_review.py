@@ -43,6 +43,18 @@ WINDOW = "window_ms"
 MARKERS = "markers_ms"
 
 
+def mark_key(kind: str, component: str | None = None) -> str:
+    """The override key for *kind*, optionally scoped to one component.
+
+    An H-reflex curve carries two responses, and a mark almost never applies to
+    both: the reflex is a false positive on a curve whose M-wave is perfectly
+    good, or the other way round. So those marks are stored per component
+    (``false_M``, ``missed_H``) while every other scenario keeps writing the
+    plain keys it always has.
+    """
+    return f"{kind}_{component}" if component else kind
+
+
 def overrides_path(output_root: Path) -> Path:
     return Path(output_root) / "review" / OVERRIDES_NAME
 
@@ -64,10 +76,11 @@ def save_overrides(output_root: Path, data: dict) -> Path:
     return p
 
 
-def mark_curve(overrides: dict, channel: str, curve: int, kind: str | None) -> dict:
+def mark_curve(overrides: dict, channel: str, curve: int, kind: str | None,
+               component: str | None = None) -> dict:
     """Set, change or clear the mark on one curve. Returns the updated dict."""
     ch = overrides.setdefault(channel, {})
-    for k in (FALSE, MISSED):
+    for k in (mark_key(FALSE, component), mark_key(MISSED, component)):
         lst = ch.get(k, [])
         if curve in lst:
             lst.remove(curve)
@@ -76,20 +89,101 @@ def mark_curve(overrides: dict, channel: str, curve: int, kind: str | None) -> d
         else:
             ch.pop(k, None)
     if kind in (FALSE, MISSED):
-        ch.setdefault(kind, [])
-        ch[kind] = sorted(set(ch[kind]) | {int(curve)})
+        key = mark_key(kind, component)
+        ch[key] = sorted(set(ch.get(key, [])) | {int(curve)})
     if not ch:
         overrides.pop(channel, None)
     return overrides
 
 
-def curve_mark(overrides: dict, channel: str, curve: int) -> str | None:
+def curve_mark(overrides: dict, channel: str, curve: int,
+               component: str | None = None) -> str | None:
     ch = overrides.get(channel, {})
-    if curve in ch.get(FALSE, []):
+    if curve in ch.get(mark_key(FALSE, component), []):
         return FALSE
-    if curve in ch.get(MISSED, []):
+    if curve in ch.get(mark_key(MISSED, component), []):
         return MISSED
     return None
+
+
+def _run_windows(output_root: Path) -> dict:
+    """The response/baseline windows this run was measured with.
+
+    Taken from the saved epochs and the recording the manifest points at, so a
+    correction applied months later uses the same windows the run did instead of
+    whatever the module defaults happen to be by then.
+    """
+    from .hreflex import load_epochs
+    from .neurosoft import HREFLEX
+    from .pipeline import input_from_run_manifest
+    from .text_curves import text_curves_window_defaults
+
+    src = input_from_run_manifest(output_root)
+    if src is not None and Path(src).exists():
+        try:
+            return text_curves_window_defaults(src, HREFLEX)
+        except Exception:
+            pass
+    # No source file to hand: fall back to the epochs' own span, minus the tail
+    # the onset search needs (see HREFLEX_NOISE_TAIL_MS).
+    from .constants import (
+        HREFLEX_NOISE_TAIL_MS, HREFLEX_RESP_TMAX, TEXT_CURVES_RESP_TMIN,
+    )
+    ep = load_epochs(output_root)
+    t = ep.times
+    return {"resp_tmin": TEXT_CURVES_RESP_TMIN,
+            "resp_tmax": min(HREFLEX_RESP_TMAX,
+                             float(t[-1]) - HREFLEX_NOISE_TAIL_MS / 1e3),
+            "baseline_tmin": float(t[0]),
+            "baseline_tmax": float(t[0]) + 0.0006}
+
+
+def _recompute_hreflex(output_root: Path, ov: dict) -> list[dict]:
+    """Re-measure an H-reflex run with the corrections applied."""
+    from .hreflex import (
+        COMPONENTS, measure_run, run_hreflex_analysis, run_hreflex_jendrassik_groups,
+    )
+    from .neurosoft import HREFLEX, JENDRASSIK, protocol_from_name
+    from .pipeline import input_from_run_manifest, regenerate_sir_outputs_from_metrics
+
+    win = _run_windows(output_root)
+    measure_run(
+        output_root,
+        resp_tmin=win["resp_tmin"], resp_tmax=win["resp_tmax"],
+        baseline_tmin=win["baseline_tmin"], baseline_tmax=win["baseline_tmax"],
+        overrides=ov,
+    )
+    regenerate_sir_outputs_from_metrics(output_root, HREFLEX)
+    run_hreflex_analysis(output_root)
+    # Same rule as a full run: a file that is also a Jendrassik study keeps its
+    # block comparison, rebuilt from the corrected metrics rather than left
+    # showing the numbers from before the correction.
+    src = input_from_run_manifest(output_root)
+    if src is not None and protocol_from_name(src) == JENDRASSIK:
+        run_hreflex_jendrassik_groups(output_root)
+
+    from .hreflex import MARKER_KEYS
+
+    done: list[dict] = []
+    for channel, marks in ov.items():
+        mk = marks.get(MARKERS) or {}
+        if any(k in mk for k in MARKER_KEYS):
+            done.append({"channel": channel, "curve": "все",
+                         "kind": "перемерено по ручным маркерам (6 точек)"})
+        elif mk:
+            # A three-marker set from a single-response run. measure_run has
+            # already said it is being ignored; saying "re-measured by hand
+            # markers" here would contradict that.
+            done.append({"channel": channel, "curve": "—",
+                         "kind": "старые маркеры на одну волну — не применены"})
+        for comp in COMPONENTS:
+            for curve in marks.get(mark_key(FALSE, comp), []):
+                done.append({"channel": channel, "curve": int(curve),
+                             "kind": f"{comp}: ложный — снят"})
+            for curve in marks.get(mark_key(MISSED, comp), []):
+                done.append({"channel": channel, "curve": int(curve),
+                             "kind": f"{comp}: пропущенный — досчитан"})
+    return done
 
 
 # --------------------------------------------------------------------------- #
@@ -183,13 +277,21 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
     Returns one record per corrected curve.
     """
     from .jendrassik import run_curve_group_analysis
-    from .neurosoft import JENDRASSIK, PAIRED, RECRUITMENT
+    from .neurosoft import HREFLEX, JENDRASSIK, PAIRED, RECRUITMENT
     from .recruitment import run_recruitment_analysis
 
     output_root = Path(output_root)
     ov = load_overrides(output_root)
     if not ov:
         return []
+
+    # The H-reflex scenario measures two responses per curve, so none of the
+    # single-response machinery below applies: its marks are per component and
+    # its "measure this curve anyway" needs a reference for each. It re-measures
+    # the whole run from the saved epochs instead, which is also what a full run
+    # does — the two paths cannot drift apart.
+    if scenario == HREFLEX:
+        return _recompute_hreflex(output_root, ov)
 
     csv = _metrics_csv(output_root)
     df = pd.read_csv(csv)
