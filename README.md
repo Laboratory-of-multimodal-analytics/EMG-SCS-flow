@@ -7,7 +7,8 @@ epoch files.
 It runs two ways:
 
 - **`python3 -m emgflow`** — the interactive toolbox
-- **`python3 run.py <file>`** — the scripted pipeline, for reproducible batch runs.
+- **`python3 run.py <file>`** — the scripted pipeline, for reproducible batch runs
+  (`--scenario` pins the Neurosoft scenario instead of auto-detecting it).
 
 The GUI does not reimplement anything: it calls the same `run_pipeline(...)`, renders the
 pipeline's own outputs, and can export a runner script that reproduces a session headlessly.
@@ -82,7 +83,7 @@ The CLI, the scripted `run_pipeline` call and the GUI all take the same path —
 the file dialog filter and mirrors the adapted windows into its settings panel, so the values shown
 are the values that run.
 
-#### The three Neurosoft protocols
+#### The Neurosoft protocols
 
 Per A. Militskova, the file name carries the stimulation level (`Th9-10`, `Th12-L1`, `C3-4` …)
 followed by a token naming the test, and each test wants a different deliverable. `src/neurosoft.py`
@@ -94,11 +95,80 @@ produced — no template diagnostics, no per-amplitude box-plots, no averaging p
 | **Recruitment curve** | `RC`, `rec curve`, `kr rec`, `кр рек`, `КР` | `Recruitment/` — amplitude vs curve number per channel, top-N and amplitude-group box-plots, per-curve tables |
 | **Jendrassik manoeuvre** | `JM`, `ендр`, `Ендрассик` | `Jendrassik/` — every curve drawn, grouped by amplitude with group mean ± SD, group statistics |
 | **Paired stimulation** | `2 stim`, `2ст`, `двойная стим`, `парная`, `paired` | `Paired stimulation/` (same as Jendrassik), or the Condition-test outputs when the ISI is recoverable |
+| **H-reflex** | `H reflex`, `Н рефлекс`, or a muscle name alone (`сол`, `SOL`, `soleus`, `GM`, `FCU`, `гастрик`) | `H-reflex/` — M and H recruitment curves per channel, latency plots, per-curve tables with a column set per component, Hmax/Mmax; plus amplitude groups on the reflex when the file is a Jendrassik run too |
 
 Matching is case-insensitive and tolerates the Cyrillic/Latin homoglyph mixing these names are full
 of (`Тh11-12`, `JМ`). A file with **no** token falls back to the signal: a moving stimulus artifact
 means paired-pulse, a fixed one means a recruitment sweep — the common case for bare `Th11-12.txt`.
 When the name and the signal disagree the name wins and the run log says so.
+
+H-reflex is tested before Jendrassik and recruitment and **beats both**: those name a protocol,
+H-reflex names what is on the curve, and a file is routinely both (`Н рефлекс СОЛ лев Ендрассик`).
+It also beats the signal-based Condition-test route, whose argument — "these files are named after
+the conditioning modality, so the name cannot be asked" — does not hold for a file called
+`Н рефлекс СОЛ лев`. The protocol is not thrown away: `protocol_from_name` keeps it and it decides
+the deliverable. The muscle-name fallback is read off the dataset rather than guessed — these
+patterns select exactly the 75 files the processing journal marks as H-reflex out of all 415,
+with no false positive and none missed.
+
+#### The H-reflex scenario: two responses per curve
+
+A peripheral-nerve run puts two responses on one curve — the direct motor response (**M**) and,
+25-30 ms behind it, the monosynaptic reflex (**H**) — and they do not grow together. As
+stimulation rises the M-wave climbs to a plateau while the H-reflex rises, peaks and then
+**recedes**, because the antidromic volley in the motor axons collides with the reflex volley
+coming back down.
+
+A single-response detector on such a curve reports whichever of the two is larger at that
+intensity, so one column ends up holding two different responses and the "recruitment curve" it
+draws is an artefact of the crossover. 23 of the 75 H-reflex files in this dataset carry exactly
+that complaint in the processing journal.
+
+So `src/hreflex.py` measures both, each with its own **onset, P1, P2 and PTP**, and each allowed
+to be absent independently — sub-threshold curves have neither, low intensities have H without a
+measurable M, and high intensities routinely have M without an H. None of that counts as a failed
+detection. Per channel:
+
+1. **M** is fitted on the mean of the channel's strongest curves.
+2. **H** is fitted on the curves with the most *late* activity — deliberately not the same set,
+   since the strongest curves are where the reflex has already been suppressed.
+3. Within the H window P1 is taken **at the polarity M-P1 has**, not as the dominant deflection:
+   the two are the same muscle's compound action potential and point the same way, and picking
+   independently makes P1 mean different things on one channel whenever the reflex's rebound
+   outgrows its first phase (it does).
+
+Then each curve is searched near its own component's reference latencies, inside its own half of
+the response window — the same marker-driven peak search the ordinary SIR pass uses, run twice.
+The response window is longer here (`HREFLEX_RESP_TMAX`, clipped to the curve's length minus a
+tail the onset search needs a noise scale from); the standard 40 ms stops before the reflex.
+
+**When the file is also a Jendrassik run** (28 of the 75 here — `Н рефлекс СОЛ лев Ендрассик`),
+the amplitude-group deliverable is produced on top of the M/H one, **grouped on the H-reflex
+amplitude**. The manoeuvre works by raising the excitability of the motoneuron pool, which is what
+the reflex measures; the direct motor response does not go through the pool and should be roughly
+unchanged between the blocks, so grouping on it would split the file on nothing and report the
+manoeuvre as having no effect. The M-wave is carried into the same table as a control — that it
+stays put across the groups is what says the split found the protocol. Outputs go under
+`H-reflex/` (`jendrassik_curves_by_H_group.png`, `jendrassik_H_amplitude_by_group_boxplots.png`)
+plus `Excel/hreflex_jendrassik_by_curve_long.csv` and `…_group_stats.csv`; the run still has one
+scenario, and this is part of its deliverable rather than a second scenario folder. Group count
+comes from the intensities named in the file, exactly as in the Jendrassik scenario, and the
+`Curves` column is the check that the groups line up with the blocks in time.
+
+**Columns.** The metrics CSV gains `M onset latency`, `M peak1 latency`, `M peak2 latency`,
+`M peak1 value`, `M peak2 value`, `M PTP amplitude` and the same six for `H`. The
+single-response columns stay and hold the **M-wave**, so anything reading the file without
+knowing about the scenario gets the direct response rather than whichever was larger.
+
+**In the GUI** the scenario tab shows the two responses as **two point plots side by side** — M
+left, H right — over one shared set of curves below, on which the selected curve's six markers
+are drawn (filled = M, hollow = H, everywhere including the exported panels). Corrections work as
+in the other scenarios but are **per component**: a combo box says which of the two "ложный
+ответ" / "потерянный ответ" applies to, and a hand-drawn template carries **six** markers instead
+of three. Those six are stored as a per-channel correction rather than a bank template — H-reflex
+detection does not consult the template bank at all, so a bank template saved on such a run would
+be written and then silently ignored. The statistics table gives Hmax, Mmax, the curve each was
+reached on, each component's threshold curve, and **Hmax/Mmax**.
 
 Both plot panels (`Plots with grid and markers`, `Plots without grid and markers`) change shape for
 these files: **the black mean line is dropped** and each curve is coloured by its position in the
@@ -112,8 +182,8 @@ one subplot per channel with the groups overlaid — the groups are read by comp
 means having them side by side rather than in one file per channel.
 
 In the GUI the scenario surface is one **interactive** tab that renames itself after whichever
-scenario the run produced ("Recruitment curve" / "Jendrassik manoeuvre" / "Paired stimulation"),
-since the three are mutually exclusive. It is driven by the per-curve metrics and the saved epochs,
+scenario the run produced ("Recruitment curve" / "Jendrassik manoeuvre" / "Paired stimulation" /
+"H-reflex"), since they are mutually exclusive. It is driven by the per-curve metrics and the saved epochs,
 not by the exported PNGs: pick a channel, click a point on the response-vs-curve plot (or drag the
 slider) to pull that curve up bold with its markers, switch the colouring between curve order and
 amplitude group, and read the group mean/SD table beside it.
@@ -233,7 +303,8 @@ Two things keep the tree flat:
     ├── Excel/                        per-epoch metrics + summary stats
     ├── Plots with / without grid and markers/, Plots grouped by amplitude/
     ├── Boxplots/, Templates/, Template overlays/
-    ├── Recruitment/ | Jendrassik/ | Paired stimulation/   (Neurosoft .txt: one of the three)
+    ├── Recruitment/ | Jendrassik/ | Paired stimulation/ | H-reflex/
+    │                                 (Neurosoft .txt: exactly one of these)
     │  StartStop:
     ├── Excel/                        metrics, summary, and three diagnostic tables:
     │                                 accepted anchors, discarded anchors + reason, channel QC
@@ -260,7 +331,9 @@ Amplitudes in the tables are in **volts**, latencies in **seconds**.
 
 Everything tunable lives in `src/constants.py`, grouped and documented: filtering, artifact
 detection, epoch and response windows, re-referencing, the SIR template/alignment/gate parameters,
-the StartStop matching and gate thresholds, and the spontaneous-EMG and burst parameters. Tune
+the StartStop matching and gate thresholds, the spontaneous-EMG and burst parameters, and the
+`HREFLEX_*` block (the longer response window, the quiet tail the onset search needs, and the
+M-to-H guard and search half-widths). Tune
 there, re-run on a known validation set, and compare.
 
 Caveats worth knowing before you go looking for a knob:
@@ -284,6 +357,7 @@ src/
 ├── constants.py    every tunable, with its default and the reasoning behind it
 ├── annotations.py  protocol parsing: config/amplitude labels, start/stop segments
 ├── detection.py    onset and peak primitives shared by both modes
+├── hreflex.py      the H-reflex scenario: M and H fitted and measured separately
 ├── plotting.py     panels, overlays, boxplots, spontaneous plots, L-shapes
 ├── io_utils.py     output tree
 templates/          the 26-template bank (.npy + onset/peak indices in .npz)

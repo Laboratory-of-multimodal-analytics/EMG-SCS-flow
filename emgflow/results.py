@@ -120,7 +120,7 @@ _PRUNE = {
     "Plots", "Raw epochs", "Templates", "Detections raw", "Spontaneous EMG",
     "Stimulus-centered epochs", "Template overlays", "annot_crops_fif", "__pycache__",
     "Condition test", "Waterfall", "Amplitude vs condition", "Recruitment", "arrays",
-    "Jendrassik", "Paired stimulation", "Curves per condition",
+    "Jendrassik", "Paired stimulation", "Curves per condition", "H-reflex",
     "Plots with grid and markers", "Plots without grid and markers",
     "Plots grouped by amplitude", "Template overlays per amplitude",
 }
@@ -305,6 +305,10 @@ class SIRResults:
                 for ch in rows["Channel"]
             ], dtype=bool)
             rows = rows[keep]
+        # Either component counts on an H-reflex run — see channel_summary.
+        if {"M peak1 latency", "H peak1 latency"} <= set(rows.columns):
+            return int(rows[["M peak1 latency", "H peak1 latency"]]
+                       .notna().any(axis=1).sum())
         if "Peak1 latency" not in rows.columns:
             return 0
         return int(rows["Peak1 latency"].notna().sum())
@@ -345,7 +349,16 @@ class SIRResults:
                     "Status": "rejected" if rejected else "no response",
                 })
                 continue
-            det = 0 if rejected else int(grp["Peak1 latency"].notna().sum())
+            # An H-reflex run has two response columns, and the single-response
+            # one holds the M-wave. Counting only that would report "24
+            # detections" on a channel carrying 24 M-waves and 41 reflexes, and
+            # call a reflex-only channel silent — the exact confusion the
+            # scenario exists to remove. Detections there means either component.
+            det_cols = ["Peak1 latency"]
+            if "H peak1 latency" in grp.columns and "M peak1 latency" in grp.columns:
+                det_cols = ["M peak1 latency", "H peak1 latency"]
+            det = 0 if rejected else int(
+                grp[det_cols].notna().any(axis=1).sum())
             p1 = grp["Peak1 latency"].to_numpy(dtype=float)
             # Amplitudes are stored in VOLTS; the column header promises µV.
             ptp = grp["PTP amplitude"].to_numpy(dtype=float) * 1e6
@@ -455,13 +468,59 @@ class SIRResults:
     def scenario(self) -> str | None:
         """Which Neurosoft protocol this run produced, or None for a normal SIR run.
 
-        Read off the deliverable folder the pipeline wrote — the three scenarios
-        are mutually exclusive, so the first hit is the answer.
+        Read off the deliverable folder the pipeline wrote — the scenarios are
+        mutually exclusive, so the first hit is the answer.
         """
-        for folder in ("Recruitment", "Jendrassik", "Paired stimulation"):
+        for folder in ("H-reflex", "Recruitment", "Jendrassik", "Paired stimulation"):
             if (self.results_dir / folder).is_dir():
                 return folder
         return None
+
+    def hreflex_by_curve(self, config: str, session=None) -> pd.DataFrame:
+        """Per-curve M and H metrics side by side, for the H-reflex scenario.
+
+        Same row set as ``recruitment_by_curve`` — one per curve, undetected
+        ones included — but with a column pair per component, because on these
+        files a curve routinely carries one response and not the other and the
+        two have to be plotted, marked and corrected apart.
+        """
+        from src.hreflex import COMPONENTS, columns_for
+
+        if self.metrics.empty:
+            return pd.DataFrame()
+        sub = self.metrics[self.metrics["Configuration"].astype(str) == str(config)].copy()
+        if sub.empty or "Epoch" not in sub.columns:
+            return pd.DataFrame()
+        if not all(columns_for(c)["p1"] in sub.columns for c in COMPONENTS):
+            return pd.DataFrame()
+
+        out = pd.DataFrame({
+            "Channel": sub["Channel"].astype(str),
+            "curve": sub["Epoch"].astype(int) + 1,
+        })
+        for comp in COMPONENTS:
+            cols = columns_for(comp)
+            pre = comp.lower()
+            rejected = None
+            if session is not None:
+                rejected = np.array([
+                    self._is_rejected(session, str(config), str(a), str(ch))
+                    for a, ch in zip(sub["Stim. amplitude"], sub["Channel"])
+                ], dtype=bool)
+            ptp = pd.to_numeric(sub[cols["ptp"]], errors="coerce") * 1e6
+            p1v = pd.to_numeric(sub[cols["pv1"]], errors="coerce") * 1e6
+            if rejected is not None:
+                ptp[rejected] = np.nan
+                p1v[rejected] = np.nan
+            out[f"{pre}_amp_uv"] = ptp
+            out[f"{pre}_p1_uv"] = p1v
+            for key, name, scale in (("onset", "onset_ms", 1e3), ("p1", "p1_ms", 1e3),
+                                     ("p2", "p2_ms", 1e3)):
+                v = pd.to_numeric(sub[cols[key]], errors="coerce") * scale
+                if rejected is not None:
+                    v[rejected] = np.nan
+                out[f"{pre}_{name}"] = v
+        return out.sort_values(["Channel", "curve"])
 
     def recruitment_by_curve(self, config: str, session=None) -> pd.DataFrame:
         """Response size per CURVE, for exports with no amplitude axis.

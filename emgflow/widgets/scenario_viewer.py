@@ -38,10 +38,10 @@ from src.recruitment import choose_n_groups, cluster_amplitudes
 from matplotlib.widgets import SpanSelector
 
 from src.sir_review import (FALSE, MARKERS, MISSED, WINDOW, curve_mark, load_overrides,
-                            mark_curve, recompute_corrections, save_overrides)
+                            mark_curve, mark_key, recompute_corrections, save_overrides)
 
 from ..templates import build_template
-from .template_editor import TemplateEditor
+from .template_editor import HREFLEX_MARKERS, TemplateEditor
 
 from ..results import SIRResults
 
@@ -54,7 +54,16 @@ SCENARIOS = {
     "Recruitment": ("Recruitment curve", "curve order", None),
     "Jendrassik": ("Jendrassik manoeuvre", "amplitude group", CURVE_GROUPS),
     "Paired stimulation": ("Paired stimulation", "amplitude group", None),
+    "H-reflex": ("H-reflex", "curve order", None),
 }
+
+#: The H-reflex surface draws the two responses side by side rather than one
+#: series: they are measured separately, marked separately and read against each
+#: other (the reflex peaks and recedes while the direct response is still
+#: growing), so a single plot would have to choose one of them to show.
+HREFLEX = "H-reflex"
+COMPONENT_COLORS = {"M": "#1f77b4", "H": "#d62728"}
+COMPONENT_LABELS = {"M": "M-ответ (прямой)", "H": "H-рефлекс"}
 
 #: Group colours, matching src/jendrassik.py so the GUI and the PNGs agree.
 GROUP_COLORS = ["#4575b4", "#f0a202", "#d73027", "#4d9221", "#7b3294"]
@@ -105,6 +114,8 @@ class ScenarioViewer(QWidget):
         self._selector = None
         self.selected_curve: int | None = None
         self._points = None          # curve numbers behind the top plot, for click hit-testing
+        self._ax_top = None
+        self._ax_tops: list = []     # H-reflex: one point plot per component
 
         # ---- left: channels + controls ----
         self.header = QLabel("<b>No Neurosoft scenario in this run</b>")
@@ -130,6 +141,18 @@ class ScenarioViewer(QWidget):
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider)
         self.curve_label = QLabel("curve: —")
+
+        # H-reflex only: which of the two responses a correction applies to. A
+        # mark almost never applies to both — the reflex is spurious on a curve
+        # whose M-wave is clean, or the other way round — so the choice has to be
+        # explicit rather than inferred from where the click landed.
+        self.component_box = QComboBox()
+        self.component_box.addItems([COMPONENT_LABELS["M"], COMPONENT_LABELS["H"]])
+        self.component_box.setToolTip("К какому из двух ответов относится правка.")
+        self.component_box.currentIndexChanged.connect(lambda _: self._draw())
+        self.component_label = QLabel("<b>Ответ, к которому относится правка</b>")
+        self.component_box.setVisible(False)
+        self.component_label.setVisible(False)
 
         # ---- per-curve corrections ----
         # Detection here is per curve, so its mistakes are per curve: one sweep
@@ -178,6 +201,8 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.show_band)
         lv.addWidget(self.curve_label)
         lv.addWidget(self.slider)
+        lv.addWidget(self.component_label)
+        lv.addWidget(self.component_box)
         lv.addWidget(QLabel("<b>Правка выбранной кривой</b>"))
         for b in (self.btn_false, self.btn_missed, self.btn_unmark,
                   self.btn_window, self.btn_apply):
@@ -246,7 +271,17 @@ class ScenarioViewer(QWidget):
         if self.scenario == "Jendrassik":
             intensities = intensities_from_name(crop.config)
             self.n_groups = 2 * max(len(intensities), 1)
-        self.by_curve = self.results.recruitment_by_curve(crop.config, self.session)
+        if self.is_hreflex:
+            self.by_curve = self.results.hreflex_by_curve(crop.config, self.session)
+        else:
+            self.by_curve = self.results.recruitment_by_curve(crop.config, self.session)
+        self.component_box.setVisible(self.is_hreflex)
+        self.component_label.setVisible(self.is_hreflex)
+        # Amplitude groups are a Jendrassik/paired idea: they look for the two
+        # protocol blocks. An H-reflex sweep has no blocks, and its own
+        # comparison — M against H — is what the two point plots already show.
+        self.color_box.setVisible(not self.is_hreflex)
+        self.show_band.setVisible(not self.is_hreflex)
         try:
             epochs = self.results.load_epochs(crop)
             self.times = epochs.times
@@ -284,13 +319,31 @@ class ScenarioViewer(QWidget):
         else:
             self._blank("No channels.")
 
+    @property
+    def is_hreflex(self) -> bool:
+        return self.scenario == HREFLEX
+
+    def component(self) -> str:
+        """Which of the two responses the correction buttons act on."""
+        return "H" if self.component_box.currentIndex() == 1 else "M"
+
+    def _amp_column(self, comp: str | None = None) -> str:
+        if not self.is_hreflex:
+            return "amp_uv"
+        return f"{(comp or self.component()).lower()}_amp_uv"
+
     def _responders(self) -> list[str]:
         """Channels with at least one detected response, in natural order."""
         if self.by_curve is None or self.by_curve.empty:
             return []
         # A channel counts as responding if ANY curve carried a detection — the
-        # frame now holds a row per curve, undetected ones included.
-        got = self.by_curve.groupby("Channel")["amp_uv"].apply(lambda s: s.notna().any())
+        # frame now holds a row per curve, undetected ones included. On an
+        # H-reflex run either component counts: a channel with a clean M and no
+        # reflex is a result, not a silent channel.
+        cols = ([self._amp_column(c) for c in ("M", "H")] if self.is_hreflex
+                else ["amp_uv"])
+        got = (self.by_curve.groupby("Channel")[cols]
+               .apply(lambda d: d.notna().any().any()))
         chans = [c for c, ok in got.items() if ok]
         return sorted((c for c in chans if c in self.waves), key=lambda s: (len(s), s))
 
@@ -314,7 +367,11 @@ class ScenarioViewer(QWidget):
         """Select the curve nearest the click on the top plot."""
         if event.inaxes is None or self._points is None or event.xdata is None:
             return
-        if event.inaxes is not self._ax_top:
+        # H-reflex draws one point plot per component; a click on either selects
+        # the curve, because the curve is what gets pulled up below and both
+        # responses live on it.
+        tops = self._ax_tops or ([self._ax_top] if self._ax_top is not None else [])
+        if event.inaxes not in tops:
             return
         curves = self._points
         if not len(curves):
@@ -334,10 +391,13 @@ class ScenarioViewer(QWidget):
         ax.set_axis_off()
         self._points = None
         self._ax_top = None
+        self._ax_tops = []
         self.stats.setRowCount(0)
         self.canvas.draw_idle()
 
-    def _provisional_amplitudes(self, g: pd.DataFrame, waves: np.ndarray) -> np.ndarray:
+    def _provisional_amplitudes(self, g: pd.DataFrame, waves: np.ndarray,
+                                amp_col: str = "amp_uv",
+                                p1_col: str = "p1_ms") -> np.ndarray:
         """What each undetected curve reads where its neighbours' response sits.
 
         Undetected curves have no point to click and no place on the plot, which
@@ -352,8 +412,8 @@ class ScenarioViewer(QWidget):
         These values are for the plot only; the tables keep the NaN.
         """
         curves = g["curve"].to_numpy(int)
-        amps = g["amp_uv"].to_numpy(float)
-        p1 = g["p1_ms"].to_numpy(float)
+        amps = g[amp_col].to_numpy(float)
+        p1 = g[p1_col].to_numpy(float)
         out = np.full(len(curves), np.nan)
         ref = np.flatnonzero(np.isfinite(amps) & np.isfinite(p1))
         if not ref.size or self.times is None:
@@ -372,12 +432,195 @@ class ScenarioViewer(QWidget):
         g["group"] = _assign_groups(g["amp_uv"], self.n_groups)
         return g
 
+    # ---- H-reflex: two responses, two point plots ---------------------- #
+    def _draw_hreflex(self, ch: str) -> None:
+        """Response-vs-curve for M and H side by side, over the shared curves.
+
+        Two axes rather than two series on one: the reflex and the direct
+        response are on different scales for most of a sweep (the reflex is the
+        only thing there before the M-wave crosses threshold, and a fifth of the
+        M-wave's size after it), so drawing them together squashes whichever is
+        currently smaller into the axis — and that one is usually the one being
+        judged. The exported figure does put them together, because there the
+        crossover is the message; here the job is to see one curve's markers.
+        """
+        g = self.by_curve[self.by_curve["Channel"] == ch].sort_values("curve").copy()
+        waves = self.waves[ch]
+        t_ms = np.asarray(self.times) * 1e3
+        curves = g["curve"].to_numpy(int)
+        self._points = curves
+
+        self.fig.clear()
+        gs = self.fig.add_gridspec(2, 2, height_ratios=[1, 1.4])
+        ax_m = self.fig.add_subplot(gs[0, 0])
+        ax_h = self.fig.add_subplot(gs[0, 1])
+        ax_bot = self.fig.add_subplot(gs[1, :])
+        self._ax_tops = [ax_m, ax_h]
+        self._ax_top = ax_m
+
+        per_ch = self.overrides.get(ch, {})
+        for comp, ax in (("M", ax_m), ("H", ax_h)):
+            pre = comp.lower()
+            amps = g[f"{pre}_amp_uv"].to_numpy(float)
+            got = np.isfinite(amps)
+            shown = self._provisional_amplitudes(
+                g, waves, amp_col=f"{pre}_amp_uv", p1_col=f"{pre}_p1_ms")
+            ax.plot(curves, amps, "-", lw=0.9, color="0.8", zorder=0)
+            ax.plot(curves[got], amps[got], "o", ms=5,
+                    color=COMPONENT_COLORS[comp], zorder=3)
+            miss = (~got) & np.isfinite(shown)
+            if miss.any():
+                ax.plot(curves[miss], shown[miss], "o", ls="none", ms=6, mfc="none",
+                        mec="0.45", mew=1.1, zorder=2)
+            for cno in per_ch.get(f"false_{comp}", []):
+                if cno in set(curves.tolist()):
+                    j = list(curves).index(cno)
+                    y = amps[j] if got[j] else shown[j]
+                    if np.isfinite(y):
+                        ax.plot([cno], [y], "x", ms=9, mew=2, color="#d62728", zorder=6)
+            for cno in per_ch.get(f"missed_{comp}", []):
+                if cno in set(curves.tolist()):
+                    j = list(curves).index(cno)
+                    y = amps[j] if got[j] else shown[j]
+                    if np.isfinite(y):
+                        ax.plot([cno], [y], "o", ms=10, mfc="none", mec="#2ca02c",
+                                mew=2, zorder=6)
+            if self.selected_curve is not None and self.selected_curve in set(curves.tolist()):
+                j = list(curves).index(self.selected_curve)
+                ax.axvline(self.selected_curve, color="#ffb703", lw=1.2, zorder=1)
+                y = amps[j] if got[j] else shown[j]
+                if np.isfinite(y):
+                    ax.plot([self.selected_curve], [y], "o", ms=11, mfc="none",
+                            mec="#ff8800", mew=2.0, zorder=4)
+            if len(curves):
+                ax.set_xlim(0.5, float(curves.max()) + 0.5)
+            ax.set_ylim(bottom=0)
+            n_got = int(got.sum())
+            active = " ← правится" if comp == self.component() else ""
+            ax.set_title(f"{COMPONENT_LABELS[comp]} — {n_got} из {len(curves)}{active}",
+                         fontsize=10, loc="left",
+                         color=COMPONENT_COLORS[comp] if active else "black")
+            ax.set_xlabel("curve number")
+            ax.set_ylabel("PTP, µV")
+            ax.grid(True, color="0.92", lw=0.6)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+
+        self._draw_curves(ax_bot, ch, g, waves, t_ms)
+        self._selector = SpanSelector(
+            ax_bot, self._on_span, "horizontal", useblit=False,
+            props=dict(alpha=0.25, facecolor="#ffb703"),
+        )
+        self.canvas.draw_idle()
+        self._fill_hreflex_stats(g)
+        self._refresh_mark_label()
+
+    def _draw_curves(self, ax_bot, ch, g, waves, t_ms) -> None:
+        """The curves themselves, with both components' markers on the selected one."""
+        found = {c: set(g.loc[g[f"{c.lower()}_amp_uv"].notna(), "curve"].astype(int))
+                 for c in ("M", "H")}
+        any_found = found["M"] | found["H"]
+        if self.show_all.isChecked():
+            norm = mcolors.Normalize(vmin=1, vmax=max(len(waves), 2))
+            for i in range(len(waves)):
+                cno = i + 1
+                missing = cno not in any_found
+                ax_bot.plot(t_ms, waves[i],
+                            color="0.78" if missing else SWEEP_CMAP(norm(cno)),
+                            lw=0.5, alpha=0.30 if missing else 0.35,
+                            zorder=0 if missing else 1)
+
+        if self.selected_curve is not None and 0 < self.selected_curve <= len(waves):
+            sel = waves[self.selected_curve - 1]
+            ax_bot.plot(t_ms, sel, color="#111111", lw=1.8, zorder=5)
+            row = g[g["curve"] == self.selected_curve]
+            bits = []
+            if not row.empty:
+                for comp in ("M", "H"):
+                    pre = comp.lower()
+                    hollow = comp == "H"
+                    for col_name, colour in ((f"{pre}_onset_ms", "tab:blue"),
+                                             (f"{pre}_p1_ms", "red"),
+                                             (f"{pre}_p2_ms", "tab:green")):
+                        val = row[col_name].iloc[0] if col_name in row.columns else np.nan
+                        if not np.isfinite(val):
+                            continue
+                        idx = int(np.argmin(np.abs(t_ms - float(val))))
+                        kw = (dict(mfc="none", mec=colour, mew=1.6) if hollow
+                              else dict(color=colour))
+                        ax_bot.plot([float(val)], [sel[idx]], "o", ms=7, zorder=6, **kw)
+                    amp = row[f"{pre}_amp_uv"].iloc[0]
+                    bits.append(f"{comp} {amp:.0f} µV" if np.isfinite(amp) else f"{comp} —")
+            self.curve_label.setText(
+                f"curve: {self.selected_curve} · " + " · ".join(bits or ["ответ не найден"]))
+        else:
+            self.curve_label.setText("curve: —")
+
+        post = np.asarray(self.times) >= 0.002
+        seg = waves[:, post]
+        if seg.size and np.isfinite(seg).any():
+            lo, hi = float(np.nanmin(seg)), float(np.nanmax(seg))
+            pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.1
+            ax_bot.set_ylim(lo - pad, hi + pad)
+        cur_win = self.overrides.get(ch, {}).get(WINDOW)
+        if cur_win:
+            ax_bot.axvspan(cur_win[0], cur_win[1], color="#ffb703", alpha=0.18, lw=0, zorder=0)
+        elif self._span is not None:
+            ax_bot.axvspan(self._span[0], self._span[1], color="#ffb703", alpha=0.12, lw=0, zorder=0)
+        mk = self.overrides.get(ch, {}).get(MARKERS) or {}
+        for key, col, ls in (("m_onset", "tab:blue", "--"), ("m_p1", "tab:red", "--"),
+                             ("m_p2", "tab:green", "--"), ("h_onset", "tab:blue", ":"),
+                             ("h_p1", "tab:red", ":"), ("h_p2", "tab:green", ":")):
+            v = mk.get(key)
+            if v is not None and np.isfinite(v):
+                ax_bot.axvline(float(v), color=col, lw=1.1, ls=ls, alpha=0.85, zorder=6)
+        ax_bot.axhline(0, color="0.8", lw=0.6)
+        ax_bot.set_xlabel("ms from stimulus")
+        ax_bot.set_ylabel("µV")
+        ax_bot.set_title(
+            f"{ch} — кривые; сплошные маркеры = M-ответ, полые = H-рефлекс",
+            fontsize=10, loc="left")
+        ax_bot.grid(True, color="0.92", lw=0.6)
+        for side in ("top", "right"):
+            ax_bot.spines[side].set_visible(False)
+
+    def _fill_hreflex_stats(self, g: pd.DataFrame) -> None:
+        """Hmax, Mmax and their ratio — what an H-reflex study is read for."""
+        self.stats.setHorizontalHeaderLabels(
+            ["Ответ", "N", "max µV", "кривая", "порог"])
+        rows = []
+        maxima = {}
+        for comp in ("M", "H"):
+            d = g[f"{comp.lower()}_amp_uv"]
+            ok = d.notna()
+            if not ok.any():
+                rows.append((comp, "0", "—", "—", "—"))
+                continue
+            mx = float(d.max())
+            maxima[comp] = mx
+            rows.append((comp, str(int(ok.sum())), f"{mx:.0f}",
+                         str(int(g.loc[d.idxmax(), "curve"])),
+                         str(int(g.loc[ok, "curve"].min()))))
+        if "M" in maxima and "H" in maxima and maxima["M"] > 0:
+            rows.append(("Hmax/Mmax", "", f"{maxima['H'] / maxima['M']:.2f}", "", ""))
+        self.stats.setRowCount(len(rows))
+        for r, vals in enumerate(rows):
+            for c, v in enumerate(vals):
+                self.stats.setItem(r, c, QTableWidgetItem(v))
+
+    # ------------------------------------------------------------------ #
     def _draw(self) -> None:
         if not self.channel or self.by_curve is None or self.times is None:
             return
         ch = self.channel
         if ch not in self.waves:
             self._blank(f"{ch} has no saved waveforms.")
+            return
+        if self.is_hreflex:
+            if self.by_curve.empty or f"m_amp_uv" not in self.by_curve.columns:
+                self._blank("Этот прогон не содержит колонок M/H — перезапустите файл.")
+                return
+            self._draw_hreflex(ch)
             return
 
         g = self._groups_for(ch)
@@ -390,6 +633,7 @@ class ScenarioViewer(QWidget):
         self.fig.clear()
         ax_top, ax_bot = self.fig.subplots(2, 1, height_ratios=[1, 1.4])
         self._ax_top = ax_top
+        self._ax_tops = []
 
         # ---- top: response size against curve number ----
         curves = g["curve"].to_numpy(int)
@@ -589,46 +833,119 @@ class ScenarioViewer(QWidget):
         except Exception as exc:
             self.mark_label.setText(f"<span style='color:#b00'>Не удалось построить шаблон: {exc}</span>")
             return
-        dlg = TemplateEditor(tpl, self)
-        if not dlg.exec():
-            return
-        t = dlg.edited_template()
+        if self.is_hreflex:
+            dlg = TemplateEditor(tpl, self, markers=HREFLEX_MARKERS,
+                                 initial=self._hreflex_marker_seed(tpl, waves, lo, hi))
+            if not dlg.exec():
+                return
+            times_ms = dlg.marker_times_ms()
+            markers = {
+                key: round(times_ms[name], 2)
+                for key, name in (("m_onset", "M onset"), ("m_p1", "M peak1"),
+                                  ("m_p2", "M peak2"), ("h_onset", "H onset"),
+                                  ("h_p1", "H peak1"), ("h_p2", "H peak2"))
+            }
+        else:
+            dlg = TemplateEditor(tpl, self)
+            if not dlg.exec():
+                return
+            t = dlg.edited_template()
+            markers = {
+                "onset": round(float(t.times[int(t.onset_idx)]) * 1e3, 2),
+                "p1": round(float(t.times[int(t.peak1_idx)]) * 1e3, 2),
+                "p2": round(float(t.times[int(t.peak2_idx)]) * 1e3, 2),
+            }
         ch = self.overrides.setdefault(self.channel, {})
         ch[WINDOW] = [round(lo, 2), round(hi, 2)]
-        ch[MARKERS] = {
-            "onset": round(float(t.times[int(t.onset_idx)]) * 1e3, 2),
-            "p1": round(float(t.times[int(t.peak1_idx)]) * 1e3, 2),
-            "p2": round(float(t.times[int(t.peak2_idx)]) * 1e3, 2),
-        }
+        ch[MARKERS] = markers
         save_overrides(self.root, self.overrides)
         self._refresh_mark_label()
         self._draw()
+
+    def _hreflex_marker_seed(self, tpl, waves, lo_ms, hi_ms) -> dict[str, int]:
+        """Where the six markers start out, before the clinician moves them.
+
+        Seeded from the same automatic fit the pipeline uses, restricted to the
+        window that was just dragged — so opening the editor on a channel the
+        detector got right shows exactly what it did, and the correction is a
+        matter of nudging whichever marker is wrong rather than placing all six.
+        """
+        from src.hreflex import fit_reference
+
+        t_s = np.asarray(self.times)
+        ref = fit_reference(np.nan_to_num(waves), t_s, lo_ms / 1e3, hi_ms / 1e3) or {}
+
+        def _idx(t_val, fallback):
+            if t_val is None or not np.isfinite(t_val):
+                return int(fallback)
+            return int(np.argmin(np.abs(tpl.times - float(t_val))))
+
+        m_p1 = ref.get("m_p1", np.nan)
+        m_p2 = ref.get("m_p2", np.nan)
+        h_p1 = ref.get("h_p1", np.nan)
+        h_p2 = ref.get("h_p2", np.nan)
+        # Onsets are not part of the reference (they are found per curve), so
+        # they are seeded a few ms ahead of each P1 — a place to drag from.
+        m_on = m_p1 - 0.004 if np.isfinite(m_p1) else np.nan
+        h_on = h_p1 - 0.004 if np.isfinite(h_p1) else np.nan
+        return {
+            "M onset": _idx(m_on, tpl.onset_idx),
+            "M peak1": _idx(m_p1, tpl.peak1_idx),
+            "M peak2": _idx(m_p2, tpl.peak2_idx),
+            "H onset": _idx(h_on, tpl.peak2_idx),
+            "H peak1": _idx(h_p1, tpl.peak2_idx),
+            "H peak2": _idx(h_p2, tpl.peak2_idx),
+        }
 
     def _mark(self, kind) -> None:
         if not self.channel or self.selected_curve is None or self.root is None:
             self.mark_label.setText("Сначала выберите кривую — кликом по графику или слайдером.")
             return
         self.overrides = mark_curve(self.overrides, self.channel,
-                                    int(self.selected_curve), kind)
+                                    int(self.selected_curve), kind,
+                                    component=self.component() if self.is_hreflex else None)
         save_overrides(self.root, self.overrides)
         self._refresh_mark_label()
         self._draw()
 
     def _refresh_mark_label(self) -> None:
-        cur = curve_mark(self.overrides, self.channel or "", int(self.selected_curve or -1))
-        word = {FALSE: "ложный", MISSED: "потерянный"}.get(cur, "нет пометки")
-        total = sum(len(v.get(FALSE, [])) + len(v.get(MISSED, []))
-                    for v in self.overrides.values())
+        comps = ("M", "H") if self.is_hreflex else (None,)
         per_ch = self.overrides.get(self.channel or "", {})
+        cur = curve_mark(self.overrides, self.channel or "",
+                         int(self.selected_curve or -1),
+                         component=self.component() if self.is_hreflex else None)
+        word = {FALSE: "ложный", MISSED: "потерянный"}.get(cur, "нет пометки")
+        total = 0
         bits = []
-        if per_ch.get(FALSE):
-            bits.append(f"ложные: {', '.join(map(str, per_ch[FALSE]))}")
-        if per_ch.get(MISSED):
-            bits.append(f"потерянные: {', '.join(map(str, per_ch[MISSED]))}")
-        txt = f"кривая {self.selected_curve}: <b>{word}</b>"
+        for comp in comps:
+            tag = f"{comp}: " if comp else ""
+            for kind, label in ((FALSE, "ложные"), (MISSED, "потерянные")):
+                lst = per_ch.get(mark_key(kind, comp), [])
+                if lst:
+                    bits.append(f"{tag}{label}: {', '.join(map(str, lst))}")
+            for v in self.overrides.values():
+                total += len(v.get(mark_key(FALSE, comp), []))
+                total += len(v.get(mark_key(MISSED, comp), []))
+        head = (f"{self.component()}, кривая {self.selected_curve}" if self.is_hreflex
+                else f"кривая {self.selected_curve}")
+        txt = f"{head}: <b>{word}</b>"
         mk = per_ch.get(MARKERS)
         if mk:
-            bits.append(f"маркеры onset {mk['onset']:.1f} / P1 {mk['p1']:.1f} / P2 {mk['p2']:.1f} мс")
+            if self.is_hreflex:
+                six = [k for k in ("m_onset", "m_p1", "m_p2",
+                                   "h_onset", "h_p1", "h_p2") if k in mk]
+                if six:
+                    bits.append("маркеры: " + ", ".join(f"{k} {mk[k]:.1f}" for k in six)
+                                + " мс")
+                else:
+                    # Left over from a run of this file under a single-response
+                    # scenario. It is not applied — say so here rather than let
+                    # the yellow window suggest it is.
+                    bits.append("есть старые маркеры на одну волну — не применяются, "
+                                "расставьте шесть заново")
+            elif "p1" in mk:
+                bits.append(f"маркеры onset {mk['onset']:.1f} / P1 {mk['p1']:.1f} / "
+                            f"P2 {mk['p2']:.1f} мс")
         if bits:
             txt += "<br>" + f"{self.channel}: " + "; ".join(bits)
         if total:
@@ -674,11 +991,14 @@ class ScenarioViewer(QWidget):
         self.results_changed.emit()
 
     def scenario_key(self) -> str | None:
+        from src.neurosoft import HREFLEX as HREFLEX_KEY
         from src.neurosoft import JENDRASSIK, PAIRED, RECRUITMENT
         return {"Recruitment": RECRUITMENT, "Jendrassik": JENDRASSIK,
-                "Paired stimulation": PAIRED}.get(self.scenario or "")
+                "Paired stimulation": PAIRED,
+                "H-reflex": HREFLEX_KEY}.get(self.scenario or "")
 
     def _fill_stats(self, g: pd.DataFrame, labels: list[str]) -> None:
+        self.stats.setHorizontalHeaderLabels(["Group", "N", "mean µV", "SD", "median"])
         rows = []
         for lab in labels:
             d = g.loc[g["group"] == lab, "amp_uv"].dropna()

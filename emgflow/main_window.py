@@ -35,7 +35,7 @@ _MODE_INDEX = {m[1]: i for i, m in enumerate(MODES)}
 # Neurosoft scenario override for the scenario_box. None = auto-detect from signal.
 SCENARIO_CHOICES = [("Auto-detect", None), ("Recruitment", "recruitment"),
                     ("Jendrassik", "jendrassik"), ("Paired", "paired"),
-                    ("Condition test", "condition")]
+                    ("Condition test", "condition"), ("H-reflex", "hreflex")]
 _SCENARIO_INDEX = {c[1]: i for i, c in enumerate(SCENARIO_CHOICES)}
 # tab indices (kept in one place so the sync logic below stays readable)
 TAB_SETTINGS, TAB_SIR, TAB_RECRUIT, TAB_STARTSTOP, TAB_SPONT, TAB_COND, TAB_RAW = range(7)
@@ -220,8 +220,16 @@ class MainWindow(QMainWindow):
         """
         if not is_text_curves_file(path):
             return
+        # The response window depends on the scenario — an H-reflex file has to
+        # look 20 ms further out than any other, or the reflex falls outside it.
+        # These values are handed to run_pipeline explicitly and therefore WIN
+        # over its own adaptation, so getting the scenario right here is not a
+        # cosmetic matter: mirroring the wrong window silently truncates the run.
+        from src.neurosoft import scenario_from_name
+
+        scenario = self.session.force_scenario or scenario_from_name(path)
         try:
-            adapted = text_curves_window_defaults(path)
+            adapted = text_curves_window_defaults(path, scenario)
         except (OSError, ValueError) as exc:
             self._log(f"Could not read text curves windows: {exc}")
             return
@@ -240,6 +248,11 @@ class MainWindow(QMainWindow):
 
     def _on_scenario(self, idx: int) -> None:
         self.session.force_scenario = SCENARIO_CHOICES[idx][1]
+        # Pinning a scenario can change the windows the run needs (H-reflex looks
+        # further out than the rest), and the panel is meant to show what runs.
+        src = self.session.input_path
+        if src:
+            self._adapt_to_text_curves(Path(src))
 
     def _set_scenario_box(self, scenario: str | None) -> None:
         """Point the scenario selector at *scenario* without re-triggering a run.

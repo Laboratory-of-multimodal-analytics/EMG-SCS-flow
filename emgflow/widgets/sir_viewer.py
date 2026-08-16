@@ -256,7 +256,14 @@ class SIRViewer(QWidget):
                 ax.set_ylim(-1.7 * span, 1.7 * span)
 
             m = self.results.markers(self.crop, ch)
-            detected = (not m.empty) and bool(m["Peak1 latency"].notna().any())
+            # Either component counts on an H-reflex run: a channel showing only
+            # the reflex is a result, and judging it by the M-wave column alone
+            # would grey it out and hide its markers.
+            det_cols = ["Peak1 latency"]
+            if self.results.scenario == "H-reflex" and "H peak1 latency" in m.columns:
+                det_cols = ["M peak1 latency", "H peak1 latency"]
+            detected = (not m.empty) and any(
+                bool(m[c].notna().any()) for c in det_cols if c in m.columns)
             if detected and not rejected:
                 self._scatter_markers(ax, m, times, data[:, idx, :])
 
@@ -303,19 +310,30 @@ class SIRViewer(QWidget):
         return f"\n[{', '.join(tags)}]" if tags else ""
 
     def _scatter_markers(self, ax, m, times, ch_data) -> None:
-        """A point per epoch, on that epoch's own trace — as the pipeline's panels do it."""
+        """A point per epoch, on that epoch's own trace — as the pipeline's panels do it.
+
+        On an H-reflex run each epoch carries two marker sets; the reflex is drawn
+        hollow, matching the exported panels and the scenario view. Without this
+        the crop view would show only the M-wave and read as "the reflex was lost".
+        """
+        sets = [(False, ("Onset latency", "Peak1 latency", "Peak2 latency"))]
+        if (self.results is not None and self.results.scenario == "H-reflex"
+                and "H peak1 latency" in m.columns):
+            sets = [(False, ("M onset latency", "M peak1 latency", "M peak2 latency")),
+                    (True, ("H onset latency", "H peak1 latency", "H peak2 latency"))]
         for _, row in m.iterrows():
             ep = int(row["Epoch"]) if not np.isnan(row.get("Epoch", np.nan)) else None
             if ep is None or ep >= ch_data.shape[0]:
                 continue
-            for col, colour in (
-                ("Onset latency", C_ONSET), ("Peak1 latency", C_P1), ("Peak2 latency", C_P2)
-            ):
-                t = row.get(col, np.nan)
-                if t is None or (isinstance(t, float) and np.isnan(t)):
-                    continue
-                i = int(np.argmin(np.abs(times - float(t))))
-                ax.scatter(float(t), ch_data[ep, i], color=colour, s=MARKER_SIZE, zorder=5)
+            for hollow, cols in sets:
+                for col, colour in zip(cols, (C_ONSET, C_P1, C_P2)):
+                    t = row.get(col, np.nan)
+                    if t is None or (isinstance(t, float) and np.isnan(t)):
+                        continue
+                    i = int(np.argmin(np.abs(times - float(t))))
+                    kw = (dict(facecolors="none", edgecolors=colour, linewidths=1.1)
+                          if hollow else dict(color=colour))
+                    ax.scatter(float(t), ch_data[ep, i], s=MARKER_SIZE, zorder=5, **kw)
 
     # ------------------------------------------------------------------ #
     def _refresh_table(self) -> None:
@@ -426,6 +444,15 @@ class SIRViewer(QWidget):
             QMessageBox.warning(self, "Cannot build template", str(exc))
             return
 
+        # An H-reflex run is not detected from the template bank at all — its two
+        # components are fitted per channel (src/hreflex.py), so a bank template
+        # saved here would be written, listed, and then quietly ignored. The
+        # editor opens with six markers instead and the result is stored as the
+        # same per-channel correction the scenario view writes, which IS read.
+        if self.results.scenario == "H-reflex":
+            self._save_hreflex_markers(tpl, channel, t0, t1)
+            return
+
         editor = TemplateEditor(tpl, self)
         if not editor.exec():
             return
@@ -450,6 +477,66 @@ class SIRViewer(QWidget):
             f"Bank: {bank.count()} template(s).\nRe-run to detect with it.",
         )
         self.template_made.emit(name)
+
+    def _save_hreflex_markers(self, tpl, channel: str, t0: float, t1: float) -> None:
+        """Six markers for one channel of an H-reflex run, stored as a correction.
+
+        Local to the channel it was drawn on, exactly like a channel-bound bank
+        template: re-measuring reads it for this channel and leaves every other
+        channel's automatic fit alone.
+        """
+        from src.hreflex import fit_reference
+        from src.sir_review import MARKERS, WINDOW, load_overrides, save_overrides
+
+        from .template_editor import HREFLEX_MARKERS
+
+        try:
+            epochs = self.results.load_epochs(self.crop)
+            waves = epochs.get_data(picks=[channel])[:, 0, :]
+            times = np.asarray(epochs.times)
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot read epochs", str(exc))
+            return
+        ref = fit_reference(np.nan_to_num(waves), times, t0, t1) or {}
+
+        def _idx(t_val, fallback):
+            if t_val is None or not np.isfinite(t_val):
+                return int(fallback)
+            return int(np.argmin(np.abs(tpl.times - float(t_val))))
+
+        m_p1, h_p1 = ref.get("m_p1", np.nan), ref.get("h_p1", np.nan)
+        initial = {
+            "M onset": _idx(m_p1 - 0.004 if np.isfinite(m_p1) else np.nan, tpl.onset_idx),
+            "M peak1": _idx(m_p1, tpl.peak1_idx),
+            "M peak2": _idx(ref.get("m_p2", np.nan), tpl.peak2_idx),
+            "H onset": _idx(h_p1 - 0.004 if np.isfinite(h_p1) else np.nan, tpl.peak2_idx),
+            "H peak1": _idx(h_p1, tpl.peak2_idx),
+            "H peak2": _idx(ref.get("h_p2", np.nan), tpl.peak2_idx),
+        }
+        editor = TemplateEditor(tpl, self, markers=HREFLEX_MARKERS, initial=initial)
+        if not editor.exec():
+            return
+        ms = editor.marker_times_ms()
+
+        root = Path(self.results.root)
+        ov = load_overrides(root)
+        ch_entry = ov.setdefault(channel, {})
+        ch_entry[WINDOW] = [round(t0 * 1e3, 2), round(t1 * 1e3, 2)]
+        ch_entry[MARKERS] = {
+            key: round(ms[name], 2)
+            for key, name in (("m_onset", "M onset"), ("m_p1", "M peak1"),
+                              ("m_p2", "M peak2"), ("h_onset", "H onset"),
+                              ("h_p1", "H peak1"), ("h_p2", "H peak2"))
+        }
+        save_overrides(root, ov)
+        QMessageBox.information(
+            self, "Маркеры сохранены",
+            f"{channel}: " + ", ".join(
+                f"{k} {v:.1f}" for k, v in ch_entry[MARKERS].items()) + " мс\n\n"
+            "Канал будет перемерен по ним. Нажмите «Пересчитать по правкам» "
+            "на вкладке сценария (или перезапустите файл).",
+        )
+        self.template_made.emit(f"{channel}: 6 маркеров")
 
     # ------------------------------------------------------------------ #
     def show_recruitment(self) -> None:
