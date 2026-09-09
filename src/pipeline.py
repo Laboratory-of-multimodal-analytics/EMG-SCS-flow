@@ -6,6 +6,7 @@ from collections import defaultdict, Counter
 from pathlib import Path
 import json
 import re
+import threading
 
 import mne
 import numpy as np
@@ -130,7 +131,10 @@ from .detection import (
     pick_epoch_value_near_latency,
 )
 from .io_utils import (
-    build_output_dirs, clear_other_scenario_outputs, ensure_dir, list_crop_files,
+    CONDITION_FOLDER, STIMULATION_INDUCED_FOLDER, SupersededOutputs,
+    build_output_dirs, ensure_dir, list_crop_files, other_scenario_output_paths,
+    resolve_mode_dirs, restore_interrupted_supersede, sir_mode_output_paths,
+    stale_mode_layout_paths,
 )
 from .neurosoft import (
     CONDITION,
@@ -2964,7 +2968,7 @@ def regenerate_sir_outputs_from_metrics(output_root: Path, scenario: str | None 
             )
 
 
-def run_pipeline(
+def _run_pipeline(
     edf_path: str | Path,
     output_dir: str | Path | None = None,
     startstop_mode: bool | None = None,
@@ -3069,6 +3073,9 @@ def run_pipeline(
     pre_epoched: dict[str, mne.EpochsArray] | None = None
     # Set for Neurosoft .txt exports only; gates which outputs the SIR path emits.
     neurosoft_scenario: str | None = None
+    # The previous reading's outputs, moved aside for the duration of this run and
+    # discarded only once it has produced its own. See SupersededOutputs.
+    superseded: SupersededOutputs | None = None
     if suffix == ".mat":
         raw = mat_blocks[0][1] if mat_blocks else _load_raw_from_mat(edf_path)
     elif suffix == ".fif":
@@ -3125,6 +3132,62 @@ def run_pipeline(
                     "paired stimulation. Going with the name.",
                     flush=True,
                 )
+        # ── The scenario is settled; make the output root match it ──
+        # A re-run under a different scenario must not leave the previous one's
+        # folders and tables beside the new ones, and must not be SHAPED by them
+        # either. That second half is what made a scenario switch unrepairable:
+        # the leftovers of the abandoned reading are mode markers, so
+        # resolve_mode_dirs concluded a second analysis lived here and pushed
+        # this run into a results/<mode>/ subfolder, while find_mode_dir kept
+        # reading the flat one. The root then held two disagreeing copies of the
+        # same recording and only deleting it by hand cleared that.
+        #
+        # So the clearing happens HERE, before the layout is resolved, rather
+        # than after the outputs are written. The cost is that switching the
+        # scenario discards the previous scenario's results even if this run
+        # then fails -- which is what switching the scenario asks for.
+        #
+        # StartStop is left out: there the scenarios mean nothing, and a root can
+        # legitimately hold a StartStop analysis beside a stimulation-induced one.
+        if not use_startstop:
+            _back = restore_interrupted_supersede(output_root)
+            if _back:
+                print(f"[NEUROSOFT] a previous run did not finish; its outputs are "
+                      f"back in place: {', '.join(_back)}", flush=True)
+            _to_condition = neurosoft_scenario == CONDITION
+            _doomed = other_scenario_output_paths(output_root, neurosoft_scenario)
+            if _to_condition:
+                _doomed += sir_mode_output_paths(output_root)
+            # The manifest names the scenario, so it describes the reading being
+            # replaced. A run that fails after rewriting it would otherwise leave
+            # the folder announcing a scenario whose outputs are not there.
+            _doomed.append(run_manifest_path(output_root))
+            superseded = SupersededOutputs(output_root)
+            _ACTIVE_SUPERSEDED.guard = superseded
+            superseded.take(_doomed)
+            paths = build_output_dirs(output_root, startstop_mode=use_startstop)
+            if _to_condition:
+                _mode_folder = CONDITION_FOLDER
+                _mode_results, _ = resolve_mode_dirs(output_root, CONDITION_FOLDER)
+            else:
+                _mode_folder = STIMULATION_INDUCED_FOLDER
+                _mode_results = paths["stim_results_dir"]
+            superseded.take(
+                stale_mode_layout_paths(output_root, _mode_folder, _mode_results))
+            if superseded.names:
+                print(f"[NEUROSOFT] outputs of the previous scenario held aside "
+                      f"until this run finishes: {', '.join(superseded.names)}",
+                      flush=True)
+        crops_dir = paths["crops_dir"]
+        epochs_dir = paths["epochs_dir"]
+        excel_dir = paths["excel_dir"]
+        boxplot_dir = paths["boxplot_dir"]
+        plots_grid_dir = paths["plots_grid_dir"]
+        plots_plain_dir = paths["plots_plain_dir"]
+        plots_grouped_dir = paths["plots_grouped_dir"]
+        templates_dir = paths["templates_dir"]
+        startstop_dir = paths["startstop_dir"]
+
         # The Condition test measures the response RELATIVE to an artifact that
         # steps along the curve, so nothing about the fixed-t0 SIR path applies.
         # Its own analysis writes the complete deliverable and returns.
@@ -3137,6 +3200,7 @@ def run_pipeline(
                 arr, float(ready.info["sfreq"]), list(ready.ch_names),
                 output_root, info=cond_info,
             )
+            _discard_superseded(superseded)
             if old_mne_log_level is not None:
                 mne.set_log_level(old_mne_log_level)
             return output_root
@@ -3261,6 +3325,9 @@ def run_pipeline(
     )
     if not template_bank:
         print("[SIR] No templates found in bank; cannot proceed.", flush=True)
+        # Nothing was computed, so the previous reading is still the only answer
+        # this recording has. Put it back rather than let the bail discard it.
+        _restore_superseded(superseded)
         if old_mne_log_level is not None:
             mne.set_log_level(old_mne_log_level)
         return output_root
@@ -4216,16 +4283,10 @@ def run_pipeline(
         plot_boxplots(df, boxplot_dir)
 
     # ── Scenario deliverables (Neurosoft .txt exports only) ──
-    # A re-run under a different scenario must not leave the previous one's
-    # folder and tables sitting beside the new ones — see
-    # clear_other_scenario_outputs. This is how the H-reflex files are being
-    # reprocessed, so it is the normal case rather than an edge one.
-    if neurosoft_scenario is not None:
-        _removed = clear_other_scenario_outputs(
-            paths["stim_results_dir"], neurosoft_scenario)
-        if _removed:
-            print(f"[NEUROSOFT] removed outputs of the previous scenario: "
-                  f"{', '.join(_removed)}", flush=True)
+    # The previous scenario's outputs were cleared before the layout was
+    # resolved, up where the scenario is decided -- doing it here left the
+    # abandoned reading's folders in place long enough to steer this run into
+    # the wrong one.
 
     if neurosoft_scenario == HREFLEX:
         # Two responses per curve, so the single-response pass above has answered
@@ -4305,7 +4366,63 @@ def run_pipeline(
             print(f"[REVIEW] could not re-apply saved corrections "
                   f"({type(exc).__name__}: {exc})", flush=True)
 
+    _discard_superseded(superseded)
+
     if old_mne_log_level is not None:
         mne.set_log_level(old_mne_log_level)
 
     return output_root
+
+
+# --------------------------------------------------------------------------- #
+# Replacing one reading of a recording with another
+# --------------------------------------------------------------------------- #
+#: The run's SupersededOutputs, reachable from run_pipeline's error path. Thread
+#: local because the GUI runs the pipeline on a worker thread while the main
+#: thread stays live, and a second run must not roll back the first one's store.
+_ACTIVE_SUPERSEDED = threading.local()
+
+
+def _discard_superseded(guard: SupersededOutputs | None) -> None:
+    """The run produced its own outputs, so the previous reading can go."""
+    if guard is None:
+        return
+    _ACTIVE_SUPERSEDED.guard = None
+    gone = guard.commit()
+    if gone:
+        print(f"[NEUROSOFT] this run replaced the previous scenario; its outputs "
+              f"are now removed: {', '.join(gone)}", flush=True)
+
+
+def _restore_superseded(guard: SupersededOutputs | None) -> None:
+    """The run produced nothing, so the previous reading is still the answer."""
+    if guard is None:
+        return
+    _ACTIVE_SUPERSEDED.guard = None
+    back = guard.restore()
+    if back:
+        print(f"[NEUROSOFT] this run produced nothing; the previous scenario's "
+              f"outputs are back in place: {', '.join(back)}", flush=True)
+
+
+def run_pipeline(*args, **kwargs) -> Path:
+    """Run the pipeline, rolling back a scenario switch that did not complete.
+
+    Switching the scenario replaces one reading of a recording with another, and
+    the previous reading's outputs have to be out of the way before the new run
+    resolves its output layout. They are moved aside rather than deleted, and
+    this wrapper decides what happens to them: the run itself discards them when
+    it has produced its own, and anything that stops it — a crash, a cancelled
+    run, a scenario picked by mistake and interrupted — puts them back.
+    """
+    _ACTIVE_SUPERSEDED.guard = None
+    try:
+        return _run_pipeline(*args, **kwargs)
+    except BaseException:
+        _restore_superseded(getattr(_ACTIVE_SUPERSEDED, "guard", None))
+        raise
+    finally:
+        _ACTIVE_SUPERSEDED.guard = None
+
+
+run_pipeline.__wrapped__ = _run_pipeline

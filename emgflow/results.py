@@ -6,6 +6,7 @@ see is what the scripted run produces. Folder names here mirror io_utils.build_o
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,15 +20,34 @@ SS_DIR = "StartStop analysis"
 COND_DIR = "Condition test"
 
 
+#: Folders that mean "an analysis was written straight into this directory".
+#: Used to recognise runs made before outputs were collected under ``results/``.
+_LEGACY_MARKERS = ("Excel", "Stimulus-centered epochs", "Detections raw",
+                   "Waterfall", "Plots with grid and markers")
+
+
 def mode_dir(root: Path, folder: str) -> Path:
     """Where *folder*-mode results live in this output root.
 
     A run that produced only one analysis writes straight into ``results/``; the
     ``<mode>/`` level is kept only when a root holds more than one. Prefer the
     nested path when it exists so both layouts read the same way.
+
+    Older runs — the whole processed pig array among them — have no ``results/``
+    level at all: ``Excel/`` and ``Stimulus-centered epochs/`` sit in the run
+    folder itself. Those are read where they are rather than recomputed, which
+    for that array would mean re-running 55 recordings whose detection settings
+    were tuned by hand, per subfolder.
     """
     nested = Path(root) / "results" / folder
-    return nested if nested.exists() else Path(root) / "results"
+    if nested.exists():
+        return nested
+    results = Path(root) / "results"
+    if results.exists():
+        return results
+    if any((Path(root) / m).is_dir() for m in _LEGACY_MARKERS):
+        return Path(root)
+    return results
 
 METRIC_COLS = [
     "Configuration", "Stim. amplitude", "Epoch", "Channel",
@@ -78,14 +98,42 @@ class ProcessedRun:
         return {"sir": "crops", "condition": "ISI"}.get(self.mode, "conditions")
 
 
-def detect_mode(root: Path) -> str | None:
-    """Which mode produced this output root — judged by CONTENT, not by folder names.
+def _mode_from_manifest(root: Path) -> str | None:
+    """The mode recorded in ``review/run.json``, or None when there is no record.
 
-    Folders are created lazily now (a SIR run no longer leaves an empty
-    'StartStop analysis/' behind), but content remains the safer test: older
-    output roots on disk still carry both empty trees.
+    The manifest stores the Neurosoft scenario, which maps onto a mode: the
+    Condition test has its own viewer, the other four are all read on the SIR
+    surfaces. A run with no scenario (a .fif/.mat recording) says nothing here
+    and falls through to the content probe, which can still tell SIR from
+    StartStop.
+    """
+    try:
+        with open(Path(root) / "review" / "run.json", encoding="utf-8") as fh:
+            scenario = json.load(fh).get("scenario")
+    except (OSError, ValueError):
+        return None
+    if scenario is None:
+        return None
+    return "condition" if scenario == "condition" else "sir"
+
+
+def detect_mode(root: Path) -> str | None:
+    """Which mode produced this output root.
+
+    The run manifest answers first. It is the only record of what was actually
+    asked for, and it is rewritten by every run — while the folders on disk are
+    whatever has accumulated there. Probing content instead is what kept a root
+    reading as a Condition test after it had been re-run as a recruitment sweep:
+    the Condition folders were still there, they are tested first, and the GUI
+    then reopened the Condition viewer and never reloaded the scenario surfaces.
+
+    Content probing stays as the fallback, for roots written before the manifest
+    existed and for ones where it was lost.
     """
     root = Path(root)
+    from_manifest = _mode_from_manifest(root)
+    if from_manifest is not None:
+        return from_manifest
     # Condition test is a distinct output tree (no SIR epochs, no StartStop fif),
     # so probe it first by its own summary CSV / plots.
     cond = mode_dir(root, COND_DIR)
@@ -123,6 +171,8 @@ _PRUNE = {
     "Jendrassik", "Paired stimulation", "Curves per condition", "H-reflex",
     "Plots with grid and markers", "Plots without grid and markers",
     "Plots grouped by amplitude", "Template overlays per amplitude",
+    # Where a run holds the previous reading while it computes the new one.
+    ".superseded",
 }
 
 
@@ -475,6 +525,164 @@ class SIRResults:
             if (self.results_dir / folder).is_dir():
                 return folder
         return None
+
+    # ------------------------------------------------------------------ #
+    # The recruitment surface, for runs of either shape
+    # ------------------------------------------------------------------ #
+    @property
+    def stim_axis(self) -> str:
+        """Whether this run's ramp is read off amplitudes or off curve order.
+
+        See src.recruitment.stim_axis_of. A Neurosoft export is one crop labelled
+        ``all`` and only its curve index can carry the ramp; every other SIR run
+        has a crop per (configuration, amplitude) and the amplitude in mA is the
+        real axis. The scenario surface draws both, so it asks rather than
+        assuming the Neurosoft shape.
+        """
+        from src.recruitment import STIM_AXIS_CURVE, stim_axis_of
+
+        if not self.crops:
+            return STIM_AXIS_CURVE
+        return stim_axis_of(c.amp for c in self.crops)
+
+    @property
+    def configs(self) -> list[str]:
+        """Configurations in the order their crops appear."""
+        seen: list[str] = []
+        for c in self.crops:
+            if c.config not in seen:
+                seen.append(c.config)
+        return seen
+
+    def config_crops(self, config: str) -> list[Crop]:
+        """The crops of one configuration, ordered along the stimulation ramp.
+
+        Sorted by the number in the amplitude label. Crops whose label has no
+        number (``unspecified``) keep their file order at the end — they cannot
+        be placed on the axis but are still part of the recording.
+        """
+        from src.recruitment import amplitude_to_float
+
+        crops = [c for c in self.crops if c.config == str(config)]
+        return sorted(crops, key=lambda c: (
+            np.isnan(amplitude_to_float(c.amp)), amplitude_to_float(c.amp)))
+
+    def recruitment_points(self, config: str, session=None) -> pd.DataFrame:
+        """One row per point of the recruitment curve, per channel.
+
+        The two run shapes are made to look the same here, because everything
+        downstream — the plot, the click-to-select, the colouring by ramp
+        position, the group analysis — asks the same questions of both:
+
+        * curve axis: a point IS a curve, one stimulus, no repeats;
+        * amplitude axis: a point is a crop, and its repeats are the epochs
+          recorded at that amplitude, so the response is their mean and ``sd_uv``
+          / ``n_epochs`` say how consistent it was.
+
+        ``curve`` is the position along the ramp (1-based) in both cases, so the
+        column keeps working as an index; ``x_value`` is what to plot against
+        (curve number, or mA) and ``x_label`` is how to print it.
+        """
+        from src.recruitment import STIM_AXIS_CURVE, amplitude_to_float
+
+        if self.stim_axis == STIM_AXIS_CURVE:
+            out = self.recruitment_by_curve(config, session)
+            if out.empty:
+                return out
+            out = out.copy()
+            out["x_value"] = out["curve"].astype(float)
+            out["x_label"] = out["curve"].astype(int).astype(str)
+            out["n_epochs"] = 1
+            out["sd_uv"] = np.nan
+            return out
+
+        if self.metrics.empty:
+            return pd.DataFrame()
+        rows = []
+        for pos, crop in enumerate(self.config_crops(config), start=1):
+            sub = self.metrics[
+                (self.metrics["Configuration"].astype(str) == str(config))
+                & (self.metrics["Stim. amplitude"].astype(str) == crop.amp)
+            ]
+            if sub.empty:
+                continue
+            ptp = pd.to_numeric(sub["PTP amplitude"], errors="coerce") * 1e6
+            p1 = pd.to_numeric(sub["Peak1 value"], errors="coerce") * 1e6
+            amp = ptp.where(ptp.notna(), p1.abs())
+            frame = pd.DataFrame({
+                "Channel": sub["Channel"].astype(str),
+                "amp_uv": amp,
+                "p1_uv": p1,
+                "p1_ms": pd.to_numeric(sub["Peak1 latency"], errors="coerce") * 1e3,
+                "onset_ms": pd.to_numeric(sub.get("Onset latency"), errors="coerce") * 1e3,
+                "p2_ms": pd.to_numeric(sub.get("Peak2 latency"), errors="coerce") * 1e3,
+            })
+            if session is not None:
+                rejected = np.array([
+                    self._is_rejected(session, str(config), crop.amp, ch)
+                    for ch in frame["Channel"]], dtype=bool)
+                frame.loc[rejected, ["amp_uv", "p1_uv", "p1_ms", "onset_ms", "p2_ms"]] = np.nan
+            # Mean over the epochs recorded at this amplitude. NaN rows are
+            # undetected epochs and must not count as zeros, but a point where
+            # NOTHING was detected stays NaN rather than becoming absent — the
+            # sub-threshold part of a ramp is part of the curve.
+            agg = frame.groupby("Channel", sort=False).agg(
+                amp_uv=("amp_uv", "mean"), sd_uv=("amp_uv", "std"),
+                n_epochs=("amp_uv", "count"), p1_uv=("p1_uv", "mean"),
+                p1_ms=("p1_ms", "mean"), onset_ms=("onset_ms", "mean"),
+                p2_ms=("p2_ms", "mean")).reset_index()
+            agg["curve"] = pos
+            agg["x_value"] = amplitude_to_float(crop.amp)
+            agg["x_label"] = str(crop.amp)
+            rows.append(agg)
+        if not rows:
+            return pd.DataFrame()
+        out = pd.concat(rows, ignore_index=True)
+        return out.sort_values(["Channel", "curve"])
+
+    def scenario_waves(self, config: str) -> tuple[np.ndarray | None, dict[str, np.ndarray], list[str]]:
+        """``(times, {channel: (n_points, n_times)}, labels)`` for the curve panel.
+
+        One row per point of the recruitment curve, in the same order as
+        ``recruitment_points``. On the amplitude axis a point is a crop, so its
+        row is the crop's MEAN epoch: the panel is a ramp of stimuli, and drawing
+        every repeat of every amplitude would bury the growth under the repeats.
+        The spread across repeats is on the point plot instead, where it can be
+        read against the response it belongs to.
+        """
+        from src.recruitment import STIM_AXIS_CURVE
+
+        if self.stim_axis == STIM_AXIS_CURVE:
+            crops = [c for c in self.crops if c.config == str(config)] or self.crops[:1]
+            if not crops:
+                return None, {}, []
+            epochs = self.load_epochs(crops[0])
+            data = epochs.get_data() * 1e6
+            waves = {ch: data[:, i, :] for i, ch in enumerate(epochs.ch_names)}
+            return epochs.times, waves, [str(i + 1) for i in range(data.shape[0])]
+
+        crops = self.config_crops(config)
+        if not crops:
+            return None, {}, []
+        times, stacks, labels = None, {}, []
+        for crop in crops:
+            try:
+                epochs = self.load_epochs(crop)
+            except Exception:
+                continue
+            if times is None:
+                times = epochs.times
+            elif len(epochs.times) != len(times):
+                # A crop recorded with a different epoch length cannot share the
+                # panel's time axis; skipping it is better than resampling it
+                # into a shape it never had.
+                continue
+            mean = epochs.get_data().mean(axis=0) * 1e6
+            for i, ch in enumerate(epochs.ch_names):
+                stacks.setdefault(ch, []).append(mean[i])
+            labels.append(str(crop.amp))
+        waves = {ch: np.vstack(rows) for ch, rows in stacks.items() if rows}
+        return times, waves, labels
 
     def hreflex_by_curve(self, config: str, session=None) -> pd.DataFrame:
         """Per-curve M and H metrics side by side, for the H-reflex scenario.

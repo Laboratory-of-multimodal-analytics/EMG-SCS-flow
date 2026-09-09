@@ -44,6 +44,8 @@ from ..templates import build_template
 from .template_editor import HREFLEX_MARKERS, TemplateEditor
 
 from ..results import SIRResults
+from src.recruitment import (STIM_AXIS_AMPLITUDE as AMPLITUDE_AXIS,
+                            STIM_AXIS_CURVE as CURVE_AXIS)
 
 #: Folder the pipeline wrote -> (tab label, default colouring, number of groups).
 #: Only Jendrassik fixes the count, and from the protocol: a block of test stimuli
@@ -108,6 +110,13 @@ class ScenarioViewer(QWidget):
         self.waves: dict[str, np.ndarray] = {}
         self.channel: str | None = None
         self.n_groups: int | None = None
+        #: "curve" (a Neurosoft export, one stimulus per curve) or "amplitude"
+        #: (a crop per mA). Decides what the x axis MEANS; everything keyed on
+        #: the ramp position keeps working either way.
+        self.stim_axis: str = "curve"
+        self.config: str | None = None
+        self.x_of_curve: dict[int, float] = {}
+        self.label_of_curve: dict[int, str] = {}
         self.root: Path | None = None
         self.overrides: dict = {}
         self._span: tuple[float, float] | None = None
@@ -124,6 +133,17 @@ class ScenarioViewer(QWidget):
         self.channel_list = QListWidget()
         self.channel_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.channel_list.currentTextChanged.connect(self._on_channel)
+
+        # A Neurosoft export is one crop, so this stayed hidden there. Every other
+        # stimulation-induced run has a ramp PER configuration, and they are not
+        # comparable to each other — different electrodes, different thresholds —
+        # so one is looked at at a time.
+        self.config_box = QComboBox()
+        self.config_box.setToolTip("Какую конфигурацию стимуляции показывать.")
+        self.config_box.currentIndexChanged.connect(self._on_config)
+        self.config_label = QLabel("<b>Конфигурация</b>")
+        self.config_box.setVisible(False)
+        self.config_label.setVisible(False)
 
         self.color_box = QComboBox()
         self.color_box.addItems(["colour by curve order", "colour by amplitude group"])
@@ -194,6 +214,8 @@ class ScenarioViewer(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
         lv.addWidget(self.header)
+        lv.addWidget(self.config_label)
+        lv.addWidget(self.config_box)
         lv.addWidget(QLabel("<b>Channels</b>"))
         lv.addWidget(self.channel_list, 1)
         lv.addWidget(self.color_box)
@@ -242,39 +264,70 @@ class ScenarioViewer(QWidget):
         self.overrides = load_overrides(self.root)
         self.results = SIRResults(Path(root))
         self.scenario = self.results.scenario
+        self.stim_axis = self.results.stim_axis
         self.by_curve = None
         self.times, self.waves = None, {}
         self.channel_list.blockSignals(True)
         self.channel_list.clear()
         self.channel_list.blockSignals(False)
 
+        # A run with no Neurosoft deliverable on disk is still a recruitment
+        # sweep whenever its crops carry real amplitudes -- pigs, patients,
+        # anything cut from a .mat or .fif. Those were locked out of this surface
+        # even though the ramp is exactly what they are, and the Neurosoft label
+        # was never what made a run readable here: the crops were.
+        if self.scenario is None and self.results.ok and self.stim_axis == AMPLITUDE_AXIS:
+            self.scenario = "Recruitment"
         if self.scenario is None:
             self.header.setText(
-                "<b>No Neurosoft scenario in this run</b><br>"
-                "<span style='color:gray'>This surface covers the recruitment, "
-                "Jendrassik and paired-stimulation exports.</span>"
+                "<b>No recruitment surface for this run</b><br>"
+                "<span style='color:gray'>This surface covers the Neurosoft "
+                "exports and any stimulation-induced run whose crops carry "
+                "stimulation amplitudes.</span>"
             )
-            self._blank("This run produced no Neurosoft scenario outputs.")
+            self._blank("This run has no recruitment ramp to draw.")
+            self.config_box.setVisible(False)
+            self.config_label.setVisible(False)
             return
 
         label, default_colour, self.n_groups = SCENARIOS.get(
             self.scenario, (self.scenario, "curve order", None))
-        crops = self.results.crops
-        if not crops:
+        if not self.results.crops:
             self.header.setText(f"<b>{label}</b>")
             self._blank("No epochs were saved for this run.")
             return
 
-        crop = crops[0]                      # a curve export is always a single crop
+        configs = self.results.configs
+        many = len(configs) > 1
+        self.config_box.setVisible(many)
+        self.config_label.setVisible(many)
+        self.config_box.blockSignals(True)
+        self.config_box.clear()
+        self.config_box.addItems(configs)
+        self.config_box.blockSignals(False)
+        self.config = configs[0]
+        self._load_config()
+
+    def _on_config(self, idx: int) -> None:
+        if self.results is None or idx < 0 or idx >= self.config_box.count():
+            return
+        self.config = self.config_box.itemText(idx)
+        self.selected_curve = None
+        self._load_config()
+
+    def _load_config(self) -> None:
+        """Read one configuration's ramp onto the surface."""
+        label = SCENARIOS.get(self.scenario, (self.scenario, "curve order", None))[0]
+        config = self.config
         # Group count follows the intensities named in the file, exactly as the
         # pipeline does it, so the on-screen groups are the exported ones.
         if self.scenario == "Jendrassik":
-            intensities = intensities_from_name(crop.config)
+            intensities = intensities_from_name(config)
             self.n_groups = 2 * max(len(intensities), 1)
         if self.is_hreflex:
-            self.by_curve = self.results.hreflex_by_curve(crop.config, self.session)
+            self.by_curve = self.results.hreflex_by_curve(config, self.session)
         else:
-            self.by_curve = self.results.recruitment_by_curve(crop.config, self.session)
+            self.by_curve = self.results.recruitment_points(config, self.session)
         self.component_box.setVisible(self.is_hreflex)
         self.component_label.setVisible(self.is_hreflex)
         # Amplitude groups are a Jendrassik/paired idea: they look for the two
@@ -282,29 +335,61 @@ class ScenarioViewer(QWidget):
         # comparison — M against H — is what the two point plots already show.
         self.color_box.setVisible(not self.is_hreflex)
         self.show_band.setVisible(not self.is_hreflex)
+
+        # Where each ramp position is drawn, and how it is printed. On the curve
+        # axis both are the curve number; on the amplitude axis the position is
+        # still the index (selection, markers and corrections are keyed on it)
+        # while the x is the current in mA, spaced as it was delivered.
+        self.x_of_curve, self.label_of_curve = {}, {}
+        if self.by_curve is not None and not self.by_curve.empty \
+                and "x_value" in self.by_curve.columns:
+            for cno, xv, xl in zip(self.by_curve["curve"], self.by_curve["x_value"],
+                                   self.by_curve["x_label"]):
+                self.x_of_curve[int(cno)] = float(xv)
+                self.label_of_curve[int(cno)] = str(xl)
+
         try:
-            epochs = self.results.load_epochs(crop)
-            self.times = epochs.times
-            data = epochs.get_data() * 1e6   # -> µV
-            self.waves = {ch: data[:, i, :] for i, ch in enumerate(epochs.ch_names)}
+            self.times, self.waves, _labels = self.results.scenario_waves(config)
         except Exception as exc:
             self._blank(f"Cannot read epochs:\n{exc}")
             return
+        if self.times is None or not self.waves:
+            self._blank("No epochs were saved for this configuration.")
+            return
 
-        n_curves = len(next(iter(self.waves.values()))) if self.waves else 0
+        n_points = len(next(iter(self.waves.values())))
+        unit = "curves" if self.stim_axis == CURVE_AXIS else "amplitudes"
         self.header.setText(
-            f"<b>{label}</b><br><span style='color:gray'>{crop.config}<br>"
-            f"{n_curves} curves · {len(self.waves)} channels</span>"
+            f"<b>{label}</b><br><span style='color:gray'>{config}<br>"
+            f"{n_points} {unit} · {len(self.waves)} channels</span>"
         )
+        # Per-curve corrections are keyed to a curve of a single crop. On the
+        # amplitude axis a point is a whole crop with its own repeats, and its
+        # corrections belong in Crop review, where they are made per (config,
+        # amplitude, channel). Offering the buttons here would write marks that
+        # name a curve number the crop does not have.
+        editable = self.stim_axis == CURVE_AXIS
+        for b in (self.btn_false, self.btn_missed, self.btn_unmark, self.btn_apply):
+            b.setEnabled(editable)
+            if not editable:
+                b.setToolTip("Правки для этого формата делаются во вкладке Crop review.")
         self.color_box.blockSignals(True)
-        self.color_box.setCurrentIndex(0 if default_colour == "curve order" else 1)
+        self.color_box.setCurrentIndex(
+            0 if SCENARIOS.get(self.scenario, (None, "curve order", None))[1]
+            == "curve order" else 1)
         self.color_box.blockSignals(False)
 
         # Show EVERY channel, not just the responders: a channel the detector
         # found nothing on still needs looking at (to place markers by hand, or
         # to confirm it really is silent). Non-responders are greyed.
         responders = set(self._responders())
-        all_chans = sorted(self.waves, key=lambda s: (len(s), s))
+        # The stimulus channel rides along in the saved epochs (SIR centres the
+        # epochs on it), but it is not a muscle and has no recruitment curve.
+        # Same rule the pipeline identifies it by: 'art' in the name.
+        measured = set(self.by_curve["Channel"].astype(str)) if self.by_curve is not None \
+            and not self.by_curve.empty else set()
+        all_chans = [c for c in sorted(self.waves, key=lambda s: (len(s), s))
+                     if "art" not in c.lower() or c in measured]
         self.channel_list.blockSignals(True)
         self.channel_list.clear()
         for ch in all_chans:
@@ -376,7 +461,11 @@ class ScenarioViewer(QWidget):
         curves = self._points
         if not len(curves):
             return
-        nearest = int(curves[int(np.argmin(np.abs(np.asarray(curves) - event.xdata)))])
+        # Hit-test where the points were actually DRAWN. On the amplitude axis
+        # that is mA, spaced as the currents were, so the nearest point to the
+        # cursor is not the nearest curve number.
+        xs = np.asarray([self.x_of_curve.get(int(c), float(c)) for c in curves], float)
+        nearest = int(np.asarray(curves)[int(np.argmin(np.abs(xs - event.xdata)))])
         self.selected_curve = nearest
         self.slider.blockSignals(True)
         self.slider.setValue(nearest)
@@ -624,6 +713,12 @@ class ScenarioViewer(QWidget):
             return
 
         g = self._groups_for(ch)
+        if g.empty:
+            # A channel with no rows in the metrics table at all. On a Neurosoft
+            # export every channel has one per curve, but an ordinary SIR run
+            # carries channels the detector never ran on.
+            self._blank(f"{ch}: в таблице метрик нет строк для этой конфигурации.")
+            return
         by_group = self.color_box.currentIndex() == 1
         # A channel keeps only the groups its own amplitudes produced.
         labels = sorted(g["group"].dropna().unique(), key=lambda s: int(str(s)[1:]))
@@ -635,10 +730,15 @@ class ScenarioViewer(QWidget):
         self._ax_top = ax_top
         self._ax_tops = []
 
-        # ---- top: response size against curve number ----
+        # ---- top: response size against the stimulation ramp ----
         curves = g["curve"].to_numpy(int)
         amps = g["amp_uv"].to_numpy(float)
         self._points = curves
+        # Where each point is DRAWN. The ramp position stays the key for
+        # selection, marks and corrections; the x is the current when the run
+        # has one, so the dense sub-threshold end and the coarse plateau are
+        # spaced as they were actually delivered instead of evenly.
+        xs = np.asarray([self.x_of_curve.get(int(c), float(c)) for c in curves], float)
         got = np.isfinite(amps)
         # What the curves with no detection would read, measured where the
         # nearest detected curve has its P1. Drawn hollow and never written to
@@ -651,24 +751,26 @@ class ScenarioViewer(QWidget):
             for gi, lab in enumerate(labels):
                 m = ((g["group"] == lab).to_numpy()) & got
                 if m.any():
-                    ax_top.plot(curves[m], amps[m], "o", ms=5, color=GROUP_COLORS[gi],
+                    ax_top.plot(xs[m], amps[m], "o", ms=5, color=GROUP_COLORS[gi],
                                 label=f"{lab} (n={int(m.sum())})")
-            ax_top.plot(curves, amps, "-", lw=0.8, color="0.7", zorder=0)
+            ax_top.plot(xs, amps, "-", lw=0.8, color="0.7", zorder=0)
             if labels:   # a silent channel has no groups, hence no legend
                 ax_top.legend(fontsize=7, frameon=False, ncol=len(labels))
         else:
             norm = mcolors.Normalize(vmin=1, vmax=max(int(curves.max()), 2))
-            ax_top.plot(curves, amps, "-", lw=0.9, color="0.75", zorder=0)
-            ax_top.scatter(curves[got], amps[got], s=26,
+            ax_top.plot(xs, amps, "-", lw=0.9, color="0.75", zorder=0)
+            ax_top.scatter(xs[got], amps[got], s=26,
                            c=[SWEEP_CMAP(norm(c)) for c in curves[got]], zorder=3)
         miss = (~got) & np.isfinite(shown)
         if miss.any():
-            ax_top.plot(curves[miss], shown[miss], "o", ls="none", ms=6,
+            ax_top.plot(xs[miss], shown[miss], "o", ls="none", ms=6,
                         mfc="none", mec="0.45", mew=1.1, zorder=2,
                         label="без детекции")
         n_missing = int((~got).sum())
-        if len(curves):
-            ax_top.set_xlim(0.5, float(curves.max()) + 0.5)
+        if len(xs) and np.isfinite(xs).any():
+            lo, hi = float(np.nanmin(xs)), float(np.nanmax(xs))
+            pad = max((hi - lo) * 0.03, 0.5 if self.stim_axis == CURVE_AXIS else 0.05)
+            ax_top.set_xlim(lo - pad, hi + pad)
         # Marked curves: a cross where a detection was called false, a hollow
         # ring where one was called missed — both visible before recomputing.
         per_ch = self.overrides.get(ch, {})
@@ -676,27 +778,32 @@ class ScenarioViewer(QWidget):
             if cno in set(curves.tolist()):
                 j = list(curves).index(cno)
                 if got[j]:
-                    ax_top.plot([cno], [amps[j]], "x", ms=9, mew=2, color="#d62728", zorder=6)
+                    ax_top.plot([xs[j]], [amps[j]], "x", ms=9, mew=2, color="#d62728", zorder=6)
         for cno in per_ch.get(MISSED, []):
             if cno in set(curves.tolist()):
                 j = list(curves).index(cno)
                 y = amps[j] if got[j] else shown[j]
                 if np.isfinite(y):
-                    ax_top.plot([cno], [y], "o", ms=10, mfc="none", mec="#2ca02c",
+                    ax_top.plot([xs[j]], [y], "o", ms=10, mfc="none", mec="#2ca02c",
                                 mew=2, zorder=6)
         if self.selected_curve is not None and self.selected_curve in set(curves.tolist()):
             j = list(curves).index(self.selected_curve)
-            ax_top.axvline(self.selected_curve, color="#ffb703", lw=1.2, zorder=1)
+            ax_top.axvline(xs[j], color="#ffb703", lw=1.2, zorder=1)
             y = amps[j] if got[j] else shown[j]
             if np.isfinite(y):
-                ax_top.plot([self.selected_curve], [y], "o", ms=11, mfc="none",
+                ax_top.plot([xs[j]], [y], "o", ms=11, mfc="none",
                             mec="#ff8800", mew=2.0, zorder=4)
+        by_amp = self.stim_axis != CURVE_AXIS
+        unit = "amplitudes" if by_amp else "curves"
         ax_top.set_xlabel(
-            "curve number"
-            + (f"   ({n_missing} of {len(curves)} without a detection)" if n_missing else "")
+            ("stimulation amplitude, mA" if by_amp else "curve number")
+            + (f"   ({n_missing} of {len(curves)} {unit} without a detection)"
+               if n_missing else "")
         )
         ax_top.set_ylabel("PTP / |P1|, µV")
-        ax_top.set_title(f"{ch} — response vs curve", fontsize=10, loc="left")
+        ax_top.set_title(
+            f"{ch} — response vs " + ("amplitude" if by_amp else "curve"),
+            fontsize=10, loc="left")
         ax_top.grid(True, color="0.92", lw=0.6)
         for side in ("top", "right"):
             ax_top.spines[side].set_visible(False)

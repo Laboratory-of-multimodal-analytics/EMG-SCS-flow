@@ -28,6 +28,43 @@ import pandas as pd
 
 from .io_utils import STIMULATION_INDUCED_FOLDER, ensure_dir, find_mode_dir
 
+#: How a run's stimuli are laid out along the recruitment axis.
+#:
+#: A Neurosoft ``curves`` export is ONE crop whose curves are the ramp: the
+#: amplitude label is the synthetic ``all`` and carries no number, so the ramp
+#: can only be read off the curve index. Every other stimulation-induced run —
+#: pigs, patients, anything cut from a .mat/.fif by annotations — has the real
+#: thing: a crop per (configuration, amplitude), with the amplitude in mA.
+#: The deliverable is the same recruitment curve either way; only what the x
+#: axis means differs, so it is decided once, here, and everything else asks.
+STIM_AXIS_CURVE = "curve"
+STIM_AXIS_AMPLITUDE = "amplitude"
+
+
+def amplitude_to_float(label) -> float:
+    """The mA in a crop's amplitude label, or NaN when it carries no number.
+
+    Labels are opaque strings by design — ``2`` and ``2,0`` are different crops
+    and are never silently merged — so this is for the x AXIS only, never for
+    identifying a crop. Decimal commas are the norm in these recordings.
+    """
+    import re
+
+    text = str(label).strip().replace(",", ".")
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(m.group(0)) if m else float("nan")
+
+
+def stim_axis_of(amplitude_labels) -> str:
+    """Which axis a run's crops define: real amplitudes, or curve order.
+
+    Two distinct numbers are the threshold: one amplitude is not a ramp, and a
+    label with no number at all (``all``, ``unspecified``) cannot be one.
+    """
+    vals = {v for v in (amplitude_to_float(a) for a in amplitude_labels) if v == v}
+    return STIM_AXIS_AMPLITUDE if len(vals) >= 2 else STIM_AXIS_CURVE
+
+
 # last N curves treated as the maximal-response group
 RECRUITMENT_TOP_N = 5
 # number of amplitude bins for the "similar amplitude" grouping
