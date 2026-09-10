@@ -26,7 +26,7 @@ from matplotlib.lines import Line2D
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QListWidget, QMessageBox, QPushButton, QSplitter,
+                               QListWidget, QMessageBox, QPushButton, QScrollArea, QSplitter,
                                QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
                                QWidget)
 
@@ -41,6 +41,10 @@ def _grid(n: int, ncol: int = 2) -> tuple[int, int]:
         ncol = 3
     ncol = min(ncol, max(n, 1))
     return int(np.ceil(n / ncol)), ncol
+
+
+def key_of(fig, viewer) -> str:
+    return next(k for k, f in viewer.figs.items() if f is fig)
 
 
 class _Collector(QThread):
@@ -120,6 +124,11 @@ class GroupSpontViewer(QWidget):
         self.aliases.setToolTip("Псевдонимы каналов: «имя в файле=общее имя», через «;». "
                                 "Регистр, пробелы и подчёркивания не учитываются и так.")
 
+        for box in (self.metric_box, self.norm_box, self.base_box, self.axis_box):
+            box.currentIndexChanged.connect(lambda _: self._on_pick())
+        for box in (self.state_a, self.state_b):
+            box.currentIndexChanged.connect(lambda _: self._draw())
+
         self.btn_apply = QPushButton("Пересчитать")
         self.btn_apply.clicked.connect(self._recompute)
         self.btn_export = QPushButton("Выгрузить таблицы…")
@@ -148,7 +157,13 @@ class GroupSpontViewer(QWidget):
             fig = Figure(figsize=(7, 6), layout="constrained")
             canvas = FigureCanvasQTAgg(fig)
             self.figs[key], self.canvases[key] = fig, canvas
-            self.views.addTab(canvas, title)
+            # A scroll area rather than a canvas squeezed into the tab: with a
+            # dozen channels each panel keeps a readable height and the view
+            # scrolls, instead of every trace flattening into a line.
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(canvas)
+            self.views.addTab(scroll, title)
         self.views.currentChanged.connect(lambda _: self._draw())
 
         self.stats = QTableWidget(0, 0)
@@ -333,11 +348,27 @@ class GroupSpontViewer(QWidget):
         self.summary, self.tc, self.env = payload
         if self.summary.empty:
             self.status.setText("В выбранных условиях нет сводных таблиц спонтанной ЭМГ.")
+            self._blank("В выбранных условиях нет сводных таблиц спонтанной ЭМГ.")
             return
         # Labels may have been edited after the members were read: the frames
         # carry the labels as they were at collection time, which is now.
         self._fill_channels()
         self._analyse()
+
+    def _on_pick(self) -> None:
+        if not self.summary.empty:
+            self._analyse()
+
+    def _blank(self, message: str = "") -> None:
+        for key, fig in self.figs.items():
+            fig.clear()
+            if message:
+                ax = fig.add_subplot(111)
+                ax.text(0.5, 0.5, message, ha="center", va="center", color="gray", wrap=True)
+                ax.set_axis_off()
+            self.canvases[key].draw()
+        self.stats.setRowCount(0)
+        self.stats.setColumnCount(0)
 
     def _fill_channels(self) -> None:
         picked = {i.text() for i in self.channel_list.selectedItems()}
@@ -434,12 +465,35 @@ class GroupSpontViewer(QWidget):
         fig.legend(handles=handles, loc="outside lower center", ncol=min(len(states), 6),
                    frameon=False, fontsize=8)
 
+
+    def _fit_canvas(self, key: str, nrow: int) -> None:
+        """Give the canvas ~2.6 in per row of panels; the scroll area does the rest."""
+        canvas = self.canvases[key]
+        # The Qt canvas keeps figure.dpi multiplied by the device pixel ratio,
+        # so widget sizes (logical pixels) must be scaled the same way before
+        # they become inches — otherwise on a Retina screen the rendered buffer
+        # covers a quarter of the widget and Qt hatches the rest.
+        ratio = float(getattr(canvas, "device_pixel_ratio", 1.0) or 1.0)
+        dpi = self.figs[key].get_dpi()
+        height = int(max(nrow, 1) * 2.6 * dpi / ratio) + 60
+        canvas.setMinimumHeight(height)
+        width = max(canvas.width(), 600)
+        self.figs[key].set_size_inches(width * ratio / dpi, height * ratio / dpi,
+                                       forward=False)
+
     def _draw(self) -> None:
         if self.norm.empty:
             return
         key = ["overlay", "mean", "box", "bursts"][self.views.currentIndex()]
         fig = self.figs[key]
         fig.clear()
+        if not self._channels_to_draw(self.norm):
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Для выбранных каналов нет данных.", ha="center",
+                    va="center", color="gray")
+            ax.set_axis_off()
+            self.canvases[key].draw()
+            return
         try:
             getattr(self, f"_draw_{key}")(fig)
         except Exception as exc:                      # noqa: BLE001 - drawn, not raised
@@ -447,7 +501,7 @@ class GroupSpontViewer(QWidget):
             ax.text(0.5, 0.5, f"{type(exc).__name__}: {exc}", ha="center", va="center",
                     color="#b00", wrap=True)
             ax.set_axis_off()
-        self.canvases[key].draw_idle()
+        self.canvases[key].draw()
 
     def _draw_overlay(self, fig) -> None:
         """Every member's RMS time course, per channel, before any averaging."""
@@ -459,6 +513,7 @@ class GroupSpontViewer(QWidget):
         channels = self._channels_to_draw(self.norm_tc)
         states = S.sort_states(self.norm_tc["state"])
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
@@ -490,6 +545,7 @@ class GroupSpontViewer(QWidget):
         states = S.sort_states(self.norm_tc["state"])
         gm = S.mean_timecourse(self.norm_tc, axis)
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
@@ -517,6 +573,7 @@ class GroupSpontViewer(QWidget):
         channels = self._channels_to_draw(self.norm)
         states = S.sort_states(self.norm["state"])
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
@@ -530,7 +587,15 @@ class GroupSpontViewer(QWidget):
                 labels.append(f"{state}\nn={len(vals)}")
                 used.append(state)
             if not data:
-                ax.set_axis_off()
+                # An empty panel that keeps its title says "nothing here for
+                # this channel"; a vanished panel says nothing at all.
+                ax.text(0.5, 0.5, "нет данных", ha="center", va="center",
+                        color="0.6", fontsize=9, transform=ax.transAxes)
+                ax.set_title(ch, fontsize=9, loc="left")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for side in ("top", "right", "left", "bottom"):
+                    ax.spines[side].set_visible(False)
                 continue
             try:
                 bp = ax.boxplot(data, tick_labels=labels, patch_artist=True, widths=0.6)
@@ -546,7 +611,11 @@ class GroupSpontViewer(QWidget):
                           else np.array([0.0]))
                 ax.plot(pos + jitter, vals, "o", ms=3, color="0.25", alpha=0.7, zorder=3)
             self._style(ax, ch)
-            ax.tick_params(axis="x", labelsize=7)
+            ax.tick_params(axis="x", labelsize=7 if len(used) <= 4 else 6)
+            if len(used) > 4:
+                for lab in ax.get_xticklabels():
+                    lab.set_rotation(35)
+                    lab.set_ha("right")
             self._apply_limits(ax, x=False, y=(self.metric_box.currentData() == "rms_uv"))
         for j in range(len(channels), nrow * ncol):
             axes[j // ncol][j % ncol].set_axis_off()
@@ -604,6 +673,7 @@ class GroupSpontViewer(QWidget):
         states = S.sort_states(env["state"])
         gm = S.mean_burst_envelope(env)
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]

@@ -36,7 +36,7 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-                               QMessageBox, QPushButton, QSplitter, QTableWidget,
+                               QMessageBox, QPushButton, QScrollArea, QSplitter, QTableWidget,
                                QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 import src.group as G
@@ -53,6 +53,10 @@ def _state_colors(states: list[str]) -> dict[str, str]:
 def _grid(n: int, ncol: int = 2) -> tuple[int, int]:
     ncol = min(ncol, max(n, 1))
     return int(np.ceil(n / ncol)), ncol
+
+
+def key_of(fig, viewer) -> str:
+    return next(k for k, f in viewer.figs.items() if f is fig)
 
 
 class _Collector(QThread):
@@ -86,6 +90,8 @@ class GroupViewer(QWidget):
         self.session = session
         self.runs: list[G.GroupRun] = []
         self.points = pd.DataFrame()
+        #: everything read from disk; ``points`` is this filtered by the pickers
+        self.points_all = pd.DataFrame()
         self.normalised = pd.DataFrame()
         self.scalars = pd.DataFrame()
         self._missing: list[str] = []
@@ -115,8 +121,10 @@ class GroupViewer(QWidget):
         self.config_list = QListWidget()
         self.config_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.config_list.setMaximumHeight(90)
+        self.config_list.itemSelectionChanged.connect(self._on_pick)
         self.channel_list = QListWidget()
         self.channel_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.channel_list.itemSelectionChanged.connect(self._on_pick)
 
         self.metric_box = QComboBox()
         for key, label in G.METRICS.items():
@@ -124,7 +132,9 @@ class GroupViewer(QWidget):
         self.norm_box = QComboBox()
         for key, label in G.NORM_LABELS.items():
             self.norm_box.addItem(label, key)
-        self.norm_box.setCurrentIndex(1)          # normalise to the baseline maximum
+        # Raw µV by default: a normalisation whose baseline most subjects lack
+        # turns the view into a few runaway ratios over a floor of zeros.
+        self.norm_box.setCurrentIndex(0)
         self.base_box = QComboBox()
         self.base_box.setToolTip(
             "Состояние, принятое за базовое. Нормировка считается в нём, "
@@ -135,7 +145,14 @@ class GroupViewer(QWidget):
         for key, label in G.SCALARS.items():
             self.scalar_box.addItem(label, key)
 
+        for box in (self.metric_box, self.norm_box, self.base_box):
+            box.currentIndexChanged.connect(lambda _: self._on_pick())
+        for box in (self.scalar_box, self.state_a, self.state_b):
+            box.currentIndexChanged.connect(lambda _: self._draw())
+
         self.btn_apply = QPushButton("Пересчитать")
+        self.btn_apply.setToolTip("Прочитать отмеченные прогоны с диска заново. Выбор каналов, "
+                                  "конфигураций, метрики и нормировки применяется сразу.")
         self.btn_apply.clicked.connect(self._recompute)
         self.btn_export = QPushButton("Выгрузить таблицы…")
         self.btn_export.clicked.connect(self._export)
@@ -167,7 +184,13 @@ class GroupViewer(QWidget):
             fig = Figure(figsize=(7, 6), layout="constrained")
             canvas = FigureCanvasQTAgg(fig)
             self.figs[key], self.canvases[key] = fig, canvas
-            self.views.addTab(canvas, title)
+            # A scroll area rather than a canvas squeezed into the tab: with a
+            # dozen channels each panel keeps a readable height and the view
+            # scrolls, instead of every trace flattening into a line.
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(canvas)
+            self.views.addTab(scroll, title)
         self.views.currentChanged.connect(lambda _: self._draw())
 
         self.stats = QTableWidget(0, 0)
@@ -335,8 +358,7 @@ class GroupViewer(QWidget):
         if self._collector is not None and self._collector.isRunning():
             return
         self.btn_apply.setEnabled(False)
-        self._collector = _Collector(active, self._selected(self.config_list),
-                                     self._selected(self.channel_list))
+        self._collector = _Collector(active, None, None)
         self._collector.progress.connect(self.status.setText)
         self._collector.done.connect(self._on_collected)
         self._collector.start()
@@ -347,19 +369,36 @@ class GroupViewer(QWidget):
             self.status.setText(error)
             QMessageBox.warning(self, "Не удалось собрать группу", error)
             return
-        self.points = points if points is not None else pd.DataFrame()
-        if self.points.empty:
-            self.status.setText("В выбранных прогонах нет точек для этих каналов "
-                                "и конфигураций.")
+        self.points_all = points if points is not None else pd.DataFrame()
+        if self.points_all.empty:
+            self.status.setText("В отмеченных прогонах нет ни одной точки.")
+            self._blank("В отмеченных прогонах нет ни одной точки.")
             return
         self._fill_pickers()
         self._analyse()
+
+    def _on_pick(self) -> None:
+        """A picker or a combo changed: re-filter and redraw, nothing re-read."""
+        if not self.points_all.empty:
+            self._analyse()
+
+    def _blank(self, message: str = "") -> None:
+        """Clear every view — stale panels must never outlive the data they drew."""
+        for key, fig in self.figs.items():
+            fig.clear()
+            if message:
+                ax = fig.add_subplot(111)
+                ax.text(0.5, 0.5, message, ha="center", va="center", color="gray", wrap=True)
+                ax.set_axis_off()
+            self.canvases[key].draw()
+        self.stats.setRowCount(0)
+        self.stats.setColumnCount(0)
 
     def _fill_pickers(self) -> None:
         """Offer what the group actually contains, keeping what was already picked."""
         for widget, column in ((self.config_list, "config"), (self.channel_list, "channel")):
             picked = {i.text() for i in widget.selectedItems()}
-            values = sorted(self.points[column].dropna().unique().tolist(),
+            values = sorted(self.points_all[column].dropna().unique().tolist(),
                             key=lambda s: (len(s), s))
             widget.blockSignals(True)
             widget.clear()
@@ -370,6 +409,15 @@ class GroupViewer(QWidget):
             widget.blockSignals(False)
 
     def _analyse(self) -> None:
+        picked = self._selected(self.config_list)
+        pts = self.points_all
+        if picked:
+            pts = pts[pts["config"].isin(set(picked))]
+        self.points = pts
+        if self.points.empty:
+            self.status.setText("Для выбранных конфигураций нет точек.")
+            self._blank("Для выбранных конфигураций нет точек.")
+            return
         metric = self.metric_box.currentData()
         mode = self.norm_box.currentData()
         baseline = self.base_box.currentText()
@@ -433,12 +481,35 @@ class GroupViewer(QWidget):
     def _unit(self) -> str:
         return str(self.normalised["unit"].iloc[0]) if not self.normalised.empty else ""
 
+
+    def _fit_canvas(self, key: str, nrow: int) -> None:
+        """Give the canvas ~2.6 in per row of panels; the scroll area does the rest."""
+        canvas = self.canvases[key]
+        # The Qt canvas keeps figure.dpi multiplied by the device pixel ratio,
+        # so widget sizes (logical pixels) must be scaled the same way before
+        # they become inches — otherwise on a Retina screen the rendered buffer
+        # covers a quarter of the widget and Qt hatches the rest.
+        ratio = float(getattr(canvas, "device_pixel_ratio", 1.0) or 1.0)
+        dpi = self.figs[key].get_dpi()
+        height = int(max(nrow, 1) * 2.6 * dpi / ratio) + 60
+        canvas.setMinimumHeight(height)
+        width = max(canvas.width(), 600)
+        self.figs[key].set_size_inches(width * ratio / dpi, height * ratio / dpi,
+                                       forward=False)
+
     def _draw(self) -> None:
         if self.normalised.empty:
             return
         key = ["overlay", "mean", "box", "waves"][self.views.currentIndex()]
         fig = self.figs[key]
         fig.clear()
+        if not self._channels_to_draw():
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "Для выбранных каналов нет точек.", ha="center",
+                    va="center", color="gray")
+            ax.set_axis_off()
+            self.canvases[key].draw()
+            return
         try:
             getattr(self, f"_draw_{key}")(fig)
         except Exception as exc:                      # noqa: BLE001 - drawn, not raised
@@ -446,7 +517,7 @@ class GroupViewer(QWidget):
             ax.text(0.5, 0.5, f"{type(exc).__name__}: {exc}", ha="center", va="center",
                     color="#b00", wrap=True)
             ax.set_axis_off()
-        self.canvases[key].draw_idle()
+        self.canvases[key].draw()
 
     def _draw_overlay(self, fig) -> None:
         """Every run's own curve, before any averaging."""
@@ -456,17 +527,25 @@ class GroupViewer(QWidget):
         states = G.sort_states(self.normalised["state"])
         colors = self._palette
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
             d = self.normalised[self.normalised["channel"] == ch]
+            drawn = 0
             for (subject, state, config), grp in d.groupby(["subject", "state", "config"]):
                 g = grp.dropna(subset=["x_value", "value"]).sort_values("x_value")
                 if g.empty:
                     continue
-                ax.plot(g["x_value"], g["value"], "-o", ms=2.5, lw=1.0,
-                        color=colors.get(state, "0.5"), alpha=0.75)
-            ax.set_title(ch, fontsize=9, loc="left")
+                drawn += 1
+                ax.plot(g["x_value"], g["value"], "-", lw=0.9,
+                        color=colors.get(state, "0.5"), alpha=0.65)
+                ax.plot(g["x_value"], g["value"], "o", ms=1.8,
+                        color=colors.get(state, "0.5"), alpha=0.65)
+            if not drawn:
+                ax.text(0.5, 0.5, "нет данных", ha="center", va="center",
+                        color="0.6", fontsize=9, transform=ax.transAxes)
+            ax.set_title(f"{ch}  (n={drawn})", fontsize=9, loc="left")
             ax.grid(True, color="0.93", lw=0.6)
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
@@ -490,6 +569,7 @@ class GroupViewer(QWidget):
         on_grid = G.interpolate_to_grid(self.normalised, grid)
         gm = G.group_mean(on_grid)
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
@@ -505,6 +585,9 @@ class GroupViewer(QWidget):
                 # n changes ALONG the axis: subjects drop out where their own
                 # sweep stopped. The label says the most anyone had.
                 ax.plot([], [], color=color, label=f"{state} (n≤{int(s['n'].max())})")
+            if d.empty:
+                ax.text(0.5, 0.5, "меньше двух субъектов", ha="center", va="center",
+                        color="0.6", fontsize=9, transform=ax.transAxes)
             ax.set_title(ch, fontsize=9, loc="left")
             ax.grid(True, color="0.93", lw=0.6)
             for side in ("top", "right"):
@@ -526,6 +609,7 @@ class GroupViewer(QWidget):
         states = G.sort_states(self.scalars["state"])
         colors = self._palette
         nrow, ncol = _grid(len(channels))
+        self._fit_canvas(key_of(fig, self), nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
@@ -540,7 +624,15 @@ class GroupViewer(QWidget):
                 labels.append(f"{state}\nn={len(vals)}")
                 used.append(state)
             if not data:
-                ax.set_axis_off()
+                # An empty panel that keeps its title says "nothing here for
+                # this channel"; a vanished panel says nothing at all.
+                ax.text(0.5, 0.5, "нет данных", ha="center", va="center",
+                        color="0.6", fontsize=9, transform=ax.transAxes)
+                ax.set_title(ch, fontsize=9, loc="left")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for side in ("top", "right", "left", "bottom"):
+                    ax.spines[side].set_visible(False)
                 continue
             # tick_labels since matplotlib 3.9; labels before it.
             try:
@@ -559,7 +651,11 @@ class GroupViewer(QWidget):
                           else np.array([0.0]))
                 ax.plot(pos + jitter, vals, "o", ms=3, color="0.25", alpha=0.7, zorder=3)
             ax.set_title(ch, fontsize=9, loc="left")
-            ax.tick_params(axis="x", labelsize=7)
+            ax.tick_params(axis="x", labelsize=7 if len(used) <= 4 else 6)
+            if len(used) > 4:
+                for lab in ax.get_xticklabels():
+                    lab.set_rotation(35)
+                    lab.set_ha("right")
             ax.grid(True, axis="y", color="0.93", lw=0.6)
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
@@ -611,6 +707,7 @@ class GroupViewer(QWidget):
         config, channel = configs[0], channels[0]
         active = [r for r in self.runs if r.include]
         times, loaded = G.collect_waveforms(active, config, channel)
+        self._fit_canvas(key_of(fig, self), 1)
         ax = fig.add_subplot(111)
         if not len(times) or not loaded:
             ax.text(0.5, 0.5, "Нет сохранённых эпох для этой пары "
