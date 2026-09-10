@@ -82,11 +82,9 @@ class GroupViewer(QWidget):
         self._palette: dict[str, str] = {}
 
         # ---- runs ----
-        self.btn_dataset = QPushButton("Датасет Нейрософта")
-        self.btn_dataset.setToolTip("Добавить все обработанные записи Нейрософта с "
-                                    "лабораторного диска (травма + контроль).")
-        self.btn_dataset.clicked.connect(self._add_dataset)
         self.btn_scan = QPushButton("Добавить папку…")
+        self.btn_scan.setToolTip("Найти внутри папки все обработанные записи и добавить "
+                                 "их в группу; метки читаются из имён папок.")
         self.btn_scan.clicked.connect(self._scan)
         self.btn_clear = QPushButton("Очистить")
         self.btn_clear.clicked.connect(self._clear)
@@ -179,11 +177,7 @@ class GroupViewer(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
         row = QHBoxLayout()
-        row.addWidget(self.btn_dataset)
-        row.addWidget(self.btn_scan)
-        lv.addLayout(row)
-        row = QHBoxLayout()
-        for b in (self.btn_all, self.btn_none, self.btn_clear):
+        for b in (self.btn_scan, self.btn_all, self.btn_none, self.btn_clear):
             row.addWidget(b)
         lv.addLayout(row)
         lv.addWidget(QLabel("<b>Группировать по</b>"))
@@ -246,15 +240,6 @@ class GroupViewer(QWidget):
         self._fill_table()
         return len(added)
 
-    def _add_dataset(self) -> None:
-        roots = [r for r in G.NEUROSOFT_ROOTS if r.exists()]
-        if not roots:
-            self.status.setText("Лабораторный диск не смонтирован — добавьте папку вручную.")
-            return
-        n = self._add_runs(G.scan_neurosoft(roots, self._mode()))
-        self.status.setText(f"Добавлено записей: {n}. Всего в группе: {len(self.runs)}. "
-                            "Отметьте нужные и нажмите «Перечитать с диска».")
-
     def _scan(self) -> None:
         start = str(self.runs[-1].root.parent) if self.runs else ""
         folder = QFileDialog.getExistingDirectory(self, "Папка с обработанными записями", start)
@@ -262,7 +247,8 @@ class GroupViewer(QWidget):
             return
         n = self._add_runs(G.scan_neurosoft([Path(folder)], self._mode()))
         self.status.setText(
-            f"Добавлено записей: {n}. Всего в группе: {len(self.runs)}."
+            f"Добавлено записей: {n}. Всего в группе: {len(self.runs)}. "
+            "Отметьте нужные и нажмите «Перечитать с диска»."
             + ("" if n else " Ничего нового: внутри нет папок с "
                             "Excel/Large_dataset_emg_response_metrics.csv."))
 
@@ -452,6 +438,23 @@ class GroupViewer(QWidget):
             self.stats.setColumnCount(0)
             return
         peak = d.groupby(["state", "channel", "run"])["value"].max().reset_index()
+        # H-reflex recordings: the ratio of the two maxima per recording is the
+        # number clinicians read first, so it gets its own row per channel.
+        if self.metric_box.currentData() == "amp_uv":
+            comp = peak["channel"].map(lambda c: G.split_component(c)[1])
+            raw = peak["channel"].map(lambda c: G.split_component(c)[0])
+            hm = peak.assign(comp=comp, raw=raw)[comp.notna()]
+            if not hm.empty:
+                wide = hm.pivot_table(index=["state", "raw", "run"], columns="comp",
+                                      values="value").reset_index()
+                if {"h", "m"} <= set(wide.columns):
+                    ratio = wide.dropna(subset=["h", "m"])
+                    ratio = ratio[ratio["m"] > 0]
+                    if not ratio.empty:
+                        extra = pd.DataFrame({
+                            "state": ratio["state"], "channel": ratio["raw"] + " · Hmax/Mmax",
+                            "run": ratio["run"], "value": ratio["h"] / ratio["m"]})
+                        peak = pd.concat([peak, extra], ignore_index=True)
         g = peak.groupby(["state", "channel"])
         table = pd.DataFrame({
             "записей": g["run"].nunique(),
@@ -655,13 +658,13 @@ class GroupViewer(QWidget):
                 n = int(s["n"].iloc[0])
                 ax.plot(s["t"] * 1e3, s["mean"], lw=1.7, color=color,
                         label=f"{state} (n={n})")
-                if n >= 2:
+                if n >= 3:
                     ax.fill_between(s["t"] * 1e3, s["lo"], s["hi"], color=color,
                                     alpha=0.2, lw=0)
             ax.axvline(0, color="0.4", lw=0.8, ls="--")
             # The y range follows the group band, not the loudest single trace:
             # one recording's 4 mV artifact would otherwise flatten every mean.
-            lo, hi = float(summary["lo"].min()), float(summary["hi"].max())
+            lo, hi = float(summary["lo"].quantile(0.002)), float(summary["hi"].quantile(0.998))
             if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
                 pad = 0.25 * (hi - lo)
                 ax.set_ylim(lo - pad, hi + pad)

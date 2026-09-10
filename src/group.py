@@ -226,8 +226,9 @@ def collect_points(runs, configs=None, channels=None) -> pd.DataFrame:
         if not res.ok:
             continue
         wanted = [c for c in res.configs if configs is None or c in set(configs)]
+        hreflex = res.scenario == "H-reflex"
         for config in wanted:
-            pts = res.recruitment_points(config)
+            pts = hreflex_points(res, config) if hreflex else res.recruitment_points(config)
             if pts is None or pts.empty:
                 continue
             pts = pts.copy()
@@ -248,6 +249,50 @@ def collect_points(runs, configs=None, channels=None) -> pd.DataFrame:
     # out of the curves rather than plotted at an invented x.
     out["x_value"] = pd.to_numeric(out["x_value"], errors="coerce")
     return out
+
+
+#: How the two components of an H-reflex recording are named as group channels.
+H_SUFFIX, M_SUFFIX = " · H", " · M"
+
+
+def hreflex_points(res, config: str) -> pd.DataFrame:
+    """M-wave and H-reflex of one recording as two separate group channels.
+
+    On these files one curve routinely carries one component and not the
+    other, and they grow with current in opposite directions, so folding them
+    into one "response" would average the M-wave into the H-reflex. Each
+    becomes its own channel — ``ch1 · M`` and ``ch1 · H`` — and everything
+    downstream (overlay, mean, waveforms, tables) treats them apart.
+    """
+    hb = res.hreflex_by_curve(config)
+    if hb is None or hb.empty:
+        return pd.DataFrame()
+    frames = []
+    for comp, suffix in (("m", M_SUFFIX), ("h", H_SUFFIX)):
+        f = pd.DataFrame({
+            "Channel": hb["Channel"].astype(str) + suffix,
+            "curve": hb["curve"].astype(int),
+            "amp_uv": pd.to_numeric(hb[f"{comp}_amp_uv"], errors="coerce"),
+            "p1_uv": pd.to_numeric(hb[f"{comp}_p1_uv"], errors="coerce"),
+            "p1_ms": pd.to_numeric(hb[f"{comp}_p1_ms"], errors="coerce"),
+            "onset_ms": pd.to_numeric(hb[f"{comp}_onset_ms"], errors="coerce"),
+            "p2_ms": pd.to_numeric(hb[f"{comp}_p2_ms"], errors="coerce"),
+        })
+        frames.append(f)
+    out = pd.concat(frames, ignore_index=True)
+    out["x_value"] = out["curve"].astype(float)
+    out["x_label"] = out["curve"].astype(str)
+    out["n_epochs"] = 1
+    out["sd_uv"] = np.nan
+    return out.sort_values(["Channel", "curve"])
+
+
+def split_component(channel: str) -> tuple[str, str | None]:
+    """``"ch1 · H"`` → ``("ch1", "h")``; a plain channel → ``(name, None)``."""
+    for suffix, comp in ((H_SUFFIX, "h"), (M_SUFFIX, "m")):
+        if channel.endswith(suffix):
+            return channel[: -len(suffix)], comp
+    return channel, None
 
 
 def inventory(points: pd.DataFrame) -> pd.DataFrame:
@@ -554,14 +599,23 @@ def collect_waveforms(runs, config: str | None, channel: str, at_x: float | None
             if cfg not in res.configs:
                 continue
             times, waves, labels = res.scenario_waves(cfg)
-            if times is None or channel not in waves:
+            raw_channel, comp = split_component(channel)
+            if times is None or raw_channel not in waves:
                 continue
-            pts = res.recruitment_points(cfg)
+            if comp is not None:
+                # An H/M channel exists only on H-reflex recordings; on any
+                # other recording it has no points and the run is skipped.
+                pts = hreflex_points(res, cfg) if res.scenario == "H-reflex" \
+                    else pd.DataFrame()
+            else:
+                pts = res.recruitment_points(cfg)
             pts = pts[pts["channel" if "channel" in pts else "Channel"] == channel] \
                 if not pts.empty else pts
+            if comp is not None and pts.empty:
+                continue
         except Exception:
             continue
-        stack = waves[channel]
+        stack = waves[raw_channel]
         idx, shown = 0, ""
         if not pts.empty:
             xs = pd.to_numeric(pts["x_value"], errors="coerce").to_numpy(float)
@@ -774,7 +828,9 @@ def waveform_summary(times: np.ndarray, loaded: list[dict]) -> pd.DataFrame:
         stack = np.vstack(waves)
         n = stack.shape[0]
         mean = np.nanmean(stack, axis=0)
-        if n >= 2:
+        # Two recordings give one degree of freedom and a t of 12.7: the band
+        # would be wider than the plot. Three is the least that says anything.
+        if n >= 3:
             se = np.nanstd(stack, axis=0, ddof=1) / np.sqrt(n)
             q = float(student_t.ppf(0.975, n - 1)) if student_t is not None else 1.96
             lo, hi = mean - q * se, mean + q * se
