@@ -1,27 +1,22 @@
-"""Group analysis: several finished runs read as one experiment.
+"""Group analysis of Neurosoft recordings: many exports read as one experiment.
 
-Every other surface in the toolbox looks at one recording. This one looks at a
-set of them and asks what they say together — did the response grow between
-sessions, is it the same muscles in every animal, how much of the spread is
-between subjects rather than between states.
+Every other surface looks at one recording. This one takes the processed
+Neurosoft array — one export per (patient, level, protocol) — and asks what the
+recordings of one STATE say together. A state is built from the tags read off
+the recording name (level, cohort, scenario, side, …); the "Группировать по"
+box says which tags make the state, and the labels stay editable in the table
+because the names are hand-typed and the guess can be wrong.
 
-The screen is in three parts, left to right: WHICH runs are in the group and
-what each one is (subject, state, baseline); WHAT to compare (channels,
-configurations, metric, normalisation); and four views of the answer —
+Three views, left to right:
 
-  * Наложение     — every run's curve on one axes, to look before averaging;
-  * Групповое среднее — mean ± SE across subjects, on a shared current axis;
-  * Боксплоты      — one number per curve, distributed across subjects, plus
-                     the paired contrast between two states;
-  * Формы ответов  — the waveforms themselves from different runs, superimposed.
+  * Наложение         — every recording's recruitment curve, one panel per channel;
+  * Групповое среднее — mean ± SE across recordings of a state, on the curve axis;
+  * Формы ответов     — the response waveforms: mean across recordings with a
+                        95 % confidence band per state, individual traces faint.
 
-All four share one pair of axis limits, computed over everything selected. That
-is the point of the "единая развертка" box: comparing curves drawn at different
-scales is the mistake this view exists to prevent, and auto-scaling each panel
-to its own data reintroduces it silently.
-
-The analysis lives in ``src/group.py`` and knows nothing about Qt; this file
-only draws what it returns.
+A Neurosoft export carries no stimulation amplitude, so the x axis of the
+curves is the curve number in the ramp. The analysis is in ``src/group.py``;
+this file only draws.
 """
 
 from __future__ import annotations
@@ -31,145 +26,127 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.lines import Line2D
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-                               QMessageBox, QPushButton, QScrollArea, QSplitter, QTableWidget,
-                               QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+                               QMessageBox, QPushButton, QScrollArea, QSplitter,
+                               QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+                               QWidget)
 
 import src.group as G
 
-#: One colour per state, in the order states are shown.
-STATE_COLORS = ["#4575b4", "#f0a202", "#d73027", "#4d9221", "#7b3294",
-                "#00838f", "#8d6e63", "#c2185b", "#5e35b1", "#33691e"]
-
-
-def _state_colors(states: list[str]) -> dict[str, str]:
-    return {s: STATE_COLORS[i % len(STATE_COLORS)] for i, s in enumerate(states)}
+STATE_COLORS = ["#4575b4", "#d73027", "#f0a202", "#4d9221", "#7b3294",
+                "#00838f", "#8d6e63", "#c2185b", "#5e35b1", "#33691e", "#ef6c00",
+                "#0277bd"]
+VIEWS = ["overlay", "mean", "waves"]
 
 
 def _grid(n: int, ncol: int = 2) -> tuple[int, int]:
+    if n > 8:
+        ncol = 3
     ncol = min(ncol, max(n, 1))
     return int(np.ceil(n / ncol)), ncol
 
 
-def key_of(fig, viewer) -> str:
-    return next(k for k, f in viewer.figs.items() if f is fig)
-
-
 class _Collector(QThread):
-    """Reads the selected runs' metrics off disk without freezing the window.
-
-    On a Google Drive mount the first read of a run's metrics table can take
-    seconds, and a group is dozens of runs; doing that on the GUI thread makes
-    the window look hung exactly when the user has just clicked something.
-    """
-    done = Signal(object, object)          # points, error
+    """Reads the selected runs' metrics off disk without freezing the window."""
+    done = Signal(object, object)
     progress = Signal(str)
 
-    def __init__(self, runs, configs, channels):
+    def __init__(self, runs):
         super().__init__()
-        self._runs, self._configs, self._channels = runs, configs, channels
+        self._runs = runs
 
     def run(self) -> None:
         try:
-            self.progress.emit(f"Читаю {len(self._runs)} прогон(ов)…")
-            pts = G.collect_points(self._runs, self._configs, self._channels)
+            self.progress.emit(f"Читаю {len(self._runs)} записей…")
+            pts = G.collect_points(self._runs)
             self.done.emit(pts, None)
         except Exception as exc:                     # noqa: BLE001 - shown to the user
             self.done.emit(None, f"{type(exc).__name__}: {exc}")
 
 
 class GroupViewer(QWidget):
-    """The group tab."""
+    """The Neurosoft group tab."""
 
     def __init__(self, session=None) -> None:
         super().__init__()
         self.session = session
         self.runs: list[G.GroupRun] = []
-        self.points = pd.DataFrame()
-        #: everything read from disk; ``points`` is this filtered by the pickers
         self.points_all = pd.DataFrame()
         self.normalised = pd.DataFrame()
-        self.scalars = pd.DataFrame()
         self._missing: list[str] = []
         self._collector: _Collector | None = None
-        #: state -> colour, fixed for the WHOLE group rather than per view. Each
-        #: view sees a different subset of states — a state with no curve on the
-        #: current grid is absent from the mean but still has a box — and a
-        #: palette built per view then gives one state two colours across the
-        #: tab, which is exactly the confusion this surface exists to remove.
         self._palette: dict[str, str] = {}
 
         # ---- runs ----
+        self.btn_dataset = QPushButton("Датасет Нейрософта")
+        self.btn_dataset.setToolTip("Добавить все обработанные записи Нейрософта с "
+                                    "лабораторного диска (травма + контроль).")
+        self.btn_dataset.clicked.connect(self._add_dataset)
         self.btn_scan = QPushButton("Добавить папку…")
-        self.btn_scan.setToolTip(
-            "Найти внутри папки все посчитанные прогоны и добавить их в группу.")
         self.btn_scan.clicked.connect(self._scan)
         self.btn_clear = QPushButton("Очистить")
         self.btn_clear.clicked.connect(self._clear)
+        self.btn_all = QPushButton("Все")
+        self.btn_all.clicked.connect(lambda: self._set_all(True))
+        self.btn_none = QPushButton("Никого")
+        self.btn_none.clicked.connect(lambda: self._set_all(False))
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["", "Субъект", "Состояние", "Прогон"])
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.group_box = QComboBox()
+        for key, label in G.GROUP_MODES.items():
+            self.group_box.addItem(label, key)
+        self.group_box.setToolTip("Из каких меток записи складывается её состояние. "
+                                  "Состояния сравниваются между собой; метки в таблице "
+                                  "можно править руками.")
+        self.group_box.currentIndexChanged.connect(lambda _: self._regroup())
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["", "Субъект", "Когорта", "Уровень", "Сценарий", "Состояние", "Запись"])
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.itemChanged.connect(self._on_table_edit)
 
-        # ---- what to compare ----
-        self.config_list = QListWidget()
-        self.config_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.config_list.setMaximumHeight(90)
-        self.config_list.itemSelectionChanged.connect(self._on_pick)
         self.channel_list = QListWidget()
         self.channel_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.channel_list.itemSelectionChanged.connect(self._on_pick)
+        self.channel_list.setToolTip("Какие каналы рисовать. Cmd-клик добавляет канал.")
+        self.channel_list.itemSelectionChanged.connect(self._draw)
 
+        # ---- what to compare ----
         self.metric_box = QComboBox()
         for key, label in G.METRICS.items():
             self.metric_box.addItem(label, key)
         self.norm_box = QComboBox()
         for key, label in G.NORM_LABELS.items():
             self.norm_box.addItem(label, key)
-        # Raw µV by default: a normalisation whose baseline most subjects lack
-        # turns the view into a few runaway ratios over a floor of zeros.
-        self.norm_box.setCurrentIndex(0)
         self.base_box = QComboBox()
-        self.base_box.setToolTip(
-            "Состояние, принятое за базовое. Нормировка считается в нём, "
-            "отдельно для каждого субъекта.")
-        self.state_a = QComboBox()
-        self.state_b = QComboBox()
-        self.scalar_box = QComboBox()
-        for key, label in G.SCALARS.items():
-            self.scalar_box.addItem(label, key)
-
+        self.base_box.setToolTip("Состояние, принятое за базовое: нормировка считается "
+                                 "в нём, отдельно для каждого субъекта и канала.")
         for box in (self.metric_box, self.norm_box, self.base_box):
             box.currentIndexChanged.connect(lambda _: self._on_pick())
-        for box in (self.scalar_box, self.state_a, self.state_b):
-            box.currentIndexChanged.connect(lambda _: self._draw())
+        self.show_runs = QCheckBox("показывать отдельные записи")
+        self.show_runs.setChecked(True)
+        self.show_runs.toggled.connect(lambda _: self._draw())
 
-        self.btn_apply = QPushButton("Пересчитать")
-        self.btn_apply.setToolTip("Прочитать отмеченные прогоны с диска заново. Выбор каналов, "
-                                  "конфигураций, метрики и нормировки применяется сразу.")
+        self.btn_apply = QPushButton("Перечитать с диска")
+        self.btn_apply.setToolTip("Прочитать отмеченные записи заново. Выбор каналов, "
+                                  "метрики, группировки и нормировки применяется сразу.")
         self.btn_apply.clicked.connect(self._recompute)
         self.btn_export = QPushButton("Выгрузить таблицы…")
         self.btn_export.clicked.connect(self._export)
 
-        # ---- shared axes ----
         self.lock_axes = QCheckBox("единая развертка")
         self.lock_axes.setChecked(True)
-        self.lock_axes.setToolTip(
-            "Одни и те же пределы по X и Y на всех панелях и во всех видах.\n"
-            "Без этого каждая панель масштабируется под себя и кривые разного "
-            "размера выглядят одинаково.")
+        self.lock_axes.setToolTip("Одни и те же пределы по X и Y на всех панелях и во всех видах.")
         self.lock_axes.toggled.connect(lambda _: self._draw())
         self.x_lo, self.x_hi = QDoubleSpinBox(), QDoubleSpinBox()
         self.y_lo, self.y_hi = QDoubleSpinBox(), QDoubleSpinBox()
         for b in (self.x_lo, self.x_hi, self.y_lo, self.y_hi):
             b.setRange(-1e6, 1e6)
-            b.setDecimals(2)
+            b.setDecimals(1)
             b.valueChanged.connect(lambda _: self._draw())
 
         self.status = QLabel("Группа пуста.")
@@ -180,13 +157,10 @@ class GroupViewer(QWidget):
         self.figs, self.canvases = {}, {}
         self.views = QTabWidget()
         for key, title in (("overlay", "Наложение"), ("mean", "Групповое среднее"),
-                           ("box", "Боксплоты"), ("waves", "Формы ответов")):
+                           ("waves", "Формы ответов")):
             fig = Figure(figsize=(7, 6), layout="constrained")
             canvas = FigureCanvasQTAgg(fig)
             self.figs[key], self.canvases[key] = fig, canvas
-            # A scroll area rather than a canvas squeezed into the tab: with a
-            # dozen channels each panel keeps a readable height and the view
-            # scrolls, instead of every trace flattening into a line.
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setWidget(canvas)
@@ -195,7 +169,7 @@ class GroupViewer(QWidget):
 
         self.stats = QTableWidget(0, 0)
         self.stats.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.stats.setMaximumHeight(190)
+        self.stats.setMaximumHeight(170)
 
         self._build_layout()
 
@@ -205,13 +179,17 @@ class GroupViewer(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
         row = QHBoxLayout()
+        row.addWidget(self.btn_dataset)
         row.addWidget(self.btn_scan)
-        row.addWidget(self.btn_clear)
         lv.addLayout(row)
-        lv.addWidget(QLabel("<b>Прогоны в группе</b>"))
-        lv.addWidget(self.table, 2)
-        lv.addWidget(QLabel("<b>Конфигурации</b>"))
-        lv.addWidget(self.config_list)
+        row = QHBoxLayout()
+        for b in (self.btn_all, self.btn_none, self.btn_clear):
+            row.addWidget(b)
+        lv.addLayout(row)
+        lv.addWidget(QLabel("<b>Группировать по</b>"))
+        lv.addWidget(self.group_box)
+        lv.addWidget(QLabel("<b>Записи в группе</b>"))
+        lv.addWidget(self.table, 3)
         lv.addWidget(QLabel("<b>Каналы</b>"))
         lv.addWidget(self.channel_list, 1)
 
@@ -220,12 +198,10 @@ class GroupViewer(QWidget):
         mv.setContentsMargins(4, 4, 4, 4)
         for title, w in (("Метрика", self.metric_box),
                          ("Нормировка", self.norm_box),
-                         ("Базовое состояние", self.base_box),
-                         ("Скаляр для боксплотов", self.scalar_box),
-                         ("Контраст: от", self.state_a),
-                         ("Контраст: к", self.state_b)):
+                         ("Базовое состояние", self.base_box)):
             mv.addWidget(QLabel(f"<b>{title}</b>"))
             mv.addWidget(w)
+        mv.addWidget(self.show_runs)
         mv.addWidget(self.btn_apply)
         mv.addWidget(self.btn_export)
         mv.addSpacing(8)
@@ -259,42 +235,69 @@ class GroupViewer(QWidget):
     # ------------------------------------------------------------------ #
     # Building the group
     # ------------------------------------------------------------------ #
-    def _scan(self) -> None:
-        start = str(self.runs[-1].root.parent) if self.runs else ""
-        folder = QFileDialog.getExistingDirectory(self, "Папка с посчитанными прогонами", start)
-        if not folder:
-            return
-        found = G.scan_runs(Path(folder))
+    def _mode(self) -> str:
+        return self.group_box.currentData() or "level"
+
+    def _add_runs(self, found: list[G.GroupRun]) -> int:
         known = {str(r.root) for r in self.runs}
         added = [r for r in found if str(r.root) not in known]
         self.runs.extend(added)
-        self.runs.sort(key=lambda r: (r.subject, G._state_order_key(r.state)))
+        self.runs.sort(key=lambda r: (r.tags.get("cohort", ""), r.subject, r.state))
         self._fill_table()
+        return len(added)
+
+    def _add_dataset(self) -> None:
+        roots = [r for r in G.NEUROSOFT_ROOTS if r.exists()]
+        if not roots:
+            self.status.setText("Лабораторный диск не смонтирован — добавьте папку вручную.")
+            return
+        n = self._add_runs(G.scan_neurosoft(roots, self._mode()))
+        self.status.setText(f"Добавлено записей: {n}. Всего в группе: {len(self.runs)}. "
+                            "Отметьте нужные и нажмите «Перечитать с диска».")
+
+    def _scan(self) -> None:
+        start = str(self.runs[-1].root.parent) if self.runs else ""
+        folder = QFileDialog.getExistingDirectory(self, "Папка с обработанными записями", start)
+        if not folder:
+            return
+        n = self._add_runs(G.scan_neurosoft([Path(folder)], self._mode()))
         self.status.setText(
-            f"Добавлено прогонов: {len(added)}. Всего в группе: {len(self.runs)}."
-            + ("" if added else " Ничего нового не найдено — проверьте, что внутри "
-                                "лежат посчитанные папки с Excel/Large_dataset_emg_response_metrics.csv.")
-        )
+            f"Добавлено записей: {n}. Всего в группе: {len(self.runs)}."
+            + ("" if n else " Ничего нового: внутри нет папок с "
+                            "Excel/Large_dataset_emg_response_metrics.csv."))
 
     def add_run(self, root: Path) -> None:
-        """Put the run currently open in the main window into the group."""
+        """Put the run open in the main window into the group."""
         root = Path(root)
-        if not G.looks_like_run(root) or any(str(r.root) == str(root) for r in self.runs):
+        if not G.looks_like_run(root):
             return
-        subject, state = G.parse_labels(root)
-        self.runs.append(G.GroupRun(root, subject, state))
-        self._fill_table()
+        tags = G.parse_neurosoft(root)
+        self._add_runs([G.GroupRun(root, tags["subject"],
+                                   G.state_from_tags(tags, self._mode()), tags=tags)])
 
     def _clear(self) -> None:
-        self.runs, self.points = [], pd.DataFrame()
-        self.normalised, self.scalars = pd.DataFrame(), pd.DataFrame()
+        self.runs, self.points_all, self.normalised = [], pd.DataFrame(), pd.DataFrame()
         self._fill_table()
-        for fig in self.figs.values():
-            fig.clear()
-        for c in self.canvases.values():
-            c.draw_idle()
-        self.stats.setRowCount(0)
+        self.channel_list.clear()
+        self._blank()
         self.status.setText("Группа пуста.")
+
+    def _set_all(self, on: bool) -> None:
+        for r in self.runs:
+            r.include = on
+        self._fill_table()
+
+    def _regroup(self) -> None:
+        """The state definition changed: rebuild every state from its tags."""
+        mode = self._mode()
+        for r in self.runs:
+            if r.tags:
+                r.state = G.state_from_tags(r.tags, mode)
+        if not self.points_all.empty:
+            self.points_all["state"] = self.points_all["run"].map(
+                {str(r.root): r.state for r in self.runs}).fillna(self.points_all["state"])
+        self._fill_table()
+        self._on_pick()
 
     def _fill_table(self) -> None:
         self.table.blockSignals(True)
@@ -305,11 +308,15 @@ class GroupViewer(QWidget):
             check.setCheckState(Qt.Checked if run.include else Qt.Unchecked)
             self.table.setItem(i, 0, check)
             self.table.setItem(i, 1, QTableWidgetItem(run.subject))
-            self.table.setItem(i, 2, QTableWidgetItem(run.state))
+            for col, key in ((2, "cohort"), (3, "level"), (4, "scenario")):
+                item = QTableWidgetItem(run.tags.get(key, "—"))
+                item.setFlags(Qt.ItemIsEnabled)
+                self.table.setItem(i, col, item)
+            self.table.setItem(i, 5, QTableWidgetItem(run.state))
             path = QTableWidgetItem(run.root.name)
             path.setFlags(Qt.ItemIsEnabled)
             path.setToolTip(str(run.root))
-            self.table.setItem(i, 3, path)
+            self.table.setItem(i, 6, path)
         self.table.resizeColumnsToContents()
         self.table.blockSignals(False)
         self._fill_states()
@@ -323,42 +330,40 @@ class GroupViewer(QWidget):
             run.include = item.checkState() == Qt.Checked
         elif item.column() == 1:
             run.subject = item.text().strip() or run.subject
-        elif item.column() == 2:
-            # Typed by hand precisely because the guess can be wrong, and a wrong
-            # state label is the one error here that no statistic will reveal.
+        elif item.column() == 5:
             run.state = item.text().strip() or run.state
+            if not self.points_all.empty:
+                self.points_all.loc[self.points_all["run"] == str(run.root), "state"] = run.state
         self._fill_states()
+        if item.column() in (1, 5):
+            self._on_pick()
 
     def _fill_states(self) -> None:
         states = G.sort_states(r.state for r in self.runs if r.include)
-        for box, keep_first in ((self.base_box, True), (self.state_a, True),
-                                (self.state_b, False)):
-            current = box.currentText()
-            box.blockSignals(True)
-            box.clear()
-            box.addItems(states)
-            if current in states:
-                box.setCurrentText(current)
-            elif states:
-                box.setCurrentIndex(0 if keep_first else min(1, len(states) - 1))
-            box.blockSignals(False)
+        current = self.base_box.currentText()
+        self.base_box.blockSignals(True)
+        self.base_box.clear()
+        self.base_box.addItems(states)
+        if current in states:
+            self.base_box.setCurrentText(current)
+        self.base_box.blockSignals(False)
 
     # ------------------------------------------------------------------ #
     # Reading and analysing
     # ------------------------------------------------------------------ #
-    def _selected(self, widget: QListWidget) -> list[str] | None:
-        picked = [i.text() for i in widget.selectedItems()]
+    def _picked_channels(self) -> list[str] | None:
+        picked = [i.text() for i in self.channel_list.selectedItems()]
         return picked or None
 
     def _recompute(self) -> None:
         active = [r for r in self.runs if r.include]
         if not active:
-            self.status.setText("Ни один прогон не отмечен.")
+            self.status.setText("Ни одна запись не отмечена.")
             return
         if self._collector is not None and self._collector.isRunning():
             return
         self.btn_apply.setEnabled(False)
-        self._collector = _Collector(active, None, None)
+        self._collector = _Collector(active)
         self._collector.progress.connect(self.status.setText)
         self._collector.done.connect(self._on_collected)
         self._collector.start()
@@ -371,19 +376,20 @@ class GroupViewer(QWidget):
             return
         self.points_all = points if points is not None else pd.DataFrame()
         if self.points_all.empty:
-            self.status.setText("В отмеченных прогонах нет ни одной точки.")
-            self._blank("В отмеченных прогонах нет ни одной точки.")
+            self.status.setText("В отмеченных записях нет ни одной точки.")
+            self._blank("В отмеченных записях нет ни одной точки.")
             return
-        self._fill_pickers()
+        # A Neurosoft export is one configuration; its name is the recording's,
+        # so it must not split the group. One label for all of them.
+        self.points_all["config"] = "Neurosoft"
+        self._fill_channels()
         self._analyse()
 
     def _on_pick(self) -> None:
-        """A picker or a combo changed: re-filter and redraw, nothing re-read."""
         if not self.points_all.empty:
             self._analyse()
 
     def _blank(self, message: str = "") -> None:
-        """Clear every view — stale panels must never outlive the data they drew."""
         for key, fig in self.figs.items():
             fig.clear()
             if message:
@@ -394,70 +400,91 @@ class GroupViewer(QWidget):
         self.stats.setRowCount(0)
         self.stats.setColumnCount(0)
 
-    def _fill_pickers(self) -> None:
-        """Offer what the group actually contains, keeping what was already picked."""
-        for widget, column in ((self.config_list, "config"), (self.channel_list, "channel")):
-            picked = {i.text() for i in widget.selectedItems()}
-            values = sorted(self.points_all[column].dropna().unique().tolist(),
-                            key=lambda s: (len(s), s))
-            widget.blockSignals(True)
-            widget.clear()
-            widget.addItems(values)
-            for i in range(widget.count()):
-                if widget.item(i).text() in picked:
-                    widget.item(i).setSelected(True)
-            widget.blockSignals(False)
+    def _fill_channels(self) -> None:
+        picked = {i.text() for i in self.channel_list.selectedItems()}
+        values = sorted(self.points_all["channel"].dropna().unique().tolist(),
+                        key=lambda s: (len(s), s))
+        self.channel_list.blockSignals(True)
+        self.channel_list.clear()
+        self.channel_list.addItems(values)
+        for i in range(self.channel_list.count()):
+            if self.channel_list.item(i).text() in picked:
+                self.channel_list.item(i).setSelected(True)
+        # Nothing picked yet: start from the first channel rather than all
+        # eight at once — one muscle at a time is how the overlay is read.
+        if not picked and self.channel_list.count():
+            self.channel_list.item(0).setSelected(True)
+        self.channel_list.blockSignals(False)
 
     def _analyse(self) -> None:
-        picked = self._selected(self.config_list)
-        pts = self.points_all
-        if picked:
-            pts = pts[pts["config"].isin(set(picked))]
-        self.points = pts
-        if self.points.empty:
-            self.status.setText("Для выбранных конфигураций нет точек.")
-            self._blank("Для выбранных конфигураций нет точек.")
-            return
         metric = self.metric_box.currentData()
         mode = self.norm_box.currentData()
         baseline = self.base_box.currentText()
-        factors = G.normalisation_factors(self.points, baseline, mode, metric=metric)
-        self.normalised, self._missing = G.apply_normalisation(self.points, factors, metric)
-        self.scalars = G.curve_scalars(self.normalised)
-
-        self._palette = _state_colors(
-            G.sort_states(r.state for r in self.runs if r.include))
-        inv = G.inventory(self.points)
-        n_sub = self.points["subject"].nunique()
-        bits = [f"{len(self.points)} точек · {n_sub} субъект(ов) · "
-                f"{self.points['run'].nunique()} прогонов"]
+        factors = G.normalisation_factors(self.points_all, baseline, mode, metric=metric)
+        self.normalised, self._missing = G.apply_normalisation(self.points_all, factors, metric)
+        self._palette = {s: STATE_COLORS[i % len(STATE_COLORS)] for i, s in enumerate(
+            G.sort_states(r.state for r in self.runs if r.include))}
+        n_sub = self.points_all["subject"].nunique()
+        bits = [f"{self.points_all['run'].nunique()} записей · {n_sub} субъект(ов) · "
+                f"{self.points_all['state'].nunique()} состояний"]
         if mode != G.NORM_NONE and not metric.endswith("_ms"):
             bits.append(f"нормировка: {G.NORM_LABELS[mode]} ({baseline})")
         if self._missing:
-            shown = ", ".join(self._missing[:6])
-            more = f" и ещё {len(self._missing) - 6}" if len(self._missing) > 6 else ""
-            bits.append(f"без базовой записи (исключены из нормировки): {shown}{more}")
-        if not inv.empty:
-            best = inv.iloc[0]
-            bits.append(f"самая представленная пара: {best['config']} / {best['channel']} "
-                        f"— {int(best['subjects'])} субъект(ов)")
+            shown = ", ".join(self._missing[:5])
+            more = f" и ещё {len(self._missing) - 5}" if len(self._missing) > 5 else ""
+            bits.append(f"без базовой записи: {shown}{more}")
         self.status.setText("  ·  ".join(bits))
         self._autoscale()
+        self._fill_stats()
         self._draw()
+
+    def _fill_stats(self) -> None:
+        """Per state and channel: recordings, subjects, curves, and the metric's max/mean."""
+        if self.normalised.empty:
+            self.stats.setRowCount(0)
+            return
+        d = self.normalised.dropna(subset=["value"])
+        picked = self._picked_channels()
+        if picked:
+            d = d[d["channel"].isin(set(picked))]
+        if d.empty:
+            self.stats.setRowCount(0)
+            self.stats.setColumnCount(0)
+            return
+        peak = d.groupby(["state", "channel", "run"])["value"].max().reset_index()
+        g = peak.groupby(["state", "channel"])
+        table = pd.DataFrame({
+            "записей": g["run"].nunique(),
+            "максимум: медиана": g["value"].median(),
+            "максимум: среднее": g["value"].mean(),
+            "максимум: SD": g["value"].std(),
+        }).reset_index()
+        table["state"] = pd.Categorical(table["state"], G.sort_states(table["state"]))
+        table = table.sort_values(["channel", "state"])
+        self.stats.setRowCount(len(table))
+        self.stats.setColumnCount(len(table.columns))
+        self.stats.setHorizontalHeaderLabels([str(c) for c in table.columns])
+        for i, (_, row) in enumerate(table.iterrows()):
+            for j, col in enumerate(table.columns):
+                v = row[col]
+                if isinstance(v, (int, float, np.floating)) and not isinstance(v, bool):
+                    text = "" if pd.isna(v) else f"{v:.3g}"
+                else:
+                    text = str(v)
+                self.stats.setItem(i, j, QTableWidgetItem(text))
+        self.stats.resizeColumnsToContents()
 
     # ------------------------------------------------------------------ #
     # Drawing
     # ------------------------------------------------------------------ #
     def _autoscale(self) -> None:
-        """Fill the shared limits from everything selected, once."""
         if self.normalised.empty:
             return
         x = pd.to_numeric(self.normalised["x_value"], errors="coerce").dropna()
         y = pd.to_numeric(self.normalised["value"], errors="coerce").dropna()
         if x.empty or y.empty:
             return
-        for box, val in ((self.x_lo, float(x.quantile(0.01))),
-                         (self.x_hi, float(x.quantile(0.99))),
+        for box, val in ((self.x_lo, float(x.min())), (self.x_hi, float(x.max())),
                          (self.y_lo, min(0.0, float(y.quantile(0.01)))),
                          (self.y_hi, float(y.quantile(0.99)) * 1.05)):
             box.blockSignals(True)
@@ -473,7 +500,7 @@ class GroupViewer(QWidget):
             ax.set_ylim(self.y_lo.value(), self.y_hi.value())
 
     def _channels_to_draw(self) -> list[str]:
-        picked = self._selected(self.channel_list)
+        picked = self._picked_channels()
         available = sorted(self.normalised["channel"].dropna().unique().tolist(),
                            key=lambda s: (len(s), s))
         return [c for c in available if picked is None or c in set(picked)]
@@ -481,269 +508,169 @@ class GroupViewer(QWidget):
     def _unit(self) -> str:
         return str(self.normalised["unit"].iloc[0]) if not self.normalised.empty else ""
 
-
     def _fit_canvas(self, key: str, nrow: int) -> None:
-        """Give the canvas ~2.6 in per row of panels; the scroll area does the rest."""
+        """~2.6 in per row of panels; the scroll area does the rest.
+
+        The Qt canvas keeps figure.dpi multiplied by the device pixel ratio, so
+        widget sizes (logical pixels) are scaled the same way before they
+        become inches — otherwise on a Retina screen the rendered buffer covers
+        a quarter of the widget and Qt hatches the rest.
+        """
         canvas = self.canvases[key]
-        # The Qt canvas keeps figure.dpi multiplied by the device pixel ratio,
-        # so widget sizes (logical pixels) must be scaled the same way before
-        # they become inches — otherwise on a Retina screen the rendered buffer
-        # covers a quarter of the widget and Qt hatches the rest.
         ratio = float(getattr(canvas, "device_pixel_ratio", 1.0) or 1.0)
         dpi = self.figs[key].get_dpi()
         height = int(max(nrow, 1) * 2.6 * dpi / ratio) + 60
+        # Never shorter than the viewport: a figure smaller than its widget
+        # leaves the rest of the widget unpainted.
+        parent = canvas.parentWidget()
+        if parent is not None:
+            height = max(height, parent.height())
         canvas.setMinimumHeight(height)
         width = max(canvas.width(), 600)
         self.figs[key].set_size_inches(width * ratio / dpi, height * ratio / dpi,
                                        forward=False)
 
+    def _style(self, ax, title: str) -> None:
+        ax.set_title(title, fontsize=9, loc="left")
+        ax.grid(True, color="0.93", lw=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+
+    def _empty_panel(self, ax, title: str, text: str = "нет данных") -> None:
+        ax.text(0.5, 0.5, text, ha="center", va="center", color="0.6", fontsize=9,
+                transform=ax.transAxes)
+        ax.set_title(title, fontsize=9, loc="left")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for side in ("top", "right", "left", "bottom"):
+            ax.spines[side].set_visible(False)
+
     def _draw(self) -> None:
         if self.normalised.empty:
             return
-        key = ["overlay", "mean", "box", "waves"][self.views.currentIndex()]
+        key = VIEWS[self.views.currentIndex()]
         fig = self.figs[key]
         fig.clear()
-        if not self._channels_to_draw():
-            ax = fig.add_subplot(111)
-            ax.text(0.5, 0.5, "Для выбранных каналов нет точек.", ha="center",
-                    va="center", color="gray")
-            ax.set_axis_off()
-            self.canvases[key].draw()
-            return
         try:
-            getattr(self, f"_draw_{key}")(fig)
+            if not self._channels_to_draw():
+                self._fit_canvas(key, 1)
+                ax = fig.add_subplot(111)
+                ax.text(0.5, 0.5, "Выберите канал в списке слева.", ha="center",
+                        va="center", color="gray")
+                ax.set_axis_off()
+            else:
+                getattr(self, f"_draw_{key}")(fig)
         except Exception as exc:                      # noqa: BLE001 - drawn, not raised
             ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, f"{type(exc).__name__}: {exc}", ha="center", va="center",
                     color="#b00", wrap=True)
             ax.set_axis_off()
         self.canvases[key].draw()
+        self._fill_stats()
 
     def _draw_overlay(self, fig) -> None:
-        """Every run's own curve, before any averaging."""
+        """Every recording's own curve, before any averaging."""
         channels = self._channels_to_draw()
-        if not channels:
-            return
         states = G.sort_states(self.normalised["state"])
-        colors = self._palette
         nrow, ncol = _grid(len(channels))
-        self._fit_canvas(key_of(fig, self), nrow)
+        self._fit_canvas("overlay", nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
             d = self.normalised[self.normalised["channel"] == ch]
             drawn = 0
-            for (subject, state, config), grp in d.groupby(["subject", "state", "config"]):
+            for (subject, state, run), grp in d.groupby(["subject", "state", "run"]):
                 g = grp.dropna(subset=["x_value", "value"]).sort_values("x_value")
                 if g.empty:
                     continue
                 drawn += 1
-                ax.plot(g["x_value"], g["value"], "-", lw=0.9,
-                        color=colors.get(state, "0.5"), alpha=0.65)
-                ax.plot(g["x_value"], g["value"], "o", ms=1.8,
-                        color=colors.get(state, "0.5"), alpha=0.65)
+                ax.plot(g["x_value"], g["value"], "-", lw=0.9, alpha=0.6,
+                        color=self._palette.get(state, "0.5"))
             if not drawn:
-                ax.text(0.5, 0.5, "нет данных", ha="center", va="center",
-                        color="0.6", fontsize=9, transform=ax.transAxes)
-            ax.set_title(f"{ch}  (n={drawn})", fontsize=9, loc="left")
-            ax.grid(True, color="0.93", lw=0.6)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
+                self._empty_panel(ax, ch)
+                continue
+            self._style(ax, f"{ch}  (записей: {drawn})")
             self._apply_limits(ax)
         for j in range(len(channels), nrow * ncol):
             axes[j // ncol][j % ncol].set_axis_off()
-        handles = [Line2D([], [], color=colors[s], label=s) for s in states]
-        fig.legend(handles=handles, loc="outside lower center", ncol=min(len(states), 6),
+        handles = [Line2D([], [], color=self._palette.get(s, "0.5"), label=s) for s in states]
+        fig.legend(handles=handles, loc="outside lower center", ncol=min(len(states), 5),
                    frameon=False, fontsize=8)
-        fig.supxlabel("stimulation amplitude, mA", fontsize=9)
+        fig.supxlabel("номер кривой в развертке", fontsize=9)
         fig.supylabel(self._unit(), fontsize=9)
 
     def _draw_mean(self, fig) -> None:
-        """Mean ± SE across subjects, on one current axis."""
+        """Mean ± SE across recordings of a state, on the shared curve axis."""
         channels = self._channels_to_draw()
-        if not channels:
-            return
         states = G.sort_states(self.normalised["state"])
-        colors = self._palette
-        grid = G.common_grid(self.normalised, 40)
-        on_grid = G.interpolate_to_grid(self.normalised, grid)
-        gm = G.group_mean(on_grid)
+        grid = G.common_grid(self.normalised, 60, q=0.0)
+        gm = G.group_mean(G.interpolate_to_grid(self.normalised, grid))
         nrow, ncol = _grid(len(channels))
-        self._fit_canvas(key_of(fig, self), nrow)
+        self._fit_canvas("mean", nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
-            d = gm[gm["channel"] == ch]
+            d = gm[gm["channel"] == ch] if not gm.empty else gm
+            if d.empty:
+                self._empty_panel(ax, ch, "меньше двух записей")
+                continue
             for state in states:
                 s = d[d["state"] == state].sort_values("x")
                 if s.empty:
                     continue
-                color = colors.get(state, "0.5")
-                ax.plot(s["x"], s["mean"], "-", lw=1.6, color=color)
+                color = self._palette.get(state, "0.5")
+                ax.plot(s["x"], s["mean"], "-", lw=1.6, color=color,
+                        label=f"{state} (n≤{int(s['n'].max())})")
                 ax.fill_between(s["x"], s["mean"] - s["se"], s["mean"] + s["se"],
                                 color=color, alpha=0.18, lw=0)
-                # n changes ALONG the axis: subjects drop out where their own
-                # sweep stopped. The label says the most anyone had.
-                ax.plot([], [], color=color, label=f"{state} (n≤{int(s['n'].max())})")
-            if d.empty:
-                ax.text(0.5, 0.5, "меньше двух субъектов", ha="center", va="center",
-                        color="0.6", fontsize=9, transform=ax.transAxes)
-            ax.set_title(ch, fontsize=9, loc="left")
-            ax.grid(True, color="0.93", lw=0.6)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            if i == 0 and not d.empty:
-                ax.legend(fontsize=7, frameon=False)
+            self._style(ax, ch)
+            ax.legend(fontsize=7, frameon=False)
             self._apply_limits(ax)
         for j in range(len(channels), nrow * ncol):
             axes[j // ncol][j % ncol].set_axis_off()
-        fig.supxlabel("stimulation amplitude, mA", fontsize=9)
-        fig.supylabel(self._unit(), fontsize=9)
+        fig.supxlabel("номер кривой в развертке", fontsize=9)
+        fig.supylabel(f"{self._unit()}, среднее ± SE", fontsize=9)
 
-    def _draw_box(self, fig) -> None:
-        """One number per curve, spread across subjects, plus the paired contrast."""
-        if self.scalars.empty:
-            return
-        scalar = self.scalar_box.currentData()
+    def _draw_waves(self, fig) -> None:
+        """Response waveforms: per state the mean across recordings with a 95 % CI."""
         channels = self._channels_to_draw()
-        states = G.sort_states(self.scalars["state"])
-        colors = self._palette
+        active = [r for r in self.runs if r.include]
         nrow, ncol = _grid(len(channels))
-        self._fit_canvas(key_of(fig, self), nrow)
+        self._fit_canvas("waves", nrow)
         axes = fig.subplots(nrow, ncol, squeeze=False)
         for i, ch in enumerate(channels):
             ax = axes[i // ncol][i % ncol]
-            d = self.scalars[self.scalars["channel"] == ch]
-            data, labels, used = [], [], []
-            for state in states:
-                vals = pd.to_numeric(d[d["state"] == state][scalar],
-                                     errors="coerce").dropna()
-                if vals.empty:
-                    continue
-                data.append(vals.to_numpy())
-                labels.append(f"{state}\nn={len(vals)}")
-                used.append(state)
-            if not data:
-                # An empty panel that keeps its title says "nothing here for
-                # this channel"; a vanished panel says nothing at all.
-                ax.text(0.5, 0.5, "нет данных", ha="center", va="center",
-                        color="0.6", fontsize=9, transform=ax.transAxes)
-                ax.set_title(ch, fontsize=9, loc="left")
-                ax.set_xticks([])
-                ax.set_yticks([])
-                for side in ("top", "right", "left", "bottom"):
-                    ax.spines[side].set_visible(False)
+            times, loaded = G.collect_waveforms(active, None, ch)
+            summary = G.waveform_summary(times, loaded)
+            if summary.empty:
+                self._empty_panel(ax, ch, "нет сохранённых эпох")
                 continue
-            # tick_labels since matplotlib 3.9; labels before it.
-            try:
-                bp = ax.boxplot(data, tick_labels=labels, patch_artist=True, widths=0.6)
-            except TypeError:
-                bp = ax.boxplot(data, labels=labels, patch_artist=True, widths=0.6)
-            for patch, state in zip(bp["boxes"], used):
-                patch.set_facecolor(colors.get(state, "0.7"))
-                patch.set_alpha(0.45)
-            for med in bp["medians"]:
-                med.set_color("0.15")
-            # Every subject as a point on its box: with a dozen animals the box
-            # hides how many there were and whether one of them carries it.
-            for pos, vals in enumerate(data, start=1):
-                jitter = (np.linspace(-0.13, 0.13, len(vals)) if len(vals) > 1
-                          else np.array([0.0]))
-                ax.plot(pos + jitter, vals, "o", ms=3, color="0.25", alpha=0.7, zorder=3)
-            ax.set_title(ch, fontsize=9, loc="left")
-            ax.tick_params(axis="x", labelsize=7 if len(used) <= 4 else 6)
-            if len(used) > 4:
-                for lab in ax.get_xticklabels():
-                    lab.set_rotation(35)
-                    lab.set_ha("right")
-            ax.grid(True, axis="y", color="0.93", lw=0.6)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            self._apply_limits(ax, x=False, y=(scalar == "max"))
+            if self.show_runs.isChecked():
+                for d in loaded:
+                    ax.plot(times * 1e3, d["wave"], lw=0.5, alpha=0.25,
+                            color=self._palette.get(d["run"].state, "0.5"))
+            for state in G.sort_states(summary["state"]):
+                s = summary[summary["state"] == state]
+                color = self._palette.get(state, "0.5")
+                n = int(s["n"].iloc[0])
+                ax.plot(s["t"] * 1e3, s["mean"], lw=1.7, color=color,
+                        label=f"{state} (n={n})")
+                if n >= 2:
+                    ax.fill_between(s["t"] * 1e3, s["lo"], s["hi"], color=color,
+                                    alpha=0.2, lw=0)
+            ax.axvline(0, color="0.4", lw=0.8, ls="--")
+            # The y range follows the group band, not the loudest single trace:
+            # one recording's 4 mV artifact would otherwise flatten every mean.
+            lo, hi = float(summary["lo"].min()), float(summary["hi"].max())
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                pad = 0.25 * (hi - lo)
+                ax.set_ylim(lo - pad, hi + pad)
+            self._style(ax, f"{ch} — сильнейший ответ каждой записи")
+            ax.legend(fontsize=7, frameon=False)
+            ax.set_xlabel("мс от стимула", fontsize=8)
         for j in range(len(channels), nrow * ncol):
             axes[j // ncol][j % ncol].set_axis_off()
-        fig.supylabel(G.SCALARS.get(scalar, scalar), fontsize=9)
-        self._fill_contrast(scalar)
-
-    def _fill_contrast(self, scalar: str) -> None:
-        a, b = self.state_a.currentText(), self.state_b.currentText()
-        if not a or not b or a == b:
-            self.stats.setRowCount(0)
-            self.stats.setColumnCount(0)
-            return
-        table = G.contrast(self.scalars, a, b, scalar)
-        if table.empty:
-            self.stats.setRowCount(0)
-            self.stats.setColumnCount(0)
-            return
-        picked = self._selected(self.channel_list)
-        if picked:
-            table = table[table["channel"].isin(set(picked))]
-        self.stats.setRowCount(len(table))
-        self.stats.setColumnCount(len(table.columns))
-        self.stats.setHorizontalHeaderLabels([str(c) for c in table.columns])
-        for i, (_, row) in enumerate(table.iterrows()):
-            for j, col in enumerate(table.columns):
-                v = row[col]
-                text = f"{v:.3g}" if isinstance(v, (int, float, np.floating)) \
-                    and not isinstance(v, bool) else str(v)
-                item = QTableWidgetItem(text)
-                if col == "baseline_is_constant" and bool(v):
-                    item.setToolTip(
-                        "Базовое состояние нормировано само на себя, поэтому его "
-                        "значения равны 1 по построению. Это одновыборочная "
-                        "проверка «отношение отличается от 1», а не сравнение "
-                        "двух измерений.")
-                self.stats.setItem(i, j, item)
-        self.stats.resizeColumnsToContents()
-
-    def _draw_waves(self, fig) -> None:
-        """The response shapes themselves, from several runs on one time axis."""
-        configs = self._selected(self.config_list) or sorted(
-            self.normalised["config"].unique())
-        channels = self._channels_to_draw()
-        if not configs or not channels:
-            return
-        config, channel = configs[0], channels[0]
-        active = [r for r in self.runs if r.include]
-        times, loaded = G.collect_waveforms(active, config, channel)
-        self._fit_canvas(key_of(fig, self), 1)
-        ax = fig.add_subplot(111)
-        if not len(times) or not loaded:
-            ax.text(0.5, 0.5, "Нет сохранённых эпох для этой пары "
-                              "конфигурация/канал.", ha="center", va="center",
-                    color="gray")
-            ax.set_axis_off()
-            return
-        colors = self._palette
-        for d in loaded:
-            run = d["run"]
-            ax.plot(times * 1e3, d["wave"], lw=1.1,
-                    color=colors.get(run.state, "0.5"), alpha=0.85)
-        ax.axvline(0, color="0.4", lw=0.8, ls="--")
-        ax.set_xlabel("ms from stimulus")
-        ax.set_ylabel("µV")
-        ax.set_title(f"{config} · {channel} — сильнейший ответ каждого прогона "
-                     f"({len(loaded)} прогонов)", fontsize=10, loc="left")
-        # One legend entry per STATE, not per run: forty-three named runs cover
-        # the plot they are supposed to explain. Which run is which is a question
-        # for the run table on the left, where the answer is already written.
-        drawn = G.sort_states(d["run"].state for d in loaded)
-        counts = {st: sum(1 for d in loaded if d["run"].state == st) for st in drawn}
-        ax.legend(handles=[Line2D([], [], color=colors.get(st, "0.5"),
-                                  label=f"{st} (n={counts[st]})") for st in drawn],
-                  fontsize=7, frameon=False, ncol=min(len(drawn), 5),
-                  loc="upper right")
-        ax.grid(True, color="0.93", lw=0.6)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        # The time axis here is the INTERSECTION of the runs' own windows, so it
-        # is already common; only y is shared with the other views on request.
-        if self.lock_axes.isChecked():
-            span = max(abs(np.nanmin([d["wave"].min() for d in loaded])),
-                       abs(np.nanmax([d["wave"].max() for d in loaded])))
-            if np.isfinite(span) and span > 0:
-                ax.set_ylim(-span * 1.05, span * 1.05)
+        fig.supylabel("µV, среднее по записям и 95 % ДИ", fontsize=9)
 
     # ------------------------------------------------------------------ #
     def _export(self) -> None:
@@ -754,27 +681,27 @@ class GroupViewer(QWidget):
             return
         out = Path(folder)
         written = []
-        self.normalised.to_csv(out / "group_points_long.csv", index=False)
-        written.append("group_points_long.csv")
-        if not self.scalars.empty:
-            self.scalars.to_csv(out / "group_curve_scalars.csv", index=False)
-            written.append("group_curve_scalars.csv")
-        grid = G.common_grid(self.normalised, 40)
+        self.normalised.to_csv(out / "neurosoft_group_points_long.csv", index=False)
+        written.append("neurosoft_group_points_long.csv")
+        grid = G.common_grid(self.normalised, 60, q=0.0)
         gm = G.group_mean(G.interpolate_to_grid(self.normalised, grid))
         if not gm.empty:
-            gm.to_csv(out / "group_mean_on_grid.csv", index=False)
-            written.append("group_mean_on_grid.csv")
-        a, b = self.state_a.currentText(), self.state_b.currentText()
-        if a and b and a != b and not self.scalars.empty:
-            c = G.contrast(self.scalars, a, b, self.scalar_box.currentData())
-            if not c.empty:
-                name = f"group_contrast_{a}_vs_{b}.csv".replace(" ", "_").replace("/", "-")
-                c.to_csv(out / name, index=False)
-                written.append(name)
-        # The membership table is what the numbers cannot be rebuilt without:
-        # which run was which subject in which state, as it was on screen.
+            gm.to_csv(out / "neurosoft_group_mean.csv", index=False)
+            written.append("neurosoft_group_mean.csv")
+        active = [r for r in self.runs if r.include]
+        frames = []
+        for ch in self._channels_to_draw():
+            times, loaded = G.collect_waveforms(active, None, ch)
+            s = G.waveform_summary(times, loaded)
+            if not s.empty:
+                s.insert(0, "channel", ch)
+                frames.append(s)
+        if frames:
+            pd.concat(frames).to_csv(out / "neurosoft_group_waveforms_ci.csv", index=False)
+            written.append("neurosoft_group_waveforms_ci.csv")
         pd.DataFrame([{"subject": r.subject, "state": r.state, "included": r.include,
+                       **{k: v for k, v in r.tags.items() if k != "subject"},
                        "run": str(r.root)} for r in self.runs]).to_csv(
-            out / "group_membership.csv", index=False)
-        written.append("group_membership.csv")
+            out / "neurosoft_group_membership.csv", index=False)
+        written.append("neurosoft_group_membership.csv")
         self.status.setText("Выгружено: " + ", ".join(written))

@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         # open: it reads finished runs off disk and compares them. So it stays
         # enabled whatever mode the current recording is in, and survives
         # opening another one.
-        self.tabs.addTab(self.group_viewer, "Group: stimulation")      # TAB_GROUP
+        self.tabs.addTab(self.group_viewer, "Group: Neurosoft")        # TAB_GROUP
         self.tabs.addTab(self.group_spont_viewer, "Group: spontaneous")  # TAB_GROUP_SPONT
         self.tabs.currentChanged.connect(self._on_tab_changed)
 

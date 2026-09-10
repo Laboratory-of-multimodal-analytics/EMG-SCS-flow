@@ -136,6 +136,8 @@ class GroupRun:
     state: str
     include: bool = True
     note: str = ""
+    #: everything the name could be read for (Neurosoft runs); see parse_neurosoft
+    tags: dict = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -522,7 +524,7 @@ def contrast(scalars: pd.DataFrame, state_a: str, state_b: str,
 # --------------------------------------------------------------------------- #
 # Waveforms across runs
 # --------------------------------------------------------------------------- #
-def collect_waveforms(runs, config: str, channel: str, at_x: float | None = None,
+def collect_waveforms(runs, config: str | None, channel: str, at_x: float | None = None,
                       n_times: int = 400) -> tuple[np.ndarray, list[dict]]:
     """Mean response shapes from several runs on one time axis.
 
@@ -545,12 +547,16 @@ def collect_waveforms(runs, config: str, channel: str, at_x: float | None = None
             continue
         try:
             res = SIRResults(Path(run.root))
-            if not res.ok or config not in res.configs:
+            if not res.ok:
                 continue
-            times, waves, labels = res.scenario_waves(config)
+            # None = the run's own configuration: a Neurosoft export has one.
+            cfg = config if config is not None else res.configs[0]
+            if cfg not in res.configs:
+                continue
+            times, waves, labels = res.scenario_waves(cfg)
             if times is None or channel not in waves:
                 continue
-            pts = res.recruitment_points(config)
+            pts = res.recruitment_points(cfg)
             pts = pts[pts["channel" if "channel" in pts else "Channel"] == channel] \
                 if not pts.empty else pts
         except Exception:
@@ -585,3 +591,195 @@ def collect_waveforms(runs, config: str, channel: str, at_x: float | None = None
         d["wave"] = np.interp(grid, d["times"], d["wave"])
         d.pop("times")
     return grid, loaded
+
+
+# --------------------------------------------------------------------------- #
+# Neurosoft recordings: labels from the recording names
+# --------------------------------------------------------------------------- #
+#: Where the processed Neurosoft array lives on the lab Drive (two roots).
+NEUROSOFT_ROOTS = [
+    Path("/Users/dkleeva/Library/CloudStorage/GoogleDrive-lma.lab.fccps@gmail.com/My Drive/"
+         "Spinal cord injury/Neurosoft data/Травма спинного мозга"),
+    Path("/Users/dkleeva/Library/CloudStorage/GoogleDrive-lma.lab.fccps@gmail.com/My Drive/"
+         "Spinal cord injury/Neurosoft data/Контроль"),
+]
+
+_LEVEL = re.compile(
+    r"(?<![A-Za-zА-Яа-я])(th|t|т|тh|c|с|l|л|д)\s*[-_]?\s*(\d{1,2})\s*[-–—]\s*(th|t|т|c|с|l|л|д)?\s*(\d{1,2})",
+    re.I)
+_LEFT = re.compile(r"\bлев\w*|\bleft\b|\bL\b|слева|лев\b", re.I)
+_RIGHT = re.compile(r"\bправ\w*|\bпр\b|\bright\b|\bR\b|справа", re.I)
+_POSITION = re.compile(r"\b(supine|side|upright|prone)\b", re.I)
+_POLARITY = re.compile(r"\b(black|red)\b", re.I)
+_MUSCLE = {
+    "Soleus": re.compile(r"sol\w*|сол\w*", re.I),
+    "GM": re.compile(r"\bGM\b|гастр\w*|gastroc\w*", re.I),
+    "FCU": re.compile(r"\bFCU\b", re.I),
+}
+_SCENARIO_WORDS = {
+    "Jendrassik": re.compile(r"ендр\w*|jendr\w*|\bJM\b|челюсть|зубы", re.I),
+    "Paired stimulation": re.compile(r"2\s*stim|2\s*ст\w*|paired|paried|двойн\w*", re.I),
+    "H-reflex": re.compile(r"h[\s-]*reflex|н[\s-]*рефлекс|h\s*refl\w*", re.I),
+    "Recruitment": re.compile(r"\bRC\b|rec\s*curve|recr\w*|кр\w*\s*рек\w*|\bKR\b|kr\s*rec", re.I),
+}
+
+
+def _canon_level(m: re.Match) -> str:
+    def seg(letter: str | None, default: str) -> str:
+        if not letter:
+            return default
+        letter = letter.lower()
+        if letter in ("th", "t", "т", "тh"):
+            return "Th"
+        if letter in ("c", "с"):
+            return "C"
+        return "L"
+    first = seg(m.group(1), "Th")
+    second = seg(m.group(3), first)
+    a, b = int(m.group(2)), int(m.group(4))
+    if first == "Th" and second == "Th" and a == 12 and b == 1:
+        second = "L"                        # "Т12-1" is Th12-L1 with the L dropped
+    if second == first:
+        return f"{first}{a}-{b}"
+    return f"{first}{a}-{second}{b}"
+
+
+def scenario_of(run_root: Path) -> str | None:
+    """Which Neurosoft protocol a run produced, read off its deliverable folder."""
+    root = Path(run_root)
+    for base in (root / "results", root / "results" / "Stimulation-induced responses", root):
+        for folder in ("H-reflex", "Recruitment", "Jendrassik", "Paired stimulation",
+                       "Condition test"):
+            if (base / folder).is_dir():
+                return "Paired stimulation" if folder == "Condition test" else folder
+    return None
+
+
+def parse_neurosoft(run_root: Path) -> dict[str, str]:
+    """Tags of one Neurosoft run: subject, cohort, level, scenario, side, muscle, position, polarity.
+
+    The recording names are typed by hand and spelled every way at once
+    (``Th11-12``, ``T11-12``, ``т11-12 кр рекр``, ``Т12-Л1 ендр 80мА``), so
+    everything here is a tolerant regex and a tag it cannot read is ``—``. The
+    scenario is taken from what the pipeline wrote, which is more reliable than
+    the name; the name only fills in when no deliverable folder is found.
+    """
+    root = Path(run_root)
+    name = root.name
+    path = str(root)
+    tags = {"subject": name, "cohort": "SCI", "level": "—", "scenario": "—",
+            "side": "—", "muscle": "—", "position": "—", "polarity": "—"}
+
+    m = _BRACKETED.match(name)
+    # The patient code may sit one or two folders up ("(П25)/07092021/07092021 T11-12 kr").
+    up = next((_BRACKETED.match(p.name) for p in (root.parent, root.parent.parent)
+               if _BRACKETED.match(p.name)), None)
+    if m:
+        tags["subject"] = m.group(1).strip()
+        rest = m.group(2)
+    elif up:
+        tags["subject"] = up.group(1).strip()
+        rest = name
+    elif re.match(r"patient\s+\S+", name, re.I):
+        pm = re.match(r"(patient\s+\S+)\s*(.*)", name, re.I)
+        tags["subject"], rest = pm.group(1), pm.group(2)
+    elif "контрол" in path.lower():
+        tags["cohort"] = "control"
+        rest = re.sub(r"^\s*контроль\s*", "", name, flags=re.I)
+        lvl = _LEVEL.search(rest)
+        tags["subject"] = (rest[:lvl.start()] if lvl else rest).strip(" _-") or name
+        rest = rest[lvl.start():] if lvl else rest
+    else:
+        rest = name
+
+    lvl = _LEVEL.search(rest)
+    if lvl:
+        tags["level"] = _canon_level(lvl)
+    scen = scenario_of(root)
+    if scen is None:
+        for key, rx in _SCENARIO_WORDS.items():
+            if rx.search(rest):
+                scen = key
+                break
+    tags["scenario"] = scen or "—"
+    if _LEFT.search(rest):
+        tags["side"] = "left"
+    elif _RIGHT.search(rest):
+        tags["side"] = "right"
+    for muscle, rx in _MUSCLE.items():
+        if rx.search(rest):
+            tags["muscle"] = muscle
+            break
+    pos = _POSITION.search(rest)
+    if pos:
+        tags["position"] = pos.group(1).lower()
+    pol = _POLARITY.search(rest)
+    if pol:
+        tags["polarity"] = pol.group(1).lower()
+    return tags
+
+
+#: What a "state" can be built from, in the order offered on screen.
+GROUP_MODES = {
+    "level": "уровень стимуляции",
+    "cohort": "когорта (SCI / control)",
+    "cohort+level": "когорта + уровень",
+    "scenario": "сценарий (RC / JM / paired / H)",
+    "level+scenario": "уровень + сценарий",
+    "side": "сторона",
+    "position": "положение тела (контроль)",
+    "polarity": "полярность (black / red)",
+    "muscle+side": "мышца + сторона (H-рефлекс)",
+}
+
+
+def state_from_tags(tags: dict[str, str], mode: str) -> str:
+    parts = [tags.get(k, "—") for k in mode.split("+")]
+    return " · ".join(parts)
+
+
+def scan_neurosoft(roots=None, mode: str = "level") -> list["GroupRun"]:
+    """Every processed Neurosoft run under the dataset roots, labelled by *mode*."""
+    roots = [Path(r) for r in (roots or NEUROSOFT_ROOTS)]
+    found: list[GroupRun] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for run in scan_runs(root, max_depth=3):
+            tags = parse_neurosoft(run.root)
+            found.append(GroupRun(run.root, tags["subject"], state_from_tags(tags, mode),
+                                  tags=tags))
+    found.sort(key=lambda r: (r.tags.get("cohort", ""), r.subject, r.state))
+    return found
+
+
+def waveform_summary(times: np.ndarray, loaded: list[dict]) -> pd.DataFrame:
+    """Mean and 95 % confidence band of the waveforms per state.
+
+    Across runs, not across the epochs of one run: the band says how much the
+    response shape varies between recordings of that state. The t-based interval
+    needs at least two runs; a lone run gets its own trace and no band.
+    """
+    if not len(times) or not loaded:
+        return pd.DataFrame()
+    try:
+        from scipy.stats import t as student_t
+    except Exception:
+        student_t = None
+    rows = []
+    by_state: dict[str, list[np.ndarray]] = {}
+    for d in loaded:
+        by_state.setdefault(d["run"].state, []).append(np.asarray(d["wave"], float))
+    for state, waves in by_state.items():
+        stack = np.vstack(waves)
+        n = stack.shape[0]
+        mean = np.nanmean(stack, axis=0)
+        if n >= 2:
+            se = np.nanstd(stack, axis=0, ddof=1) / np.sqrt(n)
+            q = float(student_t.ppf(0.975, n - 1)) if student_t is not None else 1.96
+            lo, hi = mean - q * se, mean + q * se
+        else:
+            lo = hi = mean
+        rows.append(pd.DataFrame({"state": state, "t": times, "mean": mean,
+                                  "lo": lo, "hi": hi, "n": n}))
+    return pd.concat(rows, ignore_index=True)
