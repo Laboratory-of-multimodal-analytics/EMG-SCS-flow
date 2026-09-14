@@ -62,6 +62,9 @@ def parse_condition(run_name: str, condition: str) -> tuple[str, str]:
     else:
         return run_name, text or "—"
     rest = re.sub(r"\s+", " ", _TRAIL.sub("", rest)).strip(" _-")
+    # "ext hand right" and "Ext hand right" are the same task typed twice; left apart
+    # they would never pair with each other's stim / non stim recording
+    rest = rest[:1].upper() + rest[1:]
     return rest or run_name, state
 
 
@@ -77,6 +80,9 @@ class SpontMember:
     subject: str
     state: str
     include: bool = True
+    #: the labels as read from the names, before any grouping or hand edit
+    parsed_subject: str = ""
+    parsed_state: str = ""
 
     @property
     def label(self) -> str:
@@ -101,7 +107,8 @@ def scan_members(folder: Path, max_depth: int = 4) -> list[SpontMember]:
         if ok:
             for cond in res.conditions():
                 subject, state = parse_condition(d.name, cond)
-                found.append(SpontMember(d, cond, subject, state))
+                found.append(SpontMember(d, cond, subject, state,
+                                         parsed_subject=subject, parsed_state=state))
             return
         try:
             children = sorted(p for p in d.iterdir() if p.is_dir())
@@ -116,6 +123,29 @@ def scan_members(folder: Path, max_depth: int = 4) -> list[SpontMember]:
     walk(folder, 0)
     found.sort(key=lambda m: (m.subject, m.state, m.condition))
     return found
+
+
+#: What a member's group can be read from, in the order offered on screen.
+GROUP_MODES = {
+    "state": "стимуляция (stim / non stim)",
+    "subject": "задача (из названия условия)",
+    "subject+state": "задача + стимуляция",
+    "condition": "условие целиком",
+    "run": "прогон",
+}
+
+
+def group_of(member: SpontMember, mode: str) -> str:
+    """The group label of *member* under grouping *mode* (see ``GROUP_MODES``)."""
+    state = member.parsed_state or member.state
+    subject = member.parsed_subject or member.subject
+    return {
+        "state": state,
+        "subject": subject,
+        "subject+state": f"{subject} · {state}",
+        "condition": member.condition,
+        "run": member.root.name,
+    }.get(mode, state)
 
 
 # --------------------------------------------------------------------------- #
@@ -402,62 +432,3 @@ def mean_burst_envelope(env: pd.DataFrame, min_n: int = 1) -> pd.DataFrame:
     return out
 
 
-def group_stats(summary: pd.DataFrame, value: str = "value") -> pd.DataFrame:
-    """Mean, SD, SE, median and n across members, per (state, channel)."""
-    if summary.empty:
-        return pd.DataFrame()
-    g = summary.groupby(["channel", "state"])[value]
-    out = g.agg(n="count", mean="mean", sd="std", median="median").reset_index()
-    out = out[out["n"] > 0]
-    out["se"] = out["sd"] / np.sqrt(out["n"].clip(lower=1))
-    return out
-
-
-def contrast(summary: pd.DataFrame, state_a: str, state_b: str,
-             value: str = "value") -> pd.DataFrame:
-    """*state_b* against *state_a* per channel.
-
-    Paired (Wilcoxon) inside subjects that have both states, with repeats of a
-    state averaged first; when fewer than five subjects have both, an unpaired
-    Mann–Whitney on whoever has either. The ``test`` and ``n`` columns say which
-    it was — read them before the p-value.
-    """
-    if summary.empty:
-        return pd.DataFrame()
-    try:
-        from scipy.stats import mannwhitneyu, wilcoxon
-    except Exception:
-        mannwhitneyu = wilcoxon = None
-    rows = []
-    for ch, grp in summary.groupby("channel", sort=False):
-        a = grp[grp["state"] == state_a].groupby("subject")[value].mean().dropna()
-        b = grp[grp["state"] == state_b].groupby("subject")[value].mean().dropna()
-        if a.empty or b.empty:
-            continue
-        both = a.index.intersection(b.index)
-        p, test = np.nan, "—"
-        if len(both) >= 5 and wilcoxon is not None:
-            diff = b.reindex(both) - a.reindex(both)
-            if float(np.abs(diff).sum()) > 0:
-                try:
-                    p = float(wilcoxon(a.reindex(both), b.reindex(both)).pvalue)
-                except ValueError:
-                    p = np.nan
-            test = f"Wilcoxon paired, n={len(both)}"
-        elif len(a) >= 3 and len(b) >= 3 and mannwhitneyu is not None:
-            try:
-                p = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
-            except ValueError:
-                p = np.nan
-            test = f"Mann–Whitney, {len(a)} vs {len(b)}"
-        else:
-            test = f"мало данных ({len(a)} vs {len(b)})"
-        rows.append({
-            "channel": ch,
-            f"{state_a} median": float(a.median()), f"{state_b} median": float(b.median()),
-            "median Δ": float(b.median() - a.median()),
-            "ratio": float(b.median() / a.median()) if a.median() else np.nan,
-            "p": p, "test": test,
-            "subjects": ", ".join(map(str, both)) if len(both) else "—",
-        })
-    return pd.DataFrame(rows)

@@ -36,6 +36,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import asymmetry as A
+
 # --------------------------------------------------------------------------- #
 # Runs and their labels
 # --------------------------------------------------------------------------- #
@@ -199,6 +201,7 @@ METRICS = {
     "p1_uv": "P1, µV",
     "p1_ms": "P1 latency, ms",
     "onset_ms": "Onset latency, ms",
+    "area_uvms": "Area of the response, µV·ms",
 }
 
 
@@ -277,6 +280,8 @@ def hreflex_points(res, config: str) -> pd.DataFrame:
             "p1_ms": pd.to_numeric(hb[f"{comp}_p1_ms"], errors="coerce"),
             "onset_ms": pd.to_numeric(hb[f"{comp}_onset_ms"], errors="coerce"),
             "p2_ms": pd.to_numeric(hb[f"{comp}_p2_ms"], errors="coerce"),
+            "area_uvms": (pd.to_numeric(hb[f"{comp}_area_uvms"], errors="coerce")
+                          if f"{comp}_area_uvms" in hb.columns else np.nan),
         })
         frames.append(f)
     out = pd.concat(frames, ignore_index=True)
@@ -293,24 +298,6 @@ def split_component(channel: str) -> tuple[str, str | None]:
         if channel.endswith(suffix):
             return channel[: -len(suffix)], comp
     return channel, None
-
-
-def inventory(points: pd.DataFrame) -> pd.DataFrame:
-    """What each (config, channel) is available in — how many subjects and states.
-
-    The thing to read before choosing anything: in the pig array only one
-    configuration is present in nearly every session, and a group built on a
-    configuration two animals share is a group of two.
-    """
-    if points.empty:
-        return pd.DataFrame()
-    g = points.groupby(["config", "channel"])
-    return pd.DataFrame({
-        "subjects": g["subject"].nunique(),
-        "states": g["state"].nunique(),
-        "runs": g["run"].nunique(),
-        "points": g["x_value"].count(),
-    }).reset_index().sort_values(["subjects", "runs"], ascending=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -390,261 +377,56 @@ def apply_normalisation(points: pd.DataFrame, factors: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------- #
-# Averaging over a common current axis
+# The last curves of the ramp
 # --------------------------------------------------------------------------- #
-def common_grid(points: pd.DataFrame, n: int = 40, q: float = 0.02) -> np.ndarray:
-    """A shared current axis over the range the selected runs actually cover.
-
-    Quantiles rather than min/max: one implantation session swept to 45 mA while
-    most sessions stop around 14, and on a full-range axis four fifths of the
-    grid is a single animal — which reads as a group mean and is not one.
-    """
-    x = pd.to_numeric(points.get("x_value"), errors="coerce").dropna()
-    if x.empty:
-        return np.array([])
-    lo, hi = float(x.quantile(q)), float(x.quantile(1 - q))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = float(x.min()), float(x.max())
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return np.array([lo]) if np.isfinite(lo) else np.array([])
-    return np.linspace(lo, hi, int(n))
-
-
-def interpolate_to_grid(points: pd.DataFrame, grid: np.ndarray,
-                        value: str = "value") -> pd.DataFrame:
-    """Each run's curve on the shared axis, inside its own measured range only.
-
-    The amplitude sets never coincide between recordings — one session sweeps
-    0.1 to 45 mA in 55 steps, the next 4 to 12 in eight — so a group mean needs
-    the curves on one axis before it can be taken at all.
-
-    Never extrapolated: outside a curve's own range the grid gets NaN, so a
-    subject that stopped at 8 mA contributes nothing above 8 rather than a flat
-    continuation, and the n behind every grid point says how many subjects were
-    actually measured there.
-    """
-    if points.empty or grid.size == 0:
-        return pd.DataFrame()
-    rows = []
-    keys = ["subject", "state", "config", "channel"]
-    for key, grp in points.groupby(keys, sort=False):
-        d = grp[["x_value", value]].dropna()
-        d = d.groupby("x_value", as_index=False)[value].mean().sort_values("x_value")
-        if len(d) < 2:
-            continue
-        x = d["x_value"].to_numpy(float)
-        y = d[value].to_numpy(float)
-        yi = np.interp(grid, x, y)
-        yi[(grid < x[0]) | (grid > x[-1])] = np.nan
-        frame = pd.DataFrame({"x": grid, value: yi})
-        for k, v in zip(keys, key):
-            frame[k] = v
-        rows.append(frame)
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-
-def group_mean(on_grid: pd.DataFrame, value: str = "value",
-               min_n: int = 2) -> pd.DataFrame:
-    """Mean ± SE across subjects at each grid point, per (state, config, channel).
-
-    Grid points backed by fewer than *min_n* subjects are dropped. Above and
-    below the currents most sessions covered there is usually exactly one animal
-    left, and drawing its curve as the group's — with no error band, since a
-    single value has no spread — is the most misleading thing this view could do.
-    """
-    if on_grid.empty:
-        return pd.DataFrame()
-    g = on_grid.groupby(["state", "config", "channel", "x"])[value]
-    out = g.agg(mean="mean", sd="std", n="count").reset_index()
-    out = out[out["n"] >= int(min_n)]
-    out["se"] = out["sd"] / np.sqrt(out["n"].clip(lower=1))
-    return out
+#: How many curves at the end of a recording stand for its maximal response.
+LAST_N = 5
 
 
 # --------------------------------------------------------------------------- #
-# One number per curve, and contrasts between states
+# Left/right asymmetry on the last curves
 # --------------------------------------------------------------------------- #
-SCALARS = {
-    "max": "максимум отклика",
-    "auc": "площадь под кривой",
-    "threshold": "порог (мА)",
-    "at_max_x": "ток максимума (мА)",
-}
+def asymmetry_last_curves(points: pd.DataFrame, metric: str, n: int = LAST_N,
+                          recorded: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Left/right asymmetry of every recording on its last *n* curves.
 
+    Channel pairs and indices are ``src/asymmetry.py``: AI = (R-L)/(R+L) and R/L
+    for sizes, R-L in ms for latencies; ch1–4 are taken as left, provisionally.
 
-def curve_scalars(points: pd.DataFrame, value: str = "value",
-                  threshold_frac: float = 0.1) -> pd.DataFrame:
-    """Collapse each subject's curve to the numbers a group is compared on.
+    Computed on the raw metric, never on a normalised value: normalisation divides
+    each channel by its own baseline, which would change the ratio of the sides.
+    H-reflex components (``ch1 · M``) are left out — those files record one limb,
+    so their channels are not two sides.
 
-    * ``max`` — the plateau the muscle reaches;
-    * ``at_max_x`` — the current it reaches it at;
-    * ``auc`` — the area, which moves with both size and threshold;
-    * ``threshold`` — the first current whose response clears *threshold_frac*
-      of that curve's own maximum. Relative to the curve rather than to an
-      absolute µV, because the same criterion has to work on a channel whose
-      responses are 60 µV and one whose are 1800.
+    ``recorded`` maps a run to its channels (``asymmetry.recorded_channels``): a
+    recorded channel absent from the points had no response at all and counts as
+    such. A run missing from it falls back to the channels its points have.
+
+    Returns ``(by_curve, by_recording, kind)`` with the recording's labels on every
+    row; ``kind`` is ``"size"`` or ``"latency"``.
     """
-    if points.empty:
-        return pd.DataFrame()
-    rows = []
-    for key, grp in points.groupby(["subject", "state", "config", "channel"], sort=False):
-        d = grp[["x_value", value]].dropna().sort_values("x_value")
-        if d.empty:
+    kind = "latency" if metric.endswith("_ms") else "size"
+    keys = ["subject", "state", "run", "config"]
+    if points.empty or metric not in points.columns:
+        return pd.DataFrame(), pd.DataFrame(), kind
+    plain = points[points["channel"].map(lambda c: split_component(str(c))[1] is None)]
+    curves, summaries = [], []
+    for key, grp in plain.groupby(keys, sort=False):
+        by_curve, summary = A.recording_asymmetry(grp, {metric: kind}, n,
+                                                  recorded=(recorded or {}).get(str(key[2])))
+        if summary.empty:
             continue
-        x = d["x_value"].to_numpy(float)
-        y = d[value].to_numpy(float)
-        peak = float(np.nanmax(y))
-        over = np.flatnonzero(y >= threshold_frac * peak)
-        rows.append({
-            "subject": key[0], "state": key[1], "config": key[2], "channel": key[3],
-            "max": peak,
-            "at_max_x": float(x[int(np.nanargmax(y))]),
-            "auc": float(np.trapezoid(y, x)) if len(x) > 1 else np.nan,
-            "threshold": float(x[over[0]]) if over.size else np.nan,
-            "n_points": int(len(x)),
-        })
-    return pd.DataFrame(rows)
-
-
-def contrast(scalars: pd.DataFrame, state_a: str, state_b: str,
-             scalar: str = "max") -> pd.DataFrame:
-    """Paired comparison of *state_b* against *state_a*, per (config, channel).
-
-    Paired inside the subject: the pairing is the point of a longitudinal design,
-    and the between-animal spread is far larger than the change being looked for.
-    Wilcoxon signed-rank rather than a t-test — a dozen animals, and response
-    sizes are not symmetric around their mean.
-
-    ``subjects`` names exactly who was in the pair. It is the column to read
-    first: an effect carried by three animals out of thirteen is a different
-    statement from one carried by all of them, and only this says which it is.
-
-    One caveat this cannot fix, only declare: under normalisation to the baseline
-    maximum, every baseline curve's ``max`` is 1 by construction. A contrast
-    against the baseline state is then a one-sample test of "is the ratio
-    different from 1" wearing a paired test's clothes. The p-value is the right
-    one for that question, but the baseline column is not a measurement and must
-    not be read as one. ``baseline_is_constant`` in the result says when this
-    applies.
-    """
-    if scalars.empty:
-        return pd.DataFrame()
-    try:
-        from scipy.stats import wilcoxon
-    except Exception:
-        wilcoxon = None
-
-    rows = []
-    for (config, channel), grp in scalars.groupby(["config", "channel"], sort=False):
-        a = grp[grp["state"] == state_a].set_index("subject")[scalar]
-        b = grp[grp["state"] == state_b].set_index("subject")[scalar]
-        both = a.index.intersection(b.index)
-        pair = pd.DataFrame({"a": a.reindex(both), "b": b.reindex(both)}).dropna()
-        if pair.empty:
-            continue
-        diff = pair["b"] - pair["a"]
-        p = np.nan
-        # Wilcoxon needs at least one non-zero difference and is not meaningful
-        # on a handful of pairs; the n column is what says whether to believe it.
-        if wilcoxon is not None and len(pair) >= 5 and float(np.abs(diff).sum()) > 0:
-            try:
-                p = float(wilcoxon(pair["a"], pair["b"]).pvalue)
-            except ValueError:
-                p = np.nan
-        rows.append({
-            "config": config, "channel": channel, "scalar": scalar,
-            "n_pairs": int(len(pair)),
-            f"{state_a} median": float(pair["a"].median()),
-            f"{state_b} median": float(pair["b"].median()),
-            "median Δ": float(diff.median()),
-            "ratio": float(pair["b"].median() / pair["a"].median())
-            if pair["a"].median() else np.nan,
-            "p (Wilcoxon)": p,
-            "baseline_is_constant": bool(pair["a"].nunique() == 1),
-            "subjects": ", ".join(map(str, pair.index)),
-        })
-    return pd.DataFrame(rows)
-
-
-# --------------------------------------------------------------------------- #
-# Waveforms across runs
-# --------------------------------------------------------------------------- #
-def collect_waveforms(runs, config: str | None, channel: str, at_x: float | None = None,
-                      n_times: int = 400) -> tuple[np.ndarray, list[dict]]:
-    """Mean response shapes from several runs on one time axis.
-
-    Sampling rates differ across the datasets that end up in one group — 4 kHz
-    for the pig recordings, 20 kHz for the Neurosoft exports — and so do the
-    epoch windows: a Neurosoft curve starts AT the stimulus and has no
-    pre-stimulus data at all. So the shared axis is the INTERSECTION of the
-    windows, resampled onto one grid. Anything outside every run's own window is
-    not drawn rather than padded.
-
-    *at_x* picks the amplitude to show: the point nearest that current in each
-    run. None takes each run's strongest response, which is what "show me what
-    this muscle can do" means.
-    """
-    from emgflow.results import SIRResults
-
-    loaded = []
-    for run in runs:
-        if not run.include:
-            continue
-        try:
-            res = SIRResults(Path(run.root))
-            if not res.ok:
-                continue
-            # None = the run's own configuration: a Neurosoft export has one.
-            cfg = config if config is not None else res.configs[0]
-            if cfg not in res.configs:
-                continue
-            times, waves, labels = res.scenario_waves(cfg)
-            raw_channel, comp = split_component(channel)
-            if times is None or raw_channel not in waves:
-                continue
-            if comp is not None:
-                # An H/M channel exists only on H-reflex recordings; on any
-                # other recording it has no points and the run is skipped.
-                pts = hreflex_points(res, cfg) if res.scenario == "H-reflex" \
-                    else pd.DataFrame()
-            else:
-                pts = res.recruitment_points(cfg)
-            pts = pts[pts["channel" if "channel" in pts else "Channel"] == channel] \
-                if not pts.empty else pts
-            if comp is not None and pts.empty:
-                continue
-        except Exception:
-            continue
-        stack = waves[raw_channel]
-        idx, shown = 0, ""
-        if not pts.empty:
-            xs = pd.to_numeric(pts["x_value"], errors="coerce").to_numpy(float)
-            ys = pd.to_numeric(pts["amp_uv"], errors="coerce").to_numpy(float)
-            order = pts["curve"].to_numpy(int) - 1
-            if at_x is None:
-                if np.isfinite(ys).any():
-                    idx = int(order[int(np.nanargmax(ys))])
-                    shown = str(pts["x_label"].iloc[int(np.nanargmax(ys))])
-            elif np.isfinite(xs).any():
-                j = int(np.nanargmin(np.abs(xs - at_x)))
-                idx = int(order[j])
-                shown = str(pts["x_label"].iloc[j])
-        if not 0 <= idx < len(stack):
-            idx = 0
-        loaded.append({"run": run, "times": np.asarray(times, float),
-                       "wave": np.asarray(stack[idx], float), "at": shown})
-    if not loaded:
-        return np.array([]), []
-
-    lo = max(float(d["times"][0]) for d in loaded)
-    hi = min(float(d["times"][-1]) for d in loaded)
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return np.array([]), []
-    grid = np.linspace(lo, hi, int(n_times))
-    for d in loaded:
-        d["wave"] = np.interp(grid, d["times"], d["wave"])
-        d.pop("times")
-    return grid, loaded
+        labels = dict(zip(keys, key))
+        curves.append(by_curve.assign(**labels))
+        summaries.append(summary.assign(**labels))
+    if not summaries:
+        return pd.DataFrame(), pd.DataFrame(), kind
+    by_curve = pd.concat(curves, ignore_index=True)
+    by_recording = pd.concat(summaries, ignore_index=True)
+    first = keys + ["pair", "left", "right", "metric"]
+    by_curve = by_curve[first + [c for c in by_curve.columns if c not in first]]
+    by_recording = by_recording[first + [c for c in by_recording.columns if c not in first]]
+    return by_curve, by_recording, kind
 
 
 # --------------------------------------------------------------------------- #
@@ -807,35 +589,362 @@ def scan_neurosoft(roots=None, mode: str = "level") -> list["GroupRun"]:
     return found
 
 
-def waveform_summary(times: np.ndarray, loaded: list[dict]) -> pd.DataFrame:
-    """Mean and 95 % confidence band of the waveforms per state.
+# --------------------------------------------------------------------------- #
+# What the group tab draws: ramps on one axis, plateau waveforms
+# --------------------------------------------------------------------------- #
+#: How a recording's ramp is laid on the shared x axis.
+ALIGN_END = "end"          # 0 = the last curve, -1 the one before, … (the plateau lines up)
+ALIGN_START = "start"      # the curve number as exported
 
-    Across runs, not across the epochs of one run: the band says how much the
-    response shape varies between recordings of that state. The t-based interval
-    needs at least two runs; a lone run gets its own trace and no band.
+
+def aligned_ramps(points: pd.DataFrame, align: str = ALIGN_END) -> pd.DataFrame:
+    """Add ``x``: each curve's position on the shared axis of the group plot.
+
+    Neurosoft ramps differ in length (20 to 170 curves) and in where they start,
+    and the export carries no current. Counted from the END, the last curves — the
+    highest intensities, the plateau the "last 5" summary is taken from — line up
+    across recordings; counted from the start they line up only if every ramp
+    began at the same current, which they did not.
     """
-    if not len(times) or not loaded:
-        return pd.DataFrame()
+    out = points.copy()
+    if out.empty:
+        out["x"] = []
+        return out
+    curve = pd.to_numeric(out["curve"], errors="coerce")
+    if align == ALIGN_END:
+        last = curve.groupby([out["run"], out["channel"]]).transform("max")
+        out["x"] = curve - last
+    else:
+        out["x"] = curve
+    return out
+
+
+def ramp_bands(points: pd.DataFrame, value: str = "value", group_col: str = "state",
+               min_n: int = 3, min_frac: float = 0.3) -> pd.DataFrame:
+    """Median and quartiles across recordings at every x, per (group, channel).
+
+    A position is kept only where at least *min_n* recordings and at least *min_frac*
+    of the group's recordings on that channel reach: out where only the few longest
+    ramps go, the "median" is those few recordings and jumps with each of them.
+    """
+    d = points.dropna(subset=["x", value])
+    if d.empty:
+        return pd.DataFrame(columns=[group_col, "channel", "x", "n", "median", "q1", "q3"])
+    # one value per recording per position (duplicates would weigh a recording twice)
+    d = d.groupby([group_col, "channel", "run", "x"], as_index=False)[value].mean()
+    g = d.groupby([group_col, "channel", "x"])[value]
+    out = pd.concat({"n": g.count(), "median": g.median(), "q1": g.quantile(0.25),
+                     "q3": g.quantile(0.75)}, axis=1).reset_index()
+    total = d.groupby([group_col, "channel"])["run"].nunique().rename("_total").reset_index()
+    out = out.merge(total, on=[group_col, "channel"], how="left")
+    need = np.maximum(int(min_n), np.ceil(float(min_frac) * out["_total"]))
+    return out[out["n"] >= need].drop(columns="_total")
+
+
+def plateau_waveforms(run_root, n: int = LAST_N) -> tuple[np.ndarray | None, dict[str, np.ndarray]]:
+    """The mean response of a run's last *n* curves on every channel (µV), and its time axis.
+
+    The waveform counterpart of the "last 5 curves" value: the shape of the response
+    at the plateau, one per recording. Read once per run; the tab keeps it.
+    """
+    from emgflow.results import SIRResults
+
+    res = SIRResults(Path(run_root))
+    if not res.ok or not res.configs:
+        return None, {}
+    times, waves, _ = res.scenario_waves(res.configs[0])
+    if times is None or not waves:
+        return None, {}
+    return (np.asarray(times, dtype=float),
+            {ch: np.asarray(w[-n:], dtype=float).mean(axis=0) for ch, w in waves.items() if len(w)})
+
+
+def waveform_bands(loaded: list[tuple[str, str, np.ndarray, np.ndarray]], n_times: int = 500,
+                   min_n: int = 3) -> tuple[np.ndarray, pd.DataFrame, list[tuple[str, str, np.ndarray]]]:
+    """Group mean waveform with a 95 % confidence band, per group.
+
+    ``loaded``: ``(group, run, times_s, wave)`` for one channel. The waves are put on
+    the intersection of their time windows (Neurosoft exports agree; other datasets
+    may not). A group with fewer than *min_n* recordings gets its mean and no band.
+    Returns ``(grid, bands, traces)`` with ``traces`` = ``(group, run, wave on grid)``.
+    """
+    if not loaded:
+        return np.array([]), pd.DataFrame(), []
+    lo = max(float(t[0]) for _, _, t, _ in loaded)
+    hi = min(float(t[-1]) for _, _, t, _ in loaded)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        return np.array([]), pd.DataFrame(), []
+    grid = np.linspace(lo, hi, int(n_times))
+    traces = [(g, run, np.interp(grid, t, w)) for g, run, t, w in loaded]
     try:
         from scipy.stats import t as student_t
-    except Exception:
+    except Exception:                                   # noqa: BLE001
         student_t = None
     rows = []
-    by_state: dict[str, list[np.ndarray]] = {}
-    for d in loaded:
-        by_state.setdefault(d["run"].state, []).append(np.asarray(d["wave"], float))
-    for state, waves in by_state.items():
-        stack = np.vstack(waves)
-        n = stack.shape[0]
-        mean = np.nanmean(stack, axis=0)
-        # Two recordings give one degree of freedom and a t of 12.7: the band
-        # would be wider than the plot. Three is the least that says anything.
-        if n >= 3:
-            se = np.nanstd(stack, axis=0, ddof=1) / np.sqrt(n)
-            q = float(student_t.ppf(0.975, n - 1)) if student_t is not None else 1.96
-            lo, hi = mean - q * se, mean + q * se
+    for group in dict.fromkeys(g for g, _, _ in traces):
+        stack = np.vstack([w for g, _, w in traces if g == group])
+        k = stack.shape[0]
+        mean = stack.mean(axis=0)
+        if k >= min_n:
+            se = stack.std(axis=0, ddof=1) / np.sqrt(k)
+            q = float(student_t.ppf(0.975, k - 1)) if student_t is not None else 1.96
+            lo_b, hi_b = mean - q * se, mean + q * se
         else:
-            lo = hi = mean
-        rows.append(pd.DataFrame({"state": state, "t": times, "mean": mean,
-                                  "lo": lo, "hi": hi, "n": n}))
-    return pd.concat(rows, ignore_index=True)
+            lo_b = hi_b = np.full_like(mean, np.nan)
+        rows.append(pd.DataFrame({"group": group, "t": grid, "mean": mean, "lo": lo_b,
+                                  "hi": hi_b, "n": k}))
+    return grid, pd.concat(rows, ignore_index=True), traces
+
+
+def plateau_table(points: pd.DataFrame, n: int = LAST_N,
+                  value: str = "value") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The last *n* curves of every recording and channel — the same selection as
+    ``last_curves``, computed in one pass for the group tab.
+
+    Returns ``(per_recording, curves)``: one row per recording and channel with
+    ``first_curve, last_curve, n_values, mean, sd, min, max`` (empty values are not
+    averaged; ``n_values`` says how many of the *n* carried a response), and the rows
+    of the curves used.
+    """
+    keys = ["subject", "state", "run", "config", "channel"]
+    if points.empty or "curve" not in points.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    d = points.assign(curve=pd.to_numeric(points["curve"], errors="coerce")).dropna(subset=["curve"])
+    d = d.sort_values("curve", kind="stable").drop_duplicates(keys + ["curve"], keep="last")
+    tail = d.groupby(keys, sort=False).tail(int(n)).copy()
+    tail["_v"] = pd.to_numeric(tail[value], errors="coerce")
+    g = tail.groupby(keys, sort=False)
+    per = pd.concat({"first_curve": g["curve"].min(), "last_curve": g["curve"].max(),
+                     "n_values": g["_v"].count(), "mean": g["_v"].mean(), "sd": g["_v"].std(),
+                     "min": g["_v"].min(), "max": g["_v"].max()}, axis=1).reset_index()
+    if "unit" in tail.columns:
+        per = per.merge(g["unit"].first().reset_index(), on=keys, how="left")
+    return per, tail.drop(columns="_v")
+
+
+# --------------------------------------------------------------------------- #
+# Standard stimulation runs (pigs, patients): curves on the current axis
+# --------------------------------------------------------------------------- #
+#: What a standard run's group can be read from, in the order offered on screen.
+SIR_GROUP_MODES = {
+    "state": "состояние из имени (control / implantation / N day)",
+    "subject": "субъект",
+    "run": "запись",
+}
+
+
+def is_standard_sir_run(run_root) -> bool:
+    """A finished SIR run cut per (configuration, amplitude) — not a Neurosoft export."""
+    return scenario_of(Path(run_root)) is None
+
+
+def scan_standard_runs(folder, max_depth: int = 4) -> list[GroupRun]:
+    """Every standard SIR run under *folder*, with its labels kept as read from the path."""
+    runs = [r for r in scan_runs(Path(folder), max_depth) if is_standard_sir_run(r.root)]
+    for r in runs:
+        r.tags = {"subject": r.subject, "state": r.state}
+    return runs
+
+
+def sir_group_of(run: GroupRun, mode: str) -> str:
+    """The group of *run* under grouping *mode* (see ``SIR_GROUP_MODES``)."""
+    return {"state": run.tags.get("state", run.state),
+            "subject": run.tags.get("subject", run.subject),
+            "run": run.root.name}.get(mode, run.state)
+
+
+def sir_points(res) -> pd.DataFrame:
+    """Every configuration's recruitment curve of one amplitude-axis run, in one pass.
+
+    The same numbers as ``SIRResults.recruitment_points`` configuration by
+    configuration — the mean over the epochs detected at each amplitude; an
+    amplitude where nothing was detected stays as NaN — but from ONE groupby over
+    the metrics table instead of one per crop (15 s → about 1 s on the pig array).
+    """
+    from src.recruitment import amplitude_to_float
+
+    m = res.metrics
+    if m.empty:
+        return pd.DataFrame()
+
+    def col(name, scale):
+        return (pd.to_numeric(m[name], errors="coerce") * scale if name in m.columns
+                else pd.Series(np.nan, index=m.index))
+
+    ptp, p1 = col("PTP amplitude", 1e6), col("Peak1 value", 1e6)
+    d = pd.DataFrame({
+        "config": m["Configuration"].astype(str), "x_label": m["Stim. amplitude"].astype(str),
+        "channel": m["Channel"].astype(str), "amp_uv": ptp.where(ptp.notna(), p1.abs()),
+        "p1_uv": p1, "p1_ms": col("Peak1 latency", 1e3), "onset_ms": col("Onset latency", 1e3),
+        "p2_ms": col("Peak2 latency", 1e3), "area_uvms": col("Response area", 1e9),
+    })
+    out = d.groupby(["config", "x_label", "channel"], sort=False).agg(
+        amp_uv=("amp_uv", "mean"), sd_uv=("amp_uv", "std"), n_epochs=("amp_uv", "count"),
+        p1_uv=("p1_uv", "mean"), p1_ms=("p1_ms", "mean"), onset_ms=("onset_ms", "mean"),
+        p2_ms=("p2_ms", "mean"), area_uvms=("area_uvms", "mean")).reset_index()
+    out["x_value"] = out["x_label"].map(amplitude_to_float)
+    position = {(cfg, crop.amp): i for cfg in res.configs
+                for i, crop in enumerate(res.config_crops(cfg), start=1)}
+    out["curve"] = [position.get((c, a), np.nan) for c, a in zip(out["config"], out["x_label"])]
+    return out
+
+
+def collect_sir_points(runs, progress=None) -> pd.DataFrame:
+    """The recruitment points of every standard run, all configurations, one long table.
+
+    Runs whose ramp is only a curve index (Neurosoft exports) are left out: their x
+    is not a current. ``progress(i, n)`` is called after each run.
+    """
+    from emgflow.results import SIRResults
+    from src.recruitment import STIM_AXIS_AMPLITUDE
+
+    frames = []
+    runs = list(runs)
+    for i, run in enumerate(runs, 1):
+        try:
+            res = SIRResults(Path(run.root))
+            if res.ok and res.stim_axis == STIM_AXIS_AMPLITUDE:
+                pts = sir_points(res)
+                if not pts.empty:
+                    pts["subject"], pts["state"], pts["run"] = run.subject, run.state, str(run.root)
+                    frames.append(pts)
+        except Exception:                               # noqa: BLE001 - that run is skipped
+            pass
+        if progress is not None:
+            progress(i, len(runs))
+    if not frames:
+        return pd.DataFrame(columns=["subject", "state", "run", "config", "channel", "x_value",
+                                     "x_label", "amp_uv"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def curve_summaries(points: pd.DataFrame, value: str = "value",
+                    threshold_frac: float = 0.1) -> pd.DataFrame:
+    """One row per recording, configuration and channel: what a recruitment curve is compared on.
+
+    * ``max`` — the largest response along the ramp (of *value*). A curve on which
+      nothing was detected at any current has ``max`` = 0 and ``responded`` False:
+      a silent muscle is a result (spinal shock at 7 days), not a missing value;
+    * ``at_max_x`` / ``at_max_label`` — the current of the strongest response (by
+      the raw amplitude), and its crop label, to find its epochs;
+    * ``at_max_value`` — *value* at that current (for a latency: the latency of the
+      strongest response);
+    * ``threshold_x`` — the lowest current whose response reaches *threshold_frac*
+      of that curve's own maximum; relative, so the same rule works on a 60 µV and a
+      1800 µV muscle;
+    * ``n_points``, ``x_min``, ``x_max`` — how much of the ramp was measured.
+    """
+    keys = ["subject", "state", "run", "config", "channel"]
+    if points.empty:
+        return pd.DataFrame()
+    rows = []
+    for key, g in points.groupby(keys, sort=False):
+        d = g.dropna(subset=["x_value"]).sort_values("x_value")
+        if d.empty:
+            continue
+        x = d["x_value"].to_numpy(float)
+        amp = pd.to_numeric(d["amp_uv"], errors="coerce").to_numpy(float)
+        val = pd.to_numeric(d[value], errors="coerce").to_numpy(float)
+        ok = np.isfinite(amp) & (amp > 0)
+        row = dict(zip(keys, key)) | {
+            "n_points": int(len(d)), "x_min": float(x.min()), "x_max": float(x.max()),
+            "responded": bool(ok.any()), "max": 0.0 if not value.endswith("_ms") else np.nan,
+            "at_max_x": np.nan, "at_max_label": None, "at_max_value": np.nan, "threshold_x": np.nan,
+        }
+        if ok.any():
+            i = int(np.argmax(np.where(ok, amp, -np.inf)))
+            row["at_max_x"], row["at_max_label"] = float(x[i]), str(d["x_label"].iloc[i])
+            row["at_max_value"] = float(val[i]) if np.isfinite(val[i]) else np.nan
+            if np.isfinite(val).any():
+                row["max"] = float(np.nanmax(val))
+            over = np.flatnonzero(ok & (amp >= threshold_frac * amp[i]))
+            row["threshold_x"] = float(x[over[0]]) if over.size else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def current_grid(points: pd.DataFrame, n: int = 60, q: float = 0.02) -> np.ndarray:
+    """A shared current axis over the range the selected recordings actually cover.
+
+    Quantiles rather than min/max: one session swept to 145 mA while most stop
+    around 14, and on a full-range axis most of the grid would be that one session.
+    """
+    x = pd.to_numeric(points.get("x_value"), errors="coerce").dropna()
+    if x.empty:
+        return np.array([])
+    lo, hi = float(x.quantile(q)), float(x.quantile(1 - q))
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        lo, hi = float(x.min()), float(x.max())
+    if hi <= lo:
+        return np.array([lo])
+    return np.linspace(lo, hi, int(n))
+
+
+def current_bands(points: pd.DataFrame, grid: np.ndarray, value: str = "value",
+                  group_col: str = "state", absent_as_zero: bool = True, min_n: int = 3,
+                  min_frac: float = 0.3) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Each recording's curve on the shared current axis, and the group median and quartiles.
+
+    A curve is interpolated inside its own measured range only, never extrapolated.
+    With ``absent_as_zero`` (sizes) an amplitude where nothing was detected counts as
+    no response; for latencies it is simply not there. A grid current is kept where at
+    least *min_n* recordings and *min_frac* of the group's recordings on that channel
+    were measured. Returns ``(on_grid, bands)``.
+    """
+    if points.empty or grid.size == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    rows = []
+    for (group, channel, run), g in points.groupby([group_col, "channel", "run"], sort=False):
+        d = g[["x_value", value]].copy()
+        d[value] = pd.to_numeric(d[value], errors="coerce")
+        d = d.dropna(subset=["x_value"])
+        if absent_as_zero:
+            d[value] = d[value].fillna(0.0)
+        d = d.dropna(subset=[value]).groupby("x_value", as_index=False)[value].mean()
+        if len(d) < 2:
+            continue
+        x, y = d["x_value"].to_numpy(float), d[value].to_numpy(float)
+        yi = np.interp(grid, x, y)
+        yi[(grid < x[0]) | (grid > x[-1])] = np.nan
+        rows.append(pd.DataFrame({group_col: group, "channel": channel, "run": run, "x": grid,
+                                  "y": yi}))
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+    on_grid = pd.concat(rows, ignore_index=True)
+    total = on_grid.groupby([group_col, "channel"])["run"].nunique().rename("_total")
+    valid = on_grid.dropna(subset=["y"])
+    g = valid.groupby([group_col, "channel", "x"])["y"]
+    bands = pd.concat({"n": g.count(), "median": g.median(), "q1": g.quantile(0.25),
+                       "q3": g.quantile(0.75)}, axis=1).reset_index()
+    bands = bands.merge(total.reset_index(), on=[group_col, "channel"], how="left")
+    need = np.maximum(int(min_n), np.ceil(float(min_frac) * bands["_total"]))
+    return on_grid, bands[bands["n"] >= need].drop(columns="_total")
+
+
+def peak_waveforms(run_root, config: str, labels: dict[str, str]) -> tuple[np.ndarray | None, dict]:
+    """The mean epoch (µV) of every channel's strongest crop in one configuration.
+
+    ``labels`` maps a channel to the amplitude label of its strongest response
+    (``curve_summaries``' ``at_max_label``). Each crop is read once.
+    """
+    from emgflow.results import SIRResults
+
+    res = SIRResults(Path(run_root))
+    crops = {c.amp: c for c in res.config_crops(config)}
+    cache: dict[str, tuple] = {}
+    times, out = None, {}
+    for channel, label in labels.items():
+        crop = crops.get(str(label))
+        if crop is None:
+            continue
+        if crop.amp not in cache:
+            ep = res.load_epochs(crop)
+            cache[crop.amp] = (np.asarray(ep.times, float),
+                               {n: i for i, n in enumerate(ep.ch_names)},
+                               ep.get_data().mean(axis=0) * 1e6)
+        t, index, mean = cache[crop.amp]
+        if channel in index:
+            out[channel] = mean[index[channel]]
+            times = t
+    return times, out
+
