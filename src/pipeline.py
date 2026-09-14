@@ -145,7 +145,6 @@ from .neurosoft import (
     SCENARIO_LABELS,
     SCENARIOS,
     detect_scenario,
-    intensities_from_name,
     protocol_from_name,
 )
 from .plotting import (
@@ -2413,6 +2412,7 @@ def _run_startstop_analysis(
                 results["Peak1 value"].append(e["pv1"])
                 results["Peak2 value"].append(e["pv2"])
                 results["PTP amplitude"].append(e["ptp"])
+                results.setdefault("Response area", []).append(e.get("area", np.nan))
 
             valid_epochs = [e["ep"] for e in entries if not np.isnan(e["p1"])]
             if valid_epochs:
@@ -2835,6 +2835,8 @@ def write_sir_summary_excels(df_results: "pd.DataFrame", excel_dir: Path) -> Non
         "Peak1 value", "Peak2 value", "PTP amplitude",
         "Inter-trial corr",
     ]
+    if "Response area" in df_results.columns:
+        metrics.insert(metrics.index("Inter-trial corr"), "Response area")
     df = df_results.copy()
     detection_metrics = [m for m in metrics if m != "Inter-trial corr"]
     keep_mask = (
@@ -4077,32 +4079,46 @@ def _run_pipeline(
             for e, bad in zip(entries, drop):
                 if bad:
                     e["onset"] = e["p1"] = e["p2"] = np.nan
-                    e["pv1"] = e["pv2"] = e["ptp"] = np.nan
+                    e["pv1"] = e["pv2"] = e["ptp"] = e["area"] = np.nan
                     n_misshapen += 1
         if n_misshapen:
             print(f"[SIR] {n_misshapen} small responses dropped as unlike their "
                   f"channel's own shape.", flush=True)
 
-        # ── Onsets: one latency per channel, not one per curve's noise floor ──
-        # Only for the pre-epoched exports, whose onsets are found by walking back
-        # from P1 because they have no pre-stimulus baseline to threshold against.
+        # ── Onsets: one per curve, where its response leaves the isoline ──
+        # Only for the pre-epoched exports, which have no pre-stimulus baseline to
+        # threshold against. See src/onsets.py for why the per-channel anchoring
+        # that used to live here was replaced.
         if pre_epoched is not None:
+            from .onsets import channel_onsets
+
             for ch in eligible_channels:
                 entries = channel_epoch_results[ch]
                 if not entries:
                     continue
-                refined = onsets_anchored_to_channel(
-                    np.array([e["sig"] for e in entries], dtype=float), times, sfreq,
-                    baseline_mask,
+                pv1 = np.array([e["pv1"] for e in entries], dtype=float)
+                ptp = np.array([e["ptp"] for e in entries], dtype=float)
+                onsets, _ = channel_onsets(
+                    np.array([e["sig"] for e in entries], dtype=float), times,
+                    np.array([e["p1"] for e in entries], dtype=float), pv1,
+                    np.where(np.isfinite(ptp), ptp, np.abs(pv1)),
+                    t_lo=resp_tmin, noise_after=resp_tmax,
+                )
+                for e, val in zip(entries, onsets):
+                    e["onset"] = val
+                # The area of every deflection of the response (src/area.py),
+                # from this onset to where the curve settles back at zero.
+                from .area import channel_areas
+
+                areas, _ = channel_areas(
+                    np.array([e["sig"] for e in entries], dtype=float), times,
                     np.array([e["onset"] for e in entries], dtype=float),
                     np.array([e["p1"] for e in entries], dtype=float),
-                    np.array([e["ptp"] if np.isfinite(e["ptp"]) else abs(e["pv1"])
-                              for e in entries], dtype=float),
-                    k=STIM_ONSET_K,
-                    noise_after_s=resp_tmax,
+                    np.array([e["p2"] for e in entries], dtype=float), pv1, ptp,
+                    t_cap=resp_tmax, noise_after=resp_tmax,
                 )
-                for e, val in zip(entries, refined):
-                    e["onset"] = val
+                for e, val in zip(entries, areas):
+                    e["area"] = val
 
         # ── Channel-level consistency / artifact rejection ──
         corr_min_median = float(STIM_CHANNEL_MIN_MEDIAN_CORR)
@@ -4216,7 +4232,7 @@ def _run_pipeline(
             )):
                 for e in entries:
                     e["onset"] = e["p1"] = e["p2"] = np.nan
-                    e["pv1"] = e["pv2"] = e["ptp"] = np.nan
+                    e["pv1"] = e["pv2"] = e["ptp"] = e["area"] = np.nan
 
             for e in entries:
                 latency_markers[ch].append(
@@ -4233,6 +4249,7 @@ def _run_pipeline(
                 results["Peak1 value"].append(e["pv1"])
                 results["Peak2 value"].append(e["pv2"])
                 results["PTP amplitude"].append(e["ptp"])
+                results.setdefault("Response area", []).append(e.get("area", np.nan))
                 results["Inter-trial corr"].append(inter_trial_corr)
 
         base_name = file_name.split(".fif")[0]
@@ -4322,28 +4339,11 @@ def _run_pipeline(
         except Exception as exc:   # never let the extra step fail the whole run
             print(f"[RECRUITMENT] skipped ({type(exc).__name__}: {exc})", flush=True)
     elif neurosoft_scenario in (JENDRASSIK, PAIRED):
-        # Same deliverable for both: the curves themselves plus amplitude groups
-        # with their means and spreads.
-        #
-        # How many groups to look for comes from the file name. At one intensity
-        # the run is a block of plain test stimuli and a block with the manoeuvre
-        # -> two response levels. A name that says "80 и 90 мА" means that pair
-        # was run at each of two intensities -> four. Nothing in the export
-        # itself records the current, so the name is the only source.
-        # Only the Jendrassik protocol fixes the count. Paired stimulation does
-        # not, so its channels are grouped by whatever levels they actually show.
-        intensities = intensities_from_name(edf_path)
-        n_groups = (2 * max(len(intensities), 1)
-                    if neurosoft_scenario == JENDRASSIK else None)
-        if intensities and n_groups is not None:
-            print(
-                f"[NEUROSOFT] intensities in the name: "
-                f"{', '.join(f'{v} mA' for v in intensities)} -> "
-                f"looking for {n_groups} amplitude groups.",
-                flush=True,
-            )
+        # Jendrassik: the curves cut into contiguous blocks, their spread and a
+        # verdict per channel (src/curve_blocks.py). Paired stimulation: amplitude
+        # groups, as many as each channel's own levels show.
         try:
-            run_curve_group_analysis(output_root, neurosoft_scenario, n_groups)
+            run_curve_group_analysis(output_root, neurosoft_scenario)
         except Exception as exc:
             print(f"[{neurosoft_scenario.upper()}] skipped ({type(exc).__name__}: {exc})", flush=True)
 

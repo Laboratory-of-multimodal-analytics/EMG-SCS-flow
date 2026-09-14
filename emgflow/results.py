@@ -395,7 +395,7 @@ class SIRResults:
             if grp is None:
                 rows.append({
                     "Channel": str(ch), "Detections": 0, "Epochs": 0,
-                    "P1 (ms)": np.nan, "PTP (µV)": np.nan,
+                    "P1 (ms)": np.nan, "PTP (µV)": np.nan, "Area (µV·ms)": np.nan,
                     "Status": "rejected" if rejected else "no response",
                 })
                 continue
@@ -412,6 +412,8 @@ class SIRResults:
             p1 = grp["Peak1 latency"].to_numpy(dtype=float)
             # Amplitudes are stored in VOLTS; the column header promises µV.
             ptp = grp["PTP amplitude"].to_numpy(dtype=float) * 1e6
+            area = (grp["Response area"].to_numpy(dtype=float) * 1e9
+                    if "Response area" in grp.columns else np.array([np.nan]))
             status = "rejected" if rejected else ("detected" if det else "no response")
             if not rejected and session is not None and (crop.config, crop.amp, str(ch)) in session.force_keys:
                 status = "whitelisted"
@@ -421,6 +423,7 @@ class SIRResults:
                 "Epochs": int(len(grp)),
                 "P1 (ms)": np.nan if rejected or not np.isfinite(p1).any() else 1000 * np.nanmean(p1),
                 "PTP (µV)": np.nan if rejected or not np.isfinite(ptp).any() else np.nanmean(ptp),
+                "Area (µV·ms)": np.nan if rejected or not np.isfinite(area).any() else np.nanmean(area),
                 "Status": status,
             })
         return pd.DataFrame(rows)
@@ -616,12 +619,15 @@ class SIRResults:
                 "p1_ms": pd.to_numeric(sub["Peak1 latency"], errors="coerce") * 1e3,
                 "onset_ms": pd.to_numeric(sub.get("Onset latency"), errors="coerce") * 1e3,
                 "p2_ms": pd.to_numeric(sub.get("Peak2 latency"), errors="coerce") * 1e3,
+                "area_uvms": (pd.to_numeric(sub["Response area"], errors="coerce") * 1e9
+                              if "Response area" in sub.columns else np.nan),
             })
             if session is not None:
                 rejected = np.array([
                     self._is_rejected(session, str(config), crop.amp, ch)
                     for ch in frame["Channel"]], dtype=bool)
-                frame.loc[rejected, ["amp_uv", "p1_uv", "p1_ms", "onset_ms", "p2_ms"]] = np.nan
+                frame.loc[rejected, ["amp_uv", "p1_uv", "p1_ms", "onset_ms", "p2_ms",
+                                     "area_uvms"]] = np.nan
             # Mean over the epochs recorded at this amplitude. NaN rows are
             # undetected epochs and must not count as zeros, but a point where
             # NOTHING was detected stays NaN rather than becoming absent — the
@@ -630,7 +636,7 @@ class SIRResults:
                 amp_uv=("amp_uv", "mean"), sd_uv=("amp_uv", "std"),
                 n_epochs=("amp_uv", "count"), p1_uv=("p1_uv", "mean"),
                 p1_ms=("p1_ms", "mean"), onset_ms=("onset_ms", "mean"),
-                p2_ms=("p2_ms", "mean")).reset_index()
+                p2_ms=("p2_ms", "mean"), area_uvms=("area_uvms", "mean")).reset_index()
             agg["curve"] = pos
             agg["x_value"] = amplitude_to_float(crop.amp)
             agg["x_label"] = str(crop.amp)
@@ -722,6 +728,11 @@ class SIRResults:
                 p1v[rejected] = np.nan
             out[f"{pre}_amp_uv"] = ptp
             out[f"{pre}_p1_uv"] = p1v
+            area = (pd.to_numeric(sub[cols["area"]], errors="coerce") * 1e9
+                    if cols["area"] in sub.columns else pd.Series(np.nan, index=sub.index))
+            if rejected is not None:
+                area[rejected] = np.nan
+            out[f"{pre}_area_uvms"] = area
             for key, name, scale in (("onset", "onset_ms", 1e3), ("p1", "p1_ms", 1e3),
                                      ("p2", "p2_ms", 1e3)):
                 v = pd.to_numeric(sub[cols[key]], errors="coerce") * scale
@@ -758,7 +769,9 @@ class SIRResults:
                 self._is_rejected(session, str(config), str(a), str(ch))
                 for a, ch in zip(sub["Stim. amplitude"], sub["Channel"])
             ], dtype=bool)
-            sub.loc[rejected, ["Peak1 latency", "Peak1 value", "PTP amplitude"]] = np.nan
+            wiped = [c for c in ("Peak1 latency", "Peak1 value", "PTP amplitude", "Response area")
+                     if c in sub.columns]
+            sub.loc[rejected, wiped] = np.nan
 
         ptp = pd.to_numeric(sub["PTP amplitude"], errors="coerce") * 1e6
         p1 = pd.to_numeric(sub["Peak1 value"], errors="coerce") * 1e6
@@ -770,6 +783,8 @@ class SIRResults:
             "p1_ms": pd.to_numeric(sub["Peak1 latency"], errors="coerce") * 1e3,
             "onset_ms": pd.to_numeric(sub.get("Onset latency"), errors="coerce") * 1e3,
             "p2_ms": pd.to_numeric(sub.get("Peak2 latency"), errors="coerce") * 1e3,
+            "area_uvms": (pd.to_numeric(sub["Response area"], errors="coerce") * 1e9
+                          if "Response area" in sub.columns else np.nan),
         })
         return out.sort_values(["Channel", "curve"])
 

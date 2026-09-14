@@ -363,6 +363,44 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
                          "kind": f"пропущенный — досчитан, P1 {p1l * 1e3:.1f} мс"
                                  if np.isfinite(p1l) else "пропущенный — пик не найден"})
 
+    # Onsets last, once the set of detections is final: one per curve, re-derived
+    # for every channel a mark touched (see src/onsets.py). A hand onset stays the
+    # channel's level with each curve's own small shift around it — the value
+    # _measure_at wrote above is only a placeholder at the marker.
+    from .constants import TEXT_CURVES_RESP_TMAX, TEXT_CURVES_RESP_TMIN
+    from .onsets import channel_onsets
+
+    for channel, marks in ov.items():
+        if channel not in ch_index:
+            continue
+        rows = df.index[(df["Channel"].astype(str) == channel)
+                        & df["Epoch"].between(0, data.shape[0] - 1)]
+        if not len(rows):
+            continue
+        mk = marks.get(MARKERS) or {}
+        sigs = data[df.loc[rows, "Epoch"].astype(int).to_numpy(), ch_index[channel], :]
+        p1 = df.loc[rows, "Peak1 latency"].to_numpy(float)
+        pv1 = df.loc[rows, "Peak1 value"].to_numpy(float)
+        ptp = df.loc[rows, "PTP amplitude"].to_numpy(float)
+        onsets, _ = channel_onsets(
+            sigs, times, p1, pv1,
+            np.where(np.isfinite(ptp), ptp, np.abs(pv1)),
+            t_lo=TEXT_CURVES_RESP_TMIN,
+            hand_onset=float(mk["onset"]) / 1e3 if mk.get("onset") is not None else None,
+            hand_p1=float(mk["p1"]) / 1e3 if mk.get("p1") is not None else None,
+            noise_after=TEXT_CURVES_RESP_TMAX,
+        )
+        df.loc[rows, "Onset latency"] = onsets
+        # The response area rests on the onset and on the detection, so it is
+        # re-derived with them (src/area.py).
+        from .area import channel_areas
+
+        areas, _ = channel_areas(
+            sigs, times, onsets, p1, df.loc[rows, "Peak2 latency"].to_numpy(float), pv1, ptp,
+            t_cap=TEXT_CURVES_RESP_TMAX, noise_after=TEXT_CURVES_RESP_TMAX,
+        )
+        df.loc[rows, "Response area"] = areas
+
     df.to_csv(csv, index=False)
 
     # Rebuild EVERY table and per-crop panel from the corrected CSV, so nothing

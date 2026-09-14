@@ -108,9 +108,9 @@ class SIRViewer(QWidget):
         mv.addWidget(self.hint)
 
         # ---- right: table + recruitment ----
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Channel", "Detections", "Epochs", "P1 (ms)", "PTP (µV)", "Status"]
+            ["Channel", "Detections", "Epochs", "P1 (ms)", "PTP (µV)", "Area (µV·ms)", "Status"]
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -345,7 +345,7 @@ class SIRViewer(QWidget):
         self.table.blockSignals(True)
         self.table.setRowCount(len(df))
         for r, (_, row) in enumerate(df.iterrows()):
-            for c, key in enumerate(["Channel", "Detections", "Epochs", "P1 (ms)", "PTP (µV)", "Status"]):
+            for c, key in enumerate(["Channel", "Detections", "Epochs", "P1 (ms)", "PTP (µV)", "Area (µV·ms)", "Status"]):
                 val = row[key]
                 text = ("—" if not np.isfinite(val) else f"{val:.2f}") if isinstance(val, float) else str(val)
                 item = QTableWidgetItem(text)

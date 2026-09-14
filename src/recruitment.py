@@ -9,7 +9,9 @@ this module reshapes those per-epoch metrics into recruitment deliverables:
   - a recruitment plot (amplitude vs curve number, per channel);
   - box-plots + summary statistics on TWO views the clinician asked for:
       * TOP-N  — only the last N curves (the maximal responses / plateau);
-      * GROUPS — curves binned by similar response amplitude (low..high).
+      * GROUPS — curves binned by similar response amplitude (low..high);
+  - left/right asymmetry on the last N curves, channel pairs ch1-ch5 … ch4-ch8
+    (``src/asymmetry.py``; the sides are provisional).
 
 Runs off the SIR metrics CSV, so it is independent of the detection code and can
 also be invoked stand-alone on an existing results folder.
@@ -26,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from . import asymmetry as A
 from .io_utils import STIMULATION_INDUCED_FOLDER, ensure_dir, find_mode_dir
 
 #: How a run's stimuli are laid out along the recruitment axis.
@@ -123,17 +126,13 @@ def _stats(series: pd.Series) -> dict:
     }
 
 
-def _tidy_metrics(csv: Path):
-    """Per-curve metrics in physiological units, plus the responding channels.
-
-    Shared with the Jendrassik deliverable, which needs the same table. Returns
-    ``(tidy_df, responders)``, or ``(None, [])`` when nothing responded.
-    """
+def _tidy_frame(csv: Path) -> pd.DataFrame | None:
+    """Per-curve metrics of EVERY channel in physiological units, or None if empty."""
     cols = ["Epoch", "Channel", "Onset latency", "Peak1 latency", "Peak2 latency",
-            "Peak1 value", "Peak2 value", "PTP amplitude"]
+            "Peak1 value", "Peak2 value", "PTP amplitude", "Response area"]
     df = pd.read_csv(csv, usecols=lambda c: c in cols)
     if df.empty:
-        return None, []
+        return None
 
     # to physiological units: curve number from 1, latencies in ms, values in uV
     tidy = pd.DataFrame({
@@ -146,9 +145,25 @@ def _tidy_metrics(csv: Path):
         "P2 uV": df["Peak2 value"] * 1e6,
         "PTP uV": df["PTP amplitude"] * 1e6,
     })
+    # every deflection of the response, rectified (src/area.py). A run made before
+    # the area existed has no such column, and its tables stay exactly as they were.
+    if "Response area" in df.columns:
+        tidy["Area uV·ms"] = df["Response area"] * 1e9
     # response amplitude: PTP when biphasic, else |P1| (monophasic channels)
     tidy["Amplitude uV"] = tidy["PTP uV"].where(
         tidy["PTP uV"].notna(), tidy["P1 uV"].abs())
+    return tidy
+
+
+def _tidy_metrics(csv: Path):
+    """Per-curve metrics in physiological units, plus the responding channels.
+
+    Shared with the Jendrassik deliverable, which needs the same table. Returns
+    ``(tidy_df, responders)``, or ``(None, [])`` when nothing responded.
+    """
+    tidy = _tidy_frame(csv)
+    if tidy is None:
+        return None, []
 
     # keep only responding channels (at least one detected P1), ordered naturally
     responders = [c for c in sorted(tidy["Channel"].unique(),
@@ -187,17 +202,20 @@ def run_recruitment_analysis(
     # On these files P2 and PTP are routinely undetected (monophasic responses),
     # and an all-NaN table, column or box-plot panel is just noise. Report only
     # the metrics that actually carry values.
-    metrics = [m for m in ["Amplitude uV", "PTP uV", "P1 uV", "P2 uV"]
-               if tidy[m].notna().any()]
+    metrics = [m for m in ["Amplitude uV", "Area uV·ms", "PTP uV", "P1 uV", "P2 uV"]
+               if m in tidy.columns and tidy[m].notna().any()]
 
     # ── per-curve tables ──
     tidy_round = tidy.copy()
-    for c in ["Onset ms", "P1 ms", "P2 ms", "P1 uV", "P2 uV", "PTP uV", "Amplitude uV"]:
-        tidy_round[c] = tidy_round[c].round(3)
+    for c in ["Onset ms", "P1 ms", "P2 ms", "P1 uV", "P2 uV", "PTP uV", "Amplitude uV",
+              "Area uV·ms"]:
+        if c in tidy_round.columns:
+            tidy_round[c] = tidy_round[c].round(3)
     tidy_round.sort_values(["Channel", "Curve"]).to_csv(
         excel_dir / "recruitment_by_curve_long.csv", index=False)
     for metric in metrics:
-        fname = f"recruitment_{metric.split()[0]}_uV_wide.csv"
+        name, unit = metric.split()[0], metric.split()[1].replace("·", "")
+        fname = f"recruitment_{name}_{unit}_wide.csv"
         (tidy.pivot_table(index="Curve", columns="Channel", values=metric)
          .reindex(columns=responders).round(3)
          .to_csv(excel_dir / fname))
@@ -220,6 +238,10 @@ def run_recruitment_analysis(
                               "Curves": f"{top_curves[0]}-{top_curves[-1]}",
                               **_stats(d[metric])})
     pd.DataFrame(top_stats).to_csv(excel_dir / f"stats_top{top_n}.csv", index=False)
+    try:
+        write_asymmetry_tables(output_root, top_n)
+    except Exception as exc:     # the asymmetry is an extra; never lose the rest for it
+        print(f"[RECRUITMENT] asymmetry skipped ({type(exc).__name__}: {exc})", flush=True)
 
     # ── GROUPS by similar amplitude (per channel) ──
     tidy = _assign_amplitude_groups(tidy, responders, n_groups)
@@ -241,6 +263,77 @@ def run_recruitment_analysis(
     print(f"[RECRUITMENT] {len(responders)} channels, {len(curves)} curves -> {out_dir}"
           f"; tables -> {excel_dir}", flush=True)
     return out_dir
+
+
+def write_asymmetry_tables(output_root: Path, top_n: int = RECRUITMENT_TOP_N) -> list[str]:
+    """Left/right asymmetry of the last *top_n* curves, next to ``stats_top5.csv``.
+
+    Channel pairs ch1-ch5 … ch4-ch8, sides provisional (``src/asymmetry.py``).
+    Read from the metrics CSV of every channel, not only the responding ones, and
+    completed with the channels of the saved epochs: the CSV leaves out a channel
+    on which no response template was found, and a leg that never responds is
+    exactly the complete asymmetry this reports. A pair is skipped only when one
+    of its channels was not recorded (or was excluded by hand).
+
+      * ``asymmetry_top5.csv`` — amplitude and area: mean of each side over the
+        last curves (no response = 0), AI = (R-L)/(R+L), R/L, spread of the
+        per-curve AI;
+      * ``asymmetry_latency_top5.csv`` — onset and P1 latency: R-L in ms on the
+        curves where both sides respond;
+      * ``asymmetry_top5_by_curve.csv`` — both sides and the index of every curve.
+
+    Returns the names of the files written (none when the run has no pair).
+    """
+    output_root = Path(output_root)
+    csv = _metrics_csv(output_root)
+    if not csv.exists():
+        return []
+    tidy = _tidy_frame(csv)
+    if tidy is None:
+        return []
+    frame = tidy.rename(columns={"Curve": "curve", "Channel": "channel"})
+    metrics = {m: "size" for m in ("Amplitude uV", "Area uV·ms") if m in frame.columns}
+    metrics |= {"Onset ms": "latency", "P1 ms": "latency"}
+    by_curve, summary = A.recording_asymmetry(frame, metrics, n=top_n,
+                                              recorded=A.recorded_channels(output_root))
+    if summary.empty:
+        return []
+    excel_dir = ensure_dir(shared_excel_dir(output_root))
+    written = []
+
+    size = summary[summary["kind"] == "size"]
+    if not size.empty:
+        pd.DataFrame({
+            "Pair": size["pair"], "Left channel": size["left"], "Right channel": size["right"],
+            "Sides": A.SIDES_NOTE, "Metric": size["metric"], "Curves": size["curves"],
+            "N left": size["n_left"], "N right": size["n_right"],
+            "Left mean (no response = 0)": size["left_mean"].round(3),
+            "Right mean (no response = 0)": size["right_mean"].round(3),
+            "AI (R-L)/(R+L)": size["ai"].round(3), "Ratio R/L": size["ratio"].round(3),
+            "AI SD over curves": size["ai_sd_curves"].round(3), "Responses": size["responses"],
+        }).to_csv(excel_dir / f"asymmetry_top{top_n}.csv", index=False)
+        written.append(f"asymmetry_top{top_n}.csv")
+
+    lat = summary[summary["kind"] == "latency"]
+    if not lat.empty:
+        pd.DataFrame({
+            "Pair": lat["pair"], "Left channel": lat["left"], "Right channel": lat["right"],
+            "Sides": A.SIDES_NOTE, "Metric": lat["metric"], "Curves": lat["curves"],
+            "N left": lat["n_left"], "N right": lat["n_right"], "N both": lat["n_both"],
+            "Left mean ms": lat["left_mean"].round(3), "Right mean ms": lat["right_mean"].round(3),
+            "R-L ms (curves with both)": lat["diff_ms"].round(3), "R-L SD": lat["diff_sd"].round(3),
+            "Responses": lat["responses"],
+        }).to_csv(excel_dir / f"asymmetry_latency_top{top_n}.csv", index=False)
+        written.append(f"asymmetry_latency_top{top_n}.csv")
+
+    pd.DataFrame({
+        "Pair": by_curve["pair"], "Metric": by_curve["metric"], "Curve": by_curve["curve"],
+        "Left": by_curve["left_value"].round(3), "Right": by_curve["right_value"].round(3),
+        "AI (R-L)/(R+L)": by_curve["ai"].round(3), "Ratio R/L": by_curve["ratio"].round(3),
+        "R-L ms": by_curve["diff_ms"].round(3),
+    }).to_csv(excel_dir / f"asymmetry_top{top_n}_by_curve.csv", index=False)
+    written.append(f"asymmetry_top{top_n}_by_curve.csv")
+    return written
 
 
 #: Below this many points a cluster's own std is noise itself (or exactly 0 on

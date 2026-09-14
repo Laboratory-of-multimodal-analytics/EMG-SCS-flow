@@ -90,6 +90,7 @@ COMPONENT_COLUMNS = {
     "pv1": "{c} peak1 value",
     "pv2": "{c} peak2 value",
     "ptp": "{c} PTP amplitude",
+    "area": "{c} response area",
 }
 
 #: The legacy single-response columns, which stay in place and mirror the M-wave.
@@ -100,6 +101,7 @@ LEGACY_COLUMNS = {
     "pv1": "Peak1 value",
     "pv2": "Peak2 value",
     "ptp": "PTP amplitude",
+    "area": "Response area",
 }
 
 #: Marker keys a hand-drawn H-reflex template carries — six, not three.
@@ -354,13 +356,8 @@ def _apply_channel_gates(res: dict[str, np.ndarray], curves, times, sfreq,
             res[k][:] = np.nan
         return
 
-    # One latency per channel rather than one per curve's own noise floor — the
-    # same correction the recruitment path makes, for the same reason.
-    res["onset"] = onsets_anchored_to_channel(
-        curves, times, sfreq, baseline_mask, res["onset"], res["p1"],
-        np.where(np.isfinite(res["ptp"]), res["ptp"], np.abs(res["pv1"])),
-        k=STIM_ONSET_K, noise_after_s=resp_tmax,
-    )
+    # The final onsets are set in measure_run once both components are settled
+    # (src/onsets.py); the provisional per-curve ones only need to follow P1.
     res["onset"][~np.isfinite(res["p1"])] = np.nan
 
 
@@ -535,6 +532,27 @@ def measure_run(
                              resp_tmin, resp_tmax)
         _apply_marks(res, ch_marks, curves, times, sfreq,
                      baseline_mask, ref, resp_tmin, resp_tmax)
+        # Onsets last, once both components' detections are final: one per curve
+        # (src/onsets.py), the reflex's never before its own curve's M rebound,
+        # hand onsets keeping the clinician's level.
+        from .onsets import hreflex_onsets
+
+        hand = (ref if ref is not None and ref.get("source") == "маркеры вручную"
+                else None)
+        for comp, (onsets, _) in hreflex_onsets(
+                curves, times, res, resp_tmin, resp_tmax, hand=hand).items():
+            res[comp]["onset"] = onsets
+        # Areas rest on the onsets (src/area.py). An M-wave ends, at the latest,
+        # where this curve's reflex begins; the reflex, at the end of the window.
+        from .area import channel_areas
+
+        h_onset = res["H"]["onset"]
+        for comp in COMPONENTS:
+            r = res[comp]
+            cap = (np.where(np.isfinite(h_onset), h_onset, resp_tmax) if comp == "M"
+                   else resp_tmax)
+            r["area"], _ = channel_areas(curves, times, r["onset"], r["p1"], r["p2"],
+                                         r["pv1"], r["ptp"], t_cap=cap, noise_after=resp_tmax)
 
         for comp in COMPONENTS:
             cols = columns_for(comp)
@@ -591,10 +609,14 @@ def tidy_metrics(csv: Path) -> tuple[pd.DataFrame | None, list[str]]:
         cols = columns_for(comp)
         for key, unit, scale in (("onset", "ms", 1e3), ("p1", "ms", 1e3),
                                  ("p2", "ms", 1e3), ("pv1", "uV", 1e6),
-                                 ("pv2", "uV", 1e6), ("ptp", "uV", 1e6)):
+                                 ("pv2", "uV", 1e6), ("ptp", "uV", 1e6),
+                                 ("area", "uV·ms", 1e9)):
             name = {"onset": f"{comp} onset ms", "p1": f"{comp} P1 ms",
                     "p2": f"{comp} P2 ms", "pv1": f"{comp} P1 uV",
-                    "pv2": f"{comp} P2 uV", "ptp": f"{comp} PTP uV"}[key]
+                    "pv2": f"{comp} P2 uV", "ptp": f"{comp} PTP uV",
+                    "area": f"{comp} area uV·ms"}[key]
+            if key == "area" and cols[key] not in df.columns:
+                continue      # a run made before the area existed keeps its tables as they were
             out[name] = pd.to_numeric(df.get(cols[key]), errors="coerce") * scale
         # One amplitude per component, so the two curves are directly comparable.
         out[f"{comp} amplitude uV"] = out[f"{comp} PTP uV"]
@@ -628,6 +650,10 @@ def hm_summary(tidy: pd.DataFrame, responders: list[str]) -> pd.DataFrame:
             rec[f"{comp} threshold curve"] = (int(d.loc[ok, "Curve"].min())
                                               if ok.any() else np.nan)
             rec[f"{comp} N curves"] = int(ok.sum())
+            if f"{comp} area uV·ms" in d.columns:
+                area = d[f"{comp} area uV·ms"]
+                rec[f"{comp} area max uV·ms"] = (round(float(area.max()), 1)
+                                                  if area.notna().any() else np.nan)
         m, h = rec["Mmax uV"], rec["Hmax uV"]
         rec["Hmax/Mmax"] = (round(float(h / m), 3)
                             if np.isfinite(m) and np.isfinite(h) and m > 0 else np.nan)
@@ -657,6 +683,11 @@ def run_hreflex_analysis(output_root: Path) -> Path | None:
                           values=f"{comp} amplitude uV")
          .reindex(columns=responders).round(3)
          .to_csv(excel_dir / f"hreflex_{comp}_amplitude_uV_wide.csv"))
+        if f"{comp} area uV·ms" in tidy.columns and tidy[f"{comp} area uV·ms"].notna().any():
+            (tidy.pivot_table(index="Curve", columns="Channel",
+                              values=f"{comp} area uV·ms")
+             .reindex(columns=responders).round(1)
+             .to_csv(excel_dir / f"hreflex_{comp}_area_uVms_wide.csv"))
     hm = hm_summary(tidy, responders)
     hm.to_csv(excel_dir / "stats_hm.csv", index=False)
 
@@ -668,9 +699,7 @@ def run_hreflex_analysis(output_root: Path) -> Path | None:
     return out_dir
 
 
-def run_hreflex_jendrassik_groups(
-    output_root: Path, n_groups: int | None = None,
-) -> Path | None:
+def run_hreflex_jendrassik_groups(output_root: Path) -> Path | None:
     """Amplitude groups for an H-reflex file that was ALSO a Jendrassik run.
 
     28 of the 75 H-reflex files in this dataset carry a Jendrassik token as well
@@ -688,19 +717,14 @@ def run_hreflex_jendrassik_groups(
     effect. (That the M-wave stays put across the groups is itself worth
     checking, and it is in the per-curve table.)
 
-    Everything else follows the Jendrassik scenario: the count of groups comes
-    from the intensities named in the file (two per intensity), each curve is
-    drawn rather than averaged, and the ``Curves`` column says which curves fell
-    in each group — the check that the split found the protocol blocks and not
-    amplitude noise. Outputs live under ``H-reflex/`` rather than in a second
+    Everything else follows the Jendrassik scenario (``src/curve_blocks.py``): the
+    curves are cut into contiguous blocks of similar reflex amplitude, each block
+    reports its spread, and each channel gets A. Militskova's verdict (SD above
+    30 µV — the manoeuvre works). Every curve is drawn rather than averaged. Outputs live under ``H-reflex/`` rather than in a second
     scenario folder: the run has one scenario, and this is part of its
     deliverable.
     """
-    from .jendrassik import (
-        _curve_span, _group_colors, _load_epoch_waveforms, _plot_curves_by_group,
-        _plot_group_boxplots,
-    )
-    from .recruitment import _assign_amplitude_groups, _stats, channel_group_labels
+    from .jendrassik import HREFLEX_BLOCK_NAMES, _reported_metrics, write_block_deliverable
 
     output_root = Path(output_root)
     csv = metrics_csv(output_root)
@@ -719,13 +743,9 @@ def run_hreflex_jendrassik_groups(
               "группировка по нему невозможна, пропускаю.", flush=True)
         return None
 
-    if n_groups is None:
-        from .jendrassik import _jendrassik_groups_from_name
-        n_groups = _jendrassik_groups_from_name(output_root)
-
-    # The shared group/plot helpers speak the single-response column names, so
-    # the H columns are presented under them. Renaming rather than reimplementing
-    # keeps this figure identical to the one the Jendrassik scenario produces.
+    # The shared block helpers speak the single-response column names, so the H
+    # columns are presented under them. Renaming rather than reimplementing keeps
+    # these figures identical to the ones the Jendrassik scenario produces.
     grouped = pd.DataFrame({
         "Channel": tidy["Channel"], "Curve": tidy["Curve"],
         "Onset ms": tidy["H onset ms"], "P1 ms": tidy["H P1 ms"],
@@ -736,49 +756,18 @@ def run_hreflex_jendrassik_groups(
         # the control the whole comparison rests on.
         "M amplitude uV": tidy["M amplitude uV"], "M P1 ms": tidy["M P1 ms"],
     })
+    if "H area uV·ms" in tidy.columns:
+        grouped["Area uV·ms"] = tidy["H area uV·ms"]
     grouped = grouped[grouped["Channel"].isin(responders)].copy()
-    grouped = _assign_amplitude_groups(grouped, responders, n_groups)
 
     out_dir = ensure_dir(_sir_dir(output_root) / "H-reflex")
     excel_dir = ensure_dir(_sir_dir(output_root) / "Excel")
-    grouped.round(3).sort_values(["Channel", "Curve"]).to_csv(
-        excel_dir / "hreflex_jendrassik_by_curve_long.csv", index=False)
-
-    n_seen = max((len(channel_group_labels(grouped, ch)) for ch in responders), default=1)
-    labels = [f"G{i + 1}" for i in range(n_seen)]
-    colors = _group_colors(n_seen)
-
-    metrics = [m for m in ["Amplitude uV", "PTP uV", "P1 uV", "P2 uV", "P1 ms",
-                           "Onset ms", "M amplitude uV"]
-               if grouped[m].notna().any()]
-    rows = []
-    for ch in responders:
-        d = grouped[grouped["Channel"] == ch]
-        for grp in labels:
-            dg = d[d["Amplitude group"] == grp]
-            if dg.empty:
-                continue
-            for metric in metrics:
-                rows.append({"Channel": ch, "Amplitude group": grp,
-                             "Curves": _curve_span(dg["Curve"]),
-                             "Metric": metric, **_stats(dg[metric])})
-    stats = pd.DataFrame(rows)
-    if not stats.empty:
-        stats = stats[stats["N"] > 0]
-    stats.to_csv(excel_dir / "hreflex_jendrassik_group_stats.csv", index=False)
-
-    times, waves = _load_epoch_waveforms(output_root)
-    drawn = [ch for ch in responders if ch in waves]
-    if times is not None and drawn:
-        _plot_curves_by_group(
-            times, waves, grouped, drawn, labels, colors,
-            out_dir / "jendrassik_curves_by_H_group.png",
-            "приём Ендрассика, группы по H-рефлексу")
-    _plot_group_boxplots(grouped, responders, labels, colors,
-                         out_dir / "jendrassik_H_amplitude_by_group_boxplots.png")
-
-    print(f"[HREFLEX/JM] {len(responders)} канал(ов), {n_groups} групп по амплитуде "
-          f"H-рефлекса -> {out_dir}; таблицы -> {excel_dir}", flush=True)
+    res = write_block_deliverable(
+        output_root, grouped, responders, _reported_metrics(grouped, extra=("M amplitude uV",)),
+        HREFLEX_BLOCK_NAMES, out_dir, excel_dir, "приём Ендрассика, блоки по H-рефлексу")
+    counts = res.verdict["Verdict"].value_counts().to_dict()
+    print(f"[HREFLEX/JM] {len(responders)} канал(ов), блоки по амплитуде H-рефлекса; "
+          f"вердикты {counts} -> {out_dir}; таблицы -> {excel_dir}", flush=True)
     return out_dir
 
 

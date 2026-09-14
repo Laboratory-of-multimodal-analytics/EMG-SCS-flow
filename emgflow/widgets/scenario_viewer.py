@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from matplotlib import colors as mcolors
+from matplotlib.cm import ScalarMappable
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
@@ -31,8 +32,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from src.jendrassik import CURVE_GROUPS
-from src.neurosoft import intensities_from_name
+from src.constants import HREFLEX_NOISE_TAIL_MS, HREFLEX_RESP_TMAX, TEXT_CURVES_RESP_TMAX
+import src.curve_blocks as CB
 from src.plotting import SWEEP_CMAP
 from src.recruitment import choose_n_groups, cluster_amplitudes
 from matplotlib.widgets import SpanSelector
@@ -48,13 +49,12 @@ from src.recruitment import (STIM_AXIS_AMPLITUDE as AMPLITUDE_AXIS,
                             STIM_AXIS_CURVE as CURVE_AXIS)
 
 #: Folder the pipeline wrote -> (tab label, default colouring, number of groups).
-#: Only Jendrassik fixes the count, and from the protocol: a block of test stimuli
-#: and a block with the manoeuvre, per intensity. Elsewhere None means each
-#: channel's own amplitudes decide — nothing about a recruitment ramp or a
-#: paired-pulse run says how many response levels it should have.
+#: None means each channel's own amplitudes decide the groups. A Jendrassik run is
+#: not grouped by amplitude at all: it is cut into contiguous blocks
+#: (src/curve_blocks.py), as in its exported tables.
 SCENARIOS = {
     "Recruitment": ("Recruitment curve", "curve order", None),
-    "Jendrassik": ("Jendrassik manoeuvre", "amplitude group", CURVE_GROUPS),
+    "Jendrassik": ("Jendrassik manoeuvre", "block", None),
     "Paired stimulation": ("Paired stimulation", "amplitude group", None),
     "H-reflex": ("H-reflex", "curve order", None),
 }
@@ -69,6 +69,16 @@ COMPONENT_LABELS = {"M": "M-ответ (прямой)", "H": "H-рефлекс"}
 
 #: Group colours, matching src/jendrassik.py so the GUI and the PNGs agree.
 GROUP_COLORS = ["#4575b4", "#f0a202", "#d73027", "#4d9221", "#7b3294"]
+
+
+def _label_colour(label: str, labels: list[str]):
+    """Colour of a group (G…, by rank) or of a Jendrassik block (B…, by number, as in the PNGs)."""
+    from matplotlib import colormaps
+
+    if str(label).startswith("B"):
+        return colormaps["tab10"]((int(str(label)[1:]) - 1) % 10)
+    i = labels.index(label)
+    return GROUP_COLORS[i] if i < len(GROUP_COLORS) else colormaps["tab10"](i % 10)
 
 
 def _assign_groups(amps: pd.Series, n_groups: int | None) -> pd.Series:
@@ -110,6 +120,8 @@ class ScenarioViewer(QWidget):
         self.waves: dict[str, np.ndarray] = {}
         self.channel: str | None = None
         self.n_groups: int | None = None
+        #: The current channel's Jendrassik blocks (None on every other scenario).
+        self._blocks: list | None = None
         #: "curve" (a Neurosoft export, one stimulus per curve) or "amplitude"
         #: (a crop per mA). Decides what the x axis MEANS; everything keyed on
         #: the ramp position keeps working either way.
@@ -125,6 +137,8 @@ class ScenarioViewer(QWidget):
         self._points = None          # curve numbers behind the top plot, for click hit-testing
         self._ax_top = None
         self._ax_tops: list = []     # H-reflex: one point plot per component
+        self._ax_scatter = None      # H-reflex: M against H
+        self._scatter = None         # (curve numbers, H uV, M uV) behind that plot
 
         # ---- left: channels + controls ----
         self.header = QLabel("<b>No Neurosoft scenario in this run</b>")
@@ -144,6 +158,14 @@ class ScenarioViewer(QWidget):
         self.config_label = QLabel("<b>Конфигурация</b>")
         self.config_box.setVisible(False)
         self.config_label.setVisible(False)
+
+        # Which number the point plots and the statistics show. The area is every
+        # deflection of the response (src/area.py) — what a polyphasic response
+        # is measured by, where PTP reads only its two largest phases.
+        self.metric_box = QComboBox()
+        self.metric_box.addItem("размах (PTP / |P1|), мкВ", "amp")
+        self.metric_box.addItem("площадь ответа, мкВ·мс", "area")
+        self.metric_box.currentIndexChanged.connect(lambda _: self._draw())
 
         self.color_box = QComboBox()
         self.color_box.addItems(["colour by curve order", "colour by amplitude group"])
@@ -218,6 +240,7 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.config_box)
         lv.addWidget(QLabel("<b>Channels</b>"))
         lv.addWidget(self.channel_list, 1)
+        lv.addWidget(self.metric_box)
         lv.addWidget(self.color_box)
         lv.addWidget(self.show_all)
         lv.addWidget(self.show_band)
@@ -239,7 +262,7 @@ class ScenarioViewer(QWidget):
         self.canvas.mpl_connect("button_press_event", self._on_click)
 
         self.hint = QLabel(
-            "Click a point on the top plot to pull that curve up below, or drag the slider."
+            "Click a point on a top plot to pull that curve up below, or drag the slider."
         )
         self.hint.setStyleSheet("color: gray; font-size: 10px;")
 
@@ -319,15 +342,25 @@ class ScenarioViewer(QWidget):
         """Read one configuration's ramp onto the surface."""
         label = SCENARIOS.get(self.scenario, (self.scenario, "curve order", None))[0]
         config = self.config
-        # Group count follows the intensities named in the file, exactly as the
-        # pipeline does it, so the on-screen groups are the exported ones.
-        if self.scenario == "Jendrassik":
-            intensities = intensities_from_name(config)
-            self.n_groups = 2 * max(len(intensities), 1)
+        jendrassik = self.scenario == "Jendrassik"
+        self.color_box.setItemText(1, "colour by block" if jendrassik else "colour by amplitude group")
+        self.show_band.setText("block mean ± SD" if jendrassik else "group mean ± SD")
         if self.is_hreflex:
             self.by_curve = self.results.hreflex_by_curve(config, self.session)
         else:
             self.by_curve = self.results.recruitment_points(config, self.session)
+        # A run made before the area existed has no such column: the choice is
+        # offered only where there is something to show.
+        area_cols = ["m_area_uvms", "h_area_uvms"] if self.is_hreflex else ["area_uvms"]
+        has_area = bool(self.by_curve is not None and not self.by_curve.empty and any(
+            c in self.by_curve.columns and self.by_curve[c].notna().any() for c in area_cols))
+        self.metric_box.setEnabled(has_area)
+        self.metric_box.setToolTip(
+            "" if has_area else "В этом прогоне площадь ответа не посчитана — перезапустите файл.")
+        if not has_area:
+            self.metric_box.blockSignals(True)
+            self.metric_box.setCurrentIndex(0)
+            self.metric_box.blockSignals(False)
         self.component_box.setVisible(self.is_hreflex)
         self.component_label.setVisible(self.is_hreflex)
         # Amplitude groups are a Jendrassik/paired idea: they look for the two
@@ -417,6 +450,39 @@ class ScenarioViewer(QWidget):
             return "amp_uv"
         return f"{(comp or self.component()).lower()}_amp_uv"
 
+    def _use_area(self) -> bool:
+        return self.metric_box.isEnabled() and self.metric_box.currentData() == "area"
+
+    def _value_column(self, comp: str | None = None) -> str:
+        """Column behind the point plots: the amplitude, or the response area."""
+        if self.is_hreflex:
+            pre = (comp or self.component()).lower()
+            return f"{pre}_area_uvms" if self._use_area() else f"{pre}_amp_uv"
+        return "area_uvms" if self._use_area() else "amp_uv"
+
+    def _hreflex_tmax(self) -> float:
+        """The H-reflex response window's end, as the run measured it."""
+        end = float(np.asarray(self.times)[-1]) if self.times is not None else HREFLEX_RESP_TMAX
+        return max(TEXT_CURVES_RESP_TMAX, min(HREFLEX_RESP_TMAX, end - HREFLEX_NOISE_TAIL_MS / 1e3))
+
+    def _shade_area(self, ax, t_ms, sel, row, prefix: str, t_cap: float, colour) -> None:
+        """Shade what the selected curve's area covers: onset to the end of its response."""
+        from src.area import response_end
+
+        onset = row.get(f"{prefix}onset_ms", np.nan)
+        p1 = row.get(f"{prefix}p1_ms", np.nan)
+        p2 = row.get(f"{prefix}p2_ms", np.nan)
+        amp = row.get(f"{prefix}amp_uv", np.nan)
+        if not (np.isfinite(onset) and np.isfinite(p1)):
+            return
+        if not np.isfinite(amp):
+            amp = abs(row.get(f"{prefix}p1_uv", np.nan))
+        start = (p2 if np.isfinite(p2) else p1) / 1e3
+        end = response_end(sel, np.asarray(self.times), start, t_cap, amp, t_cap)
+        m = (t_ms >= onset) & (t_ms <= end * 1e3)
+        if m.sum() > 1:
+            ax.fill_between(t_ms[m], 0, sel[m], color=colour, alpha=0.28, lw=0, zorder=4)
+
     def _responders(self) -> list[str]:
         """Channels with at least one detected response, in natural order."""
         if self.by_curve is None or self.by_curve.empty:
@@ -452,6 +518,20 @@ class ScenarioViewer(QWidget):
         """Select the curve nearest the click on the top plot."""
         if event.inaxes is None or self._points is None or event.xdata is None:
             return
+        # M-against-H: both axes are amplitudes, so the nearest point is nearest
+        # on the screen, not on either axis alone.
+        if self._ax_scatter is not None and event.inaxes is self._ax_scatter:
+            if self._scatter is None or not len(self._scatter[0]):
+                return
+            cs, xs, ys = self._scatter
+            pix = self._ax_scatter.transData.transform(np.column_stack([xs, ys]))
+            nearest = int(cs[int(np.argmin(np.hypot(pix[:, 0] - event.x, pix[:, 1] - event.y)))])
+            self.selected_curve = nearest
+            self.slider.blockSignals(True)
+            self.slider.setValue(nearest)
+            self.slider.blockSignals(False)
+            self._draw()
+            return
         # H-reflex draws one point plot per component; a click on either selects
         # the curve, because the curve is what gets pulled up below and both
         # responses live on it.
@@ -481,6 +561,8 @@ class ScenarioViewer(QWidget):
         self._points = None
         self._ax_top = None
         self._ax_tops = []
+        self._ax_scatter = None
+        self._scatter = None
         self.stats.setRowCount(0)
         self.canvas.draw_idle()
 
@@ -518,7 +600,14 @@ class ScenarioViewer(QWidget):
 
     def _groups_for(self, ch: str) -> pd.DataFrame:
         g = self.by_curve[self.by_curve["Channel"] == ch].sort_values("curve").copy()
-        g["group"] = _assign_groups(g["amp_uv"], self.n_groups)
+        if self.scenario == "Jendrassik":
+            # contiguous blocks, exactly as the exported tables cut the run; silent
+            # blocks carry no label, so their curves stay grey
+            self._blocks = CB.find_blocks(g["amp_uv"].to_numpy(float), g["curve"].to_numpy(int))
+            g["group"] = CB.labels_per_curve(self._blocks, len(g), silent_label=False)
+        else:
+            self._blocks = None
+            g["group"] = _assign_groups(g["amp_uv"], self.n_groups)
         return g
 
     # ---- H-reflex: two responses, two point plots ---------------------- #
@@ -532,6 +621,10 @@ class ScenarioViewer(QWidget):
         currently smaller into the axis — and that one is usually the one being
         judged. The exported figure does put them together, because there the
         crossover is the message; here the job is to see one curve's markers.
+
+        The third panel puts the two against each other — M-wave amplitude over
+        the reflex's, one point per curve that carries both — which is where the
+        reflex rising and then receding as the M-wave grows reads as one shape.
         """
         g = self.by_curve[self.by_curve["Channel"] == ch].sort_values("curve").copy()
         waves = self.waves[ch]
@@ -540,9 +633,10 @@ class ScenarioViewer(QWidget):
         self._points = curves
 
         self.fig.clear()
-        gs = self.fig.add_gridspec(2, 2, height_ratios=[1, 1.4])
+        gs = self.fig.add_gridspec(2, 3, height_ratios=[1, 1.4], width_ratios=[1, 1, 1])
         ax_m = self.fig.add_subplot(gs[0, 0])
         ax_h = self.fig.add_subplot(gs[0, 1])
+        ax_mh = self.fig.add_subplot(gs[0, 2])
         ax_bot = self.fig.add_subplot(gs[1, :])
         self._ax_tops = [ax_m, ax_h]
         self._ax_top = ax_m
@@ -550,10 +644,13 @@ class ScenarioViewer(QWidget):
         per_ch = self.overrides.get(ch, {})
         for comp, ax in (("M", ax_m), ("H", ax_h)):
             pre = comp.lower()
-            amps = g[f"{pre}_amp_uv"].to_numpy(float)
+            value_col = self._value_column(comp)
+            amps = (g[value_col].to_numpy(float) if value_col in g.columns
+                    else np.full(len(g), np.nan))
             got = np.isfinite(amps)
-            shown = self._provisional_amplitudes(
-                g, waves, amp_col=f"{pre}_amp_uv", p1_col=f"{pre}_p1_ms")
+            shown = (np.full(len(curves), np.nan) if self._use_area() else
+                     self._provisional_amplitudes(
+                         g, waves, amp_col=f"{pre}_amp_uv", p1_col=f"{pre}_p1_ms"))
             ax.plot(curves, amps, "-", lw=0.9, color="0.8", zorder=0)
             ax.plot(curves[got], amps[got], "o", ms=5,
                     color=COMPONENT_COLORS[comp], zorder=3)
@@ -590,11 +687,12 @@ class ScenarioViewer(QWidget):
                          fontsize=10, loc="left",
                          color=COMPONENT_COLORS[comp] if active else "black")
             ax.set_xlabel("curve number")
-            ax.set_ylabel("PTP, µV")
+            ax.set_ylabel("area, µV·ms" if self._use_area() else "PTP, µV")
             ax.grid(True, color="0.92", lw=0.6)
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
 
+        self._draw_mh_scatter(ax_mh, ch, g)
         self._draw_curves(ax_bot, ch, g, waves, t_ms)
         self._selector = SpanSelector(
             ax_bot, self._on_span, "horizontal", useblit=False,
@@ -603,6 +701,55 @@ class ScenarioViewer(QWidget):
         self.canvas.draw_idle()
         self._fill_hreflex_stats(g)
         self._refresh_mark_label()
+
+    def _draw_mh_scatter(self, ax, ch: str, g: pd.DataFrame) -> None:
+        """M-wave amplitude against the H-reflex's, one point per curve.
+
+        Only curves where BOTH responses were measured have a place here: the
+        hollow provisional points of the plots beside it stand for no
+        measurement, and pairing one with a real value would draw a relation
+        that was never observed. Points are coloured by curve order, as the
+        waveforms below are, so the path the sweep takes through the plane stays
+        readable; the colour bar gives the curve numbers.
+        """
+        curves = g["curve"].to_numpy(int)
+        m_col, h_col = self._value_column("M"), self._value_column("H")
+        m = g[m_col].to_numpy(float) if m_col in g.columns else np.full(len(g), np.nan)
+        h = g[h_col].to_numpy(float) if h_col in g.columns else np.full(len(g), np.nan)
+        both = np.isfinite(m) & np.isfinite(h)
+        self._ax_scatter = ax
+        self._scatter = (curves[both], h[both], m[both])
+
+        norm = mcolors.Normalize(vmin=1, vmax=max(int(curves.max()) if len(curves) else 1, 2))
+        if both.any():
+            ax.scatter(h[both], m[both], c=[SWEEP_CMAP(norm(c)) for c in curves[both]],
+                       s=30, edgecolors="0.35", linewidths=0.4, zorder=3)
+            per_ch = self.overrides.get(ch, {})
+            paired = dict(zip(curves[both].tolist(), zip(h[both], m[both])))
+            false_any = set(per_ch.get("false_M", [])) | set(per_ch.get("false_H", []))
+            missed_any = set(per_ch.get("missed_M", [])) | set(per_ch.get("missed_H", []))
+            for cno in false_any & set(paired):
+                ax.plot(*paired[cno], "x", ms=9, mew=2, color="#d62728", zorder=6)
+            for cno in missed_any & set(paired):
+                ax.plot(*paired[cno], "o", ms=10, mfc="none", mec="#2ca02c", mew=2, zorder=6)
+            if self.selected_curve in paired:
+                ax.plot(*paired[self.selected_curve], "o", ms=12, mfc="none",
+                        mec="#ff8800", mew=2.0, zorder=7)
+            ax.set_xlim(left=0)
+            ax.set_ylim(bottom=0)
+            self.fig.colorbar(ScalarMappable(norm=norm, cmap=SWEEP_CMAP), ax=ax,
+                              fraction=0.06, pad=0.01, label="номер кривой")
+        else:
+            ax.text(0.5, 0.5, "нет кривых, где найдены\nоба ответа", transform=ax.transAxes,
+                    ha="center", va="center", color="gray", fontsize=9)
+        ax.set_title(f"M против H — {int(both.sum())} из {len(curves)} кривых",
+                     fontsize=10, loc="left")
+        what = "площадь, µV·ms" if self._use_area() else "PTP µV"
+        ax.set_xlabel(f"H-рефлекс, {what}")
+        ax.set_ylabel(f"M-ответ, {what}")
+        ax.grid(True, color="0.92", lw=0.6)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
 
     def _draw_curves(self, ax_bot, ch, g, waves, t_ms) -> None:
         """The curves themselves, with both components' markers on the selected one."""
@@ -639,7 +786,19 @@ class ScenarioViewer(QWidget):
                               else dict(color=colour))
                         ax_bot.plot([float(val)], [sel[idx]], "o", ms=7, zorder=6, **kw)
                     amp = row[f"{pre}_amp_uv"].iloc[0]
-                    bits.append(f"{comp} {amp:.0f} µV" if np.isfinite(amp) else f"{comp} —")
+                    area = (row[f"{pre}_area_uvms"].iloc[0] if f"{pre}_area_uvms" in row.columns
+                            else np.nan)
+                    bits.append((f"{comp} {amp:.0f} µV"
+                                 + (f" / {area:.0f} µV·ms" if np.isfinite(area) else ""))
+                                if np.isfinite(amp) else f"{comp} —")
+                    if self._use_area():
+                        # the M-wave's area ends, at the latest, where this curve's reflex begins
+                        cap = self._hreflex_tmax()
+                        if comp == "M" and "h_onset_ms" in row.columns \
+                                and np.isfinite(row["h_onset_ms"].iloc[0]):
+                            cap = float(row["h_onset_ms"].iloc[0]) / 1e3
+                        self._shade_area(ax_bot, t_ms, sel, row.iloc[0], f"{pre}_", cap,
+                                         COMPONENT_COLORS[comp])
             self.curve_label.setText(
                 f"curve: {self.selected_curve} · " + " · ".join(bits or ["ответ не найден"]))
         else:
@@ -675,12 +834,14 @@ class ScenarioViewer(QWidget):
 
     def _fill_hreflex_stats(self, g: pd.DataFrame) -> None:
         """Hmax, Mmax and their ratio — what an H-reflex study is read for."""
+        unit = "µV·ms" if self._use_area() else "µV"
         self.stats.setHorizontalHeaderLabels(
-            ["Ответ", "N", "max µV", "кривая", "порог"])
+            ["Ответ", "N", f"max {unit}", "кривая", "порог"])
         rows = []
         maxima = {}
         for comp in ("M", "H"):
-            d = g[f"{comp.lower()}_amp_uv"]
+            col = self._value_column(comp)
+            d = g[col] if col in g.columns else pd.Series(np.nan, index=g.index)
             ok = d.notna()
             if not ok.any():
                 rows.append((comp, "0", "—", "—", "—"))
@@ -691,7 +852,8 @@ class ScenarioViewer(QWidget):
                          str(int(g.loc[d.idxmax(), "curve"])),
                          str(int(g.loc[ok, "curve"].min()))))
         if "M" in maxima and "H" in maxima and maxima["M"] > 0:
-            rows.append(("Hmax/Mmax", "", f"{maxima['H'] / maxima['M']:.2f}", "", ""))
+            rows.append(("H/M max площадей" if self._use_area() else "Hmax/Mmax", "",
+                         f"{maxima['H'] / maxima['M']:.2f}", "", ""))
         self.stats.setRowCount(len(rows))
         for r, vals in enumerate(rows):
             for c, v in enumerate(vals):
@@ -732,7 +894,9 @@ class ScenarioViewer(QWidget):
 
         # ---- top: response size against the stimulation ramp ----
         curves = g["curve"].to_numpy(int)
-        amps = g["amp_uv"].to_numpy(float)
+        value_col = self._value_column()
+        amps = (g[value_col].to_numpy(float) if value_col in g.columns
+                else np.full(len(g), np.nan))
         self._points = curves
         # Where each point is DRAWN. The ramp position stays the key for
         # selection, marks and corrections; the x is the current when the run
@@ -744,16 +908,38 @@ class ScenarioViewer(QWidget):
         # nearest detected curve has its P1. Drawn hollow and never written to
         # the tables, which keep the NaN: this is something to aim at and to
         # judge by eye, not a measurement.
-        shown = self._provisional_amplitudes(g, waves)
+        # (an area has no stand-in for an undetected curve: there is no response
+        # to integrate, so nothing is drawn for them on the area plot)
+        shown = (np.full(len(curves), np.nan) if self._use_area()
+                 else self._provisional_amplitudes(g, waves))
         # The line is drawn over the full curve range; NaNs break it, so curves
         # with no detection show up as gaps instead of shifting the axis.
         if by_group:
             for gi, lab in enumerate(labels):
                 m = ((g["group"] == lab).to_numpy()) & got
                 if m.any():
-                    ax_top.plot(xs[m], amps[m], "o", ms=5, color=GROUP_COLORS[gi],
+                    ax_top.plot(xs[m], amps[m], "o", ms=5, color=_label_colour(lab, labels),
                                 label=f"{lab} (n={int(m.sum())})")
             ax_top.plot(xs, amps, "-", lw=0.8, color="0.7", zorder=0)
+            if self._blocks is not None and self.show_band.isChecked():
+                # each block's level and scatter over its own stretch of curves
+                pos = {int(c): k for k, c in enumerate(curves)}
+                for b in self._blocks:
+                    ks = [pos[c] for c in b.curves if c in pos]
+                    if not ks:
+                        continue
+                    x0, x1 = float(np.nanmin(xs[ks])) - 0.4, float(np.nanmax(xs[ks])) + 0.4
+                    v = amps[ks]
+                    v = v[np.isfinite(v)]
+                    if b.kind == CB.SILENT or v.size == 0:
+                        ax_top.axvspan(x0, x1, color="0.93", lw=0, zorder=0)
+                        continue
+                    colour = _label_colour(b.label, labels)
+                    mean = float(v.mean())
+                    sd = float(v.std(ddof=1)) if v.size > 1 else 0.0
+                    ax_top.fill_between([x0, x1], mean - sd, mean + sd, color=colour,
+                                        alpha=0.15, lw=0, zorder=0)
+                    ax_top.plot([x0, x1], [mean, mean], color=colour, lw=1.4, zorder=1)
             if labels:   # a silent channel has no groups, hence no legend
                 ax_top.legend(fontsize=7, frameon=False, ncol=len(labels))
         else:
@@ -800,9 +986,11 @@ class ScenarioViewer(QWidget):
             + (f"   ({n_missing} of {len(curves)} {unit} without a detection)"
                if n_missing else "")
         )
-        ax_top.set_ylabel("PTP / |P1|, µV")
+        ax_top.set_ylabel("area of the response, µV·ms" if self._use_area() else "PTP / |P1|, µV")
+        verdict = ("" if self._blocks is None
+                   else f" · {CB.VERDICT_RU[CB.verdict(self._blocks)]}")
         ax_top.set_title(
-            f"{ch} — response vs " + ("amplitude" if by_amp else "curve"),
+            f"{ch} — response vs " + ("amplitude" if by_amp else "curve") + verdict,
             fontsize=10, loc="left")
         ax_top.grid(True, color="0.92", lw=0.6)
         for side in ("top", "right"):
@@ -827,7 +1015,7 @@ class ScenarioViewer(QWidget):
                     # No group (a missed curve, or a channel with no detections at
                     # all) — still draw it, in grey, so a silent channel shows its
                     # curves instead of a blank panel.
-                    col = (GROUP_COLORS[labels.index(lab)] if lab in labels else "0.78")
+                    col = (_label_colour(lab, labels) if lab in labels else "0.78")
                 else:
                     col = "0.78" if missing else SWEEP_CMAP(norm(cno))
                 missing = missing or (by_group and group_of.get(cno) not in labels)
@@ -843,9 +1031,9 @@ class ScenarioViewer(QWidget):
                 block = waves[sorted(rows)]
                 m = block.mean(axis=0)
                 sd = block.std(axis=0, ddof=1) if len(block) > 1 else np.zeros_like(m)
-                ax_bot.fill_between(t_ms, m - sd, m + sd, color=GROUP_COLORS[gi],
+                ax_bot.fill_between(t_ms, m - sd, m + sd, color=_label_colour(lab, labels),
                                     alpha=0.18, lw=0, zorder=2)
-                ax_bot.plot(t_ms, m, color=GROUP_COLORS[gi], lw=1.8, zorder=3,
+                ax_bot.plot(t_ms, m, color=_label_colour(lab, labels), lw=1.8, zorder=3,
                             label=f"{lab} mean")
             if labels:   # a silent channel has no groups, hence no legend
                 ax_bot.legend(fontsize=7, frameon=False, ncol=len(labels))
@@ -868,9 +1056,14 @@ class ScenarioViewer(QWidget):
                         continue
                     idx = int(np.argmin(np.abs(t_ms - float(val))))
                     ax_bot.plot([float(val)], [sel[idx]], "o", color=colour, ms=7, zorder=6)
+                if self._use_area():
+                    self._shade_area(ax_bot, t_ms, sel, row.iloc[0], "", TEXT_CURVES_RESP_TMAX,
+                                     "#c51b7d")
             if not row.empty and np.isfinite(row["amp_uv"].iloc[0]):
+                area = row["area_uvms"].iloc[0] if "area_uvms" in row.columns else np.nan
                 self.curve_label.setText(
-                    f"curve: {self.selected_curve} · {row['amp_uv'].iloc[0]:.1f} µV")
+                    f"curve: {self.selected_curve} · {row['amp_uv'].iloc[0]:.1f} µV"
+                    + (f" · {area:.0f} µV·ms" if np.isfinite(area) else ""))
             else:
                 self.curve_label.setText(
                     f"curve: {self.selected_curve} · ответ не найден")
@@ -899,7 +1092,8 @@ class ScenarioViewer(QWidget):
         ax_bot.set_ylabel("µV")
         ax_bot.set_title(
             f"{ch} — curves, "
-            + ("coloured by amplitude group" if by_group else "coloured by order (later = darker)"),
+            + (("coloured by block" if self._blocks is not None else "coloured by amplitude group")
+               if by_group else "coloured by order (later = darker)"),
             fontsize=10, loc="left",
         )
         ax_bot.grid(True, color="0.92", lw=0.6)
@@ -1105,15 +1299,27 @@ class ScenarioViewer(QWidget):
                 "H-reflex": HREFLEX_KEY}.get(self.scenario or "")
 
     def _fill_stats(self, g: pd.DataFrame, labels: list[str]) -> None:
-        self.stats.setHorizontalHeaderLabels(["Group", "N", "mean µV", "SD", "median"])
+        unit = "µV·ms" if self._use_area() else "µV"
+        blocks = self._blocks is not None
+        self.stats.setHorizontalHeaderLabels(
+            ["Block (curves)" if blocks else "Group", "N", f"mean {unit}", "SD", "median"])
+        spans = {b.label: CB.curve_span(b.curves) for b in (self._blocks or [])}
         rows = []
+        value_col = self._value_column()
         for lab in labels:
-            d = g.loc[g["group"] == lab, "amp_uv"].dropna()
+            if value_col not in g.columns:
+                break
+            d = g.loc[g["group"] == lab, value_col].dropna()
             if d.empty:
                 continue
             rows.append((lab, len(d), d.mean(),
                          d.std(ddof=1) if len(d) > 1 else 0.0, d.median()))
         self.stats.setRowCount(len(rows))
         for r, (lab, n, mean, sd, med) in enumerate(rows):
-            for c, v in enumerate([lab, str(n), f"{mean:.1f}", f"{sd:.1f}", f"{med:.1f}"]):
+            name = f"{lab} ({spans[lab]})" if lab in spans else lab
+            # A. Militskova's threshold is on the amplitude, in µV
+            flag = (f" > {CB.SPREAD_THRESHOLD_UV:g}" if blocks and not self._use_area()
+                    and sd > CB.SPREAD_THRESHOLD_UV else "")
+            for c, v in enumerate([name, str(n), f"{mean:.1f}", f"{sd:.1f}{flag}", f"{med:.1f}"]):
                 self.stats.setItem(r, c, QTableWidgetItem(v))
+        self.stats.resizeColumnsToContents()

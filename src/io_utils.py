@@ -135,8 +135,7 @@ def build_output_dirs(output_root: Path, startstop_mode: bool = False) -> dict[s
 SCENARIO_OUTPUTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "recruitment": (("Recruitment",),
                     ("recruitment_", "stats_top", "stats_amplitude_groups")),
-    "jendrassik": (("Jendrassik",),
-                   ("curves_by_amplitude_group", "stats_amplitude_groups")),
+    "jendrassik": (("Jendrassik",), ("jendrassik_",)),
     "paired": (("Paired stimulation",),
                ("curves_by_amplitude_group", "stats_amplitude_groups")),
     "hreflex": (("H-reflex",), ("hreflex_", "stats_hm")),

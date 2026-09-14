@@ -1,29 +1,35 @@
-"""Curve-group deliverable: Jendrassik manoeuvre and paired stimulation.
+"""Curve deliverables for the Jendrassik manoeuvre and for paired stimulation.
 
-A. Militskova asks for the same two things on both protocols: the CURVES
-themselves — every curve drawn, not one average over them — and the curves
-binned into groups of similar amplitude with a mean and a spread per group.
+A. Militskova asks for the CURVES themselves on both protocols — every curve
+drawn, not one average over them — with the curves that belong together summarised
+by a mean and a spread. What "belong together" means differs:
 
-No recruitment curve is drawn here, by request: a Jendrassik file is one or two
-stimulation intensities, at each of which the patient first receives a run of
-plain test stimuli and then repeats them while performing the manoeuvre. There
-is no intensity ramp to plot against — what varies is whether the response was
-facilitated, and the curves fall into a small number of response-amplitude
-groups (two, in A. Militskova's own example channel). Those groups, and the
-per-curve peak-to-peak behind them, are the deliverable.
+* **Jendrassik** (reworked after the meeting of 13 September 2026). The run is a
+  few stimuli without the manoeuvre, a few with it, then another intensity; block
+  lengths depend on the patient and nothing in the export records them. Curves
+  that belong together are similar in amplitude AND next to each other in the
+  run, so the run is cut into contiguous blocks (``src/curve_blocks.py``). Each
+  block gets its spread, and each channel her verdict: an SD above 30 µV means the
+  manoeuvre works; a run that starts silent and then holds a steady level is a
+  change of intensity, not an effect of the manoeuvre.
+* **Paired stimulation** (unchanged). The curves binned into groups of similar
+  amplitude, as many as each channel's own levels show.
+
+No recruitment curve is drawn here, by request: there is no intensity ramp to plot
+against.
 
 Paired stimulation lands here whenever the export does not encode the
-inter-stimulus interval. When it DOES (the artifact moves from curve to curve,
-as in the TMS-conditioning files) the run goes to src/condition.py instead,
-which can group by real ISI.
+inter-stimulus interval. When it DOES (the artifact moves from curve to curve, as
+in the TMS-conditioning files) the run goes to src/condition.py instead, which can
+group by real ISI.
 
-Runs off the SIR metrics CSV (per-curve P1/P2/PTP) plus the saved epochs, so it
-is independent of the detection code and can be re-run on a finished results
-folder.
+Runs off the SIR metrics CSV (per-curve P1/P2/PTP) plus the saved epochs, so it is
+independent of the detection code and can be re-run on a finished results folder.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
@@ -33,6 +39,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from . import curve_blocks as CB
 from .constants import TEXT_CURVES_RESP_TMIN
 from .io_utils import ensure_dir
 from .neurosoft import JENDRASSIK, PAIRED
@@ -48,42 +55,45 @@ from .recruitment import (
     _tidy_metrics,
 )
 
-#: Default number of response-amplitude groups. Two, not three: the protocol is
-#: a baseline block and a manoeuvre block at the same intensity, and that is the
-#: split the clinician reads off these files. Override per call if a file was run
-#: at two intensities and you want them separated as well.
-CURVE_GROUPS = 2
-
 #: Output folder and figure wording per scenario.
 _SCENARIO_STYLE = {
     JENDRASSIK: {"folder": "Jendrassik", "tag": "приём Ендрассика", "log": "JENDRASSIK"},
     PAIRED: {"folder": "Paired stimulation", "tag": "парная стимуляция", "log": "PAIRED"},
 }
 
-#: One colour per amplitude group, low -> high.
+#: One colour per amplitude group, low -> high (paired stimulation).
 _GROUP_COLORS = ["#4575b4", "#f0a202", "#d73027", "#4d9221", "#7b3294"]
+
+#: File names of the block deliverable. The Jendrassik scenario and the H-reflex
+#: files that were also Jendrassik runs write the same set under their own names;
+#: ``legacy_*`` are what the amplitude-group version wrote, removed on a re-run so
+#: they cannot sit beside the blocks reporting a grouping that is no longer used.
+JENDRASSIK_BLOCK_NAMES = {
+    "long": "jendrassik_curves_by_block_long.csv",
+    "stats": "jendrassik_block_stats.csv",
+    "blocks": "jendrassik_blocks.csv",
+    "verdict": "jendrassik_verdict.csv",
+    "curves_png": "curves_by_block.png",
+    "amp_png": "amplitude_by_block.png",
+    "legacy_tables": ("curves_by_amplitude_group_long.csv", "stats_amplitude_groups.csv"),
+    "legacy_figures": ("curves_by_amplitude_group.png", "amplitude_by_group_boxplots.png"),
+}
+HREFLEX_BLOCK_NAMES = {
+    "long": "hreflex_jendrassik_by_curve_long.csv",
+    "stats": "hreflex_jendrassik_block_stats.csv",
+    "blocks": "hreflex_jendrassik_blocks.csv",
+    "verdict": "hreflex_jendrassik_verdict.csv",
+    "curves_png": "jendrassik_curves_by_H_block.png",
+    "amp_png": "jendrassik_H_amplitude_by_block.png",
+    "legacy_tables": ("hreflex_jendrassik_group_stats.csv",),
+    "legacy_figures": ("jendrassik_curves_by_H_group.png",
+                       "jendrassik_H_amplitude_by_group_boxplots.png"),
+}
 
 
 def _curve_span(curves) -> str:
-    """Compact "1-8, 15" style summary of which curves fell in a group.
-
-    Worth reading: in a Jendrassik file the groups should line up with the two
-    blocks in time (test stimuli first, manoeuvre second), so a group whose
-    curves are scattered across the whole run is a sign the split is amplitude
-    noise rather than the protocol.
-    """
-    c = sorted(int(x) for x in curves)
-    if not c:
-        return ""
-    spans, start, prev = [], c[0], c[0]
-    for v in c[1:]:
-        if v == prev + 1:
-            prev = v
-            continue
-        spans.append((start, prev))
-        start = prev = v
-    spans.append((start, prev))
-    return ", ".join(f"{a}-{b}" if a != b else str(a) for a, b in spans)
+    """Compact "1-8, 15" style summary of which curves fell in a group."""
+    return CB.curve_span(curves)
 
 
 def _group_colors(n_groups: int) -> list[str]:
@@ -91,6 +101,12 @@ def _group_colors(n_groups: int) -> list[str]:
         return _GROUP_COLORS[:n_groups]
     cmap = plt.get_cmap("viridis")
     return [cmap(i / max(n_groups - 1, 1)) for i in range(n_groups)]
+
+
+def block_colors(n_blocks: int) -> list:
+    """One colour per block number (B1, B2, …); the GUI uses the same palette."""
+    cmap = plt.get_cmap("tab10")
+    return [cmap(i % 10) for i in range(max(n_blocks, 1))]
 
 
 def _load_epoch_waveforms(output_root: Path):
@@ -114,20 +130,17 @@ def run_curve_group_analysis(
     scenario: str = JENDRASSIK,
     n_groups: int | None = None,
 ) -> Path | None:
-    """Build the curve/amplitude-group tables and figures from a finished SIR run.
+    """Build the curve tables and figures of a finished Jendrassik or paired run.
 
-    ``n_groups=None`` lets each channel's own amplitudes decide how many groups
-    it has. That is right for paired stimulation, where nothing fixes the number.
-    The Jendrassik protocol does fix it — a block without the manoeuvre and a
-    block with it, per intensity — so its caller passes the count; falling back
-    to the data there would let a channel whose two blocks happen to overlap
-    collapse into one group and lose the comparison the test is for.
+    Jendrassik goes to ``run_jendrassik_blocks``. For paired stimulation
+    ``n_groups=None`` lets each channel's own amplitudes decide how many groups it
+    has — nothing about that protocol fixes the number.
 
     Returns the output directory, or None when there is nothing to report.
     """
-    if n_groups is None and scenario == JENDRASSIK:
-        n_groups = _jendrassik_groups_from_name(output_root)
-    style = _SCENARIO_STYLE.get(scenario, _SCENARIO_STYLE[JENDRASSIK])
+    if scenario == JENDRASSIK:
+        return run_jendrassik_blocks(output_root)
+    style = _SCENARIO_STYLE.get(scenario, _SCENARIO_STYLE[PAIRED])
     log = style["log"]
     output_root = Path(output_root)
     csv = _metrics_csv(output_root)
@@ -150,8 +163,10 @@ def run_curve_group_analysis(
 
     # ── per-curve table (with the group each curve landed in) ──
     out = tidy.copy()
-    for c in ["Onset ms", "P1 ms", "P2 ms", "P1 uV", "P2 uV", "PTP uV", "Amplitude uV"]:
-        out[c] = out[c].round(3)
+    for c in ["Onset ms", "P1 ms", "P2 ms", "P1 uV", "P2 uV", "PTP uV", "Amplitude uV",
+              "Area uV·ms"]:
+        if c in out.columns:
+            out[c] = out[c].round(3)
     out.sort_values(["Channel", "Curve"]).to_csv(
         excel_dir / "curves_by_amplitude_group_long.csv", index=False)
 
@@ -159,8 +174,7 @@ def run_curve_group_analysis(
     # Only metrics that actually carry values: on these files P2, PTP and the
     # onset go undetected on most channels (the responses are monophasic), and
     # an all-NaN row is noise in a table meant to be read.
-    metrics = [m for m in ["Amplitude uV", "PTP uV", "P1 uV", "P2 uV", "P1 ms", "Onset ms"]
-               if tidy[m].notna().any()]
+    metrics = _reported_metrics(tidy)
     rows = []
     for ch in responders:
         d = tidy[tidy["Channel"] == ch]
@@ -203,25 +217,161 @@ def run_curve_group_analysis(
     return out_dir
 
 
-def _jendrassik_groups_from_name(output_root: Path) -> int:
-    """Two groups per intensity named in the recording's file name."""
-    from .neurosoft import intensities_from_name
-    from .pipeline import input_from_run_manifest
+def _reported_metrics(tidy: pd.DataFrame, extra=()) -> list[str]:
+    return [m for m in ["Amplitude uV", "Area uV·ms", "PTP uV", "P1 uV", "P2 uV", "P1 ms",
+                        "Onset ms", *extra]
+            if m in tidy.columns and tidy[m].notna().any()]
 
-    src = input_from_run_manifest(output_root)
-    n = len(intensities_from_name(src)) if src is not None else 0
-    return 2 * max(n, 1)
+
+# --------------------------------------------------------------------------- #
+# Jendrassik: contiguous blocks
+# --------------------------------------------------------------------------- #
+@dataclass
+class BlockResult:
+    tidy: pd.DataFrame          # per curve, with "Block" and "Block kind"
+    stats: pd.DataFrame         # per channel x block x metric
+    blocks: pd.DataFrame        # per channel x block: the spread and the step between blocks
+    verdict: pd.DataFrame       # per channel
+    blocks_of: dict             # channel -> list[curve_blocks.Block]
+
+
+def _r(x) -> float:
+    return round(float(x), 3) if x is not None and np.isfinite(x) else np.nan
+
+
+def block_analysis(tidy: pd.DataFrame, responders: list[str], metrics: list[str]) -> BlockResult:
+    """Cut every channel's run into contiguous blocks on ``Amplitude uV`` and summarise them."""
+    tidy = tidy.copy()
+    tidy["Block"] = pd.Series(index=tidy.index, dtype=object)
+    tidy["Block kind"] = pd.Series(index=tidy.index, dtype=object)
+    thr = CB.SPREAD_THRESHOLD_UV
+    stats_rows, block_rows, verdict_rows, blocks_of = [], [], [], {}
+    for ch in responders:
+        d = tidy[tidy["Channel"] == ch].sort_values("Curve")
+        blocks = CB.find_blocks(d["Amplitude uV"].to_numpy(float), d["Curve"].to_numpy(int))
+        blocks_of[ch] = blocks
+        kinds = [None] * len(d)
+        for b in blocks:
+            kinds[b.start:b.stop] = [b.kind] * (b.stop - b.start)
+        tidy.loc[d.index, "Block"] = CB.labels_per_curve(blocks, len(d))
+        tidy.loc[d.index, "Block kind"] = kinds
+        verdict = CB.verdict(blocks)
+
+        previous = np.nan
+        for b in blocks:
+            span = CB.curve_span(b.curves)
+            responding = b.kind == CB.RESPONSE and b.n_response > 0
+            block_rows.append({
+                "Channel": ch, "Block": b.label, "Kind": b.kind, "Curves": span,
+                "N curves": b.stop - b.start, "N responses": b.n_response,
+                "Amplitude mean uV": _r(b.mean), "Amplitude SD uV": _r(b.sd),
+                "Amplitude CV": _r(b.cv),
+                "Range uV": _r(b.values.max() - b.values.min()) if b.n_response else np.nan,
+                "Step from previous block uV": _r(b.mean - previous) if responding else np.nan,
+                f"SD > {thr:g} uV": ("yes" if b.spread_above else "no") if b.n_response > 1 else "",
+                "Channel verdict": verdict,
+            })
+            if responding:
+                previous = b.mean
+            if not responding:
+                stats_rows.append({"Channel": ch, "Block": b.label, "Kind": b.kind, "Curves": span,
+                                   "Metric": "Amplitude uV", "N": 0, "mean": np.nan, "SD": np.nan,
+                                   "median": np.nan, "min": np.nan, "max": np.nan})
+                continue
+            rows_d = d.iloc[b.start:b.stop]
+            for metric in metrics:
+                stats_rows.append({"Channel": ch, "Block": b.label, "Kind": b.kind, "Curves": span,
+                                   "Metric": metric, **_stats(rows_d[metric])})
+
+        with_sd = [b.sd for b in blocks if b.kind == CB.RESPONSE and b.n_response > 1]
+        verdict_rows.append({
+            "Channel": ch, "Verdict": verdict, "Verdict (ru)": CB.VERDICT_RU[verdict],
+            "Blocks": " | ".join(
+                f"{CB.curve_span(b.curves)}: "
+                + ("no response" if b.kind == CB.SILENT or not b.n_response
+                   else f"{b.mean:.0f} ± {b.sd:.0f} uV" if b.n_response > 1 else f"{b.mean:.0f} uV")
+                for b in blocks),
+            "Max block SD uV": _r(max(with_sd)) if with_sd else np.nan,
+            "Threshold SD uV": thr,
+        })
+
+    stats = pd.DataFrame(stats_rows)
+    if not stats.empty:
+        # an all-NaN metric of a responding block says nothing; a silent block's row says "silent"
+        stats = stats[(stats["N"] > 0) | (stats["Kind"] == CB.SILENT)]
+    return BlockResult(tidy, stats, pd.DataFrame(block_rows), pd.DataFrame(verdict_rows), blocks_of)
+
+
+def write_block_deliverable(output_root: Path, tidy: pd.DataFrame, responders: list[str],
+                            metrics: list[str], names: dict, out_dir: Path, excel_dir: Path,
+                            tag: str) -> BlockResult:
+    """Tables and figures of the block analysis, under the file names in *names*."""
+    res = block_analysis(tidy, responders, metrics)
+
+    out = res.tidy.copy()
+    for c in ["Onset ms", "P1 ms", "P2 ms", "P1 uV", "P2 uV", "PTP uV", "Amplitude uV",
+              "Area uV·ms", "M amplitude uV", "M P1 ms"]:
+        if c in out.columns:
+            out[c] = out[c].round(3)
+    out.sort_values(["Channel", "Curve"]).to_csv(excel_dir / names["long"], index=False)
+    res.stats.to_csv(excel_dir / names["stats"], index=False)
+    res.blocks.to_csv(excel_dir / names["blocks"], index=False)
+    res.verdict.to_csv(excel_dir / names["verdict"], index=False)
+    for name in names["legacy_tables"]:
+        (excel_dir / name).unlink(missing_ok=True)
+    for name in names["legacy_figures"]:
+        (out_dir / name).unlink(missing_ok=True)
+
+    n_blocks = max((len(b) for b in res.blocks_of.values()), default=1)
+    labels = [f"B{i + 1}" for i in range(n_blocks)]
+    colors = block_colors(n_blocks)
+    times, waves = _load_epoch_waveforms(output_root)
+    drawn = [ch for ch in responders if ch in waves]
+    if times is not None and drawn:
+        # only responding blocks get a colour and a mean; a silent block has no response to average
+        shown = res.tidy.assign(**{"Amplitude group": res.tidy["Block"].where(
+            res.tidy["Block kind"] == CB.RESPONSE)})
+        _plot_curves_by_group(times, waves, shown, drawn, labels, colors,
+                              out_dir / names["curves_png"], tag,
+                              legend_title="блок (по порядку)",
+                              title="Кривые по блокам, среднее ± SD")
+    _plot_amplitude_by_block(res.tidy, responders, res.blocks_of,
+                             out_dir / names["amp_png"], tag)
+    return res
+
+
+def run_jendrassik_blocks(output_root: Path) -> Path | None:
+    """The Jendrassik deliverable: contiguous blocks, their spread, and the verdict per channel."""
+    output_root = Path(output_root)
+    csv = _metrics_csv(output_root)
+    if not csv.exists():
+        print("[JENDRASSIK] No SIR metrics CSV found; skipping.", flush=True)
+        return None
+    tidy, responders = _tidy_metrics(csv)
+    if tidy is None:
+        print("[JENDRASSIK] No responding channels; skipping.", flush=True)
+        return None
+    out_dir = ensure_dir(_sir_dir(output_root) / "Jendrassik")
+    excel_dir = ensure_dir(shared_excel_dir(output_root))
+    res = write_block_deliverable(output_root, tidy, responders, _reported_metrics(tidy),
+                                  JENDRASSIK_BLOCK_NAMES, out_dir, excel_dir, "приём Ендрассика")
+    drop_legacy_excel_dir(out_dir)
+    counts = res.verdict["Verdict"].value_counts().to_dict()
+    print(f"[JENDRASSIK] {len(responders)} channels, {tidy['Curve'].nunique()} curves, "
+          f"contiguous blocks; verdicts {counts} -> {out_dir}; tables -> {excel_dir}", flush=True)
+    return out_dir
 
 
 def run_jendrassik_analysis(output_root: Path, n_groups: int | None = None):
-    """Backwards-compatible entry point for the Jendrassik scenario."""
-    return run_curve_group_analysis(output_root, JENDRASSIK, n_groups)
+    """Backwards-compatible entry point for the Jendrassik scenario (``n_groups`` is unused)."""
+    return run_jendrassik_blocks(output_root)
 
 
 def _plot_curves_by_group(times, waves, tidy, responders, labels, colors, out_path,
-                          tag="приём Ендрассика"):
-    """All channels on ONE figure: every curve drawn, coloured by its amplitude
-    group, with each group's mean (thick) and ±SD band on top.
+                          tag="приём Ендрассика", legend_title="группа (низкая→высокая)",
+                          title="Кривые по группам амплитуды, среднее ± SD"):
+    """All channels on ONE figure: every curve drawn, coloured by its group (the
+    ``Amplitude group`` column), with each group's mean (thick) and ±SD band on top.
 
     One subplot per channel rather than one file per channel — the groups are
     read by comparing them, and comparing them across channels means having them
@@ -267,13 +417,62 @@ def _plot_curves_by_group(times, waves, tidy, responders, labels, colors, out_pa
         ax.set_title(ch_name, fontsize=10, loc="left")
         ax.set_ylabel("мкВ")
         ax.grid(alpha=0.3)
-        ax.legend(fontsize=7, title="группа (низкая→высокая)", title_fontsize=7)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, title=legend_title, title_fontsize=7)
 
     for j in range(len(responders), nrow * ncol):
         axes[j // ncol][j % ncol].axis("off")
     for ax in axes[-1]:
         ax.set_xlabel("мс от стимула")
-    fig.suptitle(f"Кривые по группам амплитуды, среднее ± SD ({tag})", fontsize=12)
+    fig.suptitle(f"{title} ({tag})", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _plot_amplitude_by_block(tidy, responders, blocks_of, out_path, tag="приём Ендрассика"):
+    """Amplitude against curve number, each block with its mean and ±SD band.
+
+    The picture A. Militskova described: the curves in run order, the level of
+    every block and the scatter around it, and the verdict the scatter gives.
+    Silent blocks are shaded grey.
+    """
+    fig, axes, nrow, ncol = _grid(len(responders))
+    colors = block_colors(max((len(b) for b in blocks_of.values()), default=1))
+    thr = CB.SPREAD_THRESHOLD_UV
+    for i, ch in enumerate(responders):
+        ax = axes[i // ncol][i % ncol]
+        d = tidy[tidy["Channel"] == ch].sort_values("Curve")
+        curves = d["Curve"].to_numpy(int)
+        amps = d["Amplitude uV"].to_numpy(float)
+        ax.plot(curves, amps, "-", color="0.8", lw=0.8, zorder=1)
+        for k, b in enumerate(blocks_of[ch]):
+            x0, x1 = min(b.curves) - 0.45, max(b.curves) + 0.45
+            if b.kind == CB.SILENT or not b.n_response:
+                ax.axvspan(x0, x1, color="0.92", lw=0, zorder=0)
+                ax.text((x0 + x1) / 2, 0.97, "нет ответа", transform=ax.get_xaxis_transform(),
+                        ha="center", va="top", fontsize=7, color="0.45")
+                continue
+            col = colors[k]
+            sel = (curves >= min(b.curves)) & (curves <= max(b.curves)) & np.isfinite(amps)
+            ax.plot(curves[sel], amps[sel], "o", ms=4, color=col, zorder=3)
+            sd = b.sd if np.isfinite(b.sd) else 0.0
+            ax.fill_between([x0, x1], b.mean - sd, b.mean + sd, color=col, alpha=0.18, lw=0, zorder=0)
+            ax.plot([x0, x1], [b.mean, b.mean], color=col, lw=1.6, zorder=2)
+            if b.n_response > 1:
+                ax.text((x0 + x1) / 2, b.mean + sd, f"SD {sd:.0f}" + (f" > {thr:g}" if b.spread_above else ""),
+                        ha="center", va="bottom", fontsize=7, color=col)
+        verdict = CB.verdict(blocks_of[ch])
+        ax.set_title(f"{ch} — {CB.VERDICT_RU[verdict]}", fontsize=10, loc="left")
+        ax.set_ylabel("мкВ")
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.3)
+    for j in range(len(responders), nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    for ax in axes[-1]:
+        ax.set_xlabel("номер кривой")
+    fig.suptitle(f"Амплитуда по блокам кривых: среднее ± SD; разброс > {thr:g} мкВ — приём работает ({tag})",
+                 fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
