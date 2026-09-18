@@ -130,6 +130,27 @@ def parse_labels(run_root: Path) -> tuple[str, str]:
     return name, "—"
 
 
+def folder_group(run_root: Path, base: Path | None = None) -> str:
+    """The user's own grouping folder of a run: the first folder under *base*.
+
+    *base* is the folder added to a group tab. Results sorted by hand into
+    ``base/Responders/…`` and ``base/Non-responders/…`` get the groups
+    "Responders" and "Non-responders", however deep inside those folders they
+    sit. A run lying straight in *base* gets *base*'s own name; a run added on its
+    own (no *base*) gets the folder it lies in.
+    """
+    run_root = Path(run_root)
+    if base is None:
+        return run_root.parent.name
+    try:
+        parts = run_root.relative_to(Path(base)).parts
+    except ValueError:
+        return run_root.parent.name
+    if not parts:
+        return run_root.parent.name
+    return parts[0] if len(parts) > 1 else Path(base).name
+
+
 @dataclass
 class GroupRun:
     """One member of a group: a finished run plus what it is relative to the rest."""
@@ -504,7 +525,8 @@ def parse_neurosoft(run_root: Path) -> dict[str, str]:
     name = root.name
     path = str(root)
     tags = {"subject": name, "cohort": "SCI", "level": "—", "scenario": "—",
-            "side": "—", "muscle": "—", "position": "—", "polarity": "—"}
+            "side": "—", "muscle": "—", "position": "—", "polarity": "—",
+            "folder": folder_group(root)}
 
     m = _BRACKETED.match(name)
     # The patient code may sit one or two folders up ("(П25)/07092021/07092021 T11-12 kr").
@@ -566,6 +588,8 @@ GROUP_MODES = {
     "position": "положение тела (контроль)",
     "polarity": "полярность (black / red)",
     "muscle+side": "мышца + сторона (H-рефлекс)",
+    "folder": "папка (подпапка добавленной папки)",
+    "folder+level": "папка + уровень",
 }
 
 
@@ -583,6 +607,7 @@ def scan_neurosoft(roots=None, mode: str = "level") -> list["GroupRun"]:
             continue
         for run in scan_runs(root, max_depth=3):
             tags = parse_neurosoft(run.root)
+            tags["folder"] = folder_group(run.root, root)
             found.append(GroupRun(run.root, tags["subject"], state_from_tags(tags, mode),
                                   tags=tags))
     found.sort(key=lambda r: (r.tags.get("cohort", ""), r.subject, r.state))
@@ -730,6 +755,7 @@ SIR_GROUP_MODES = {
     "state": "состояние из имени (control / implantation / N day)",
     "subject": "субъект",
     "run": "запись",
+    "folder": "папка (подпапка добавленной папки)",
 }
 
 
@@ -742,7 +768,8 @@ def scan_standard_runs(folder, max_depth: int = 4) -> list[GroupRun]:
     """Every standard SIR run under *folder*, with its labels kept as read from the path."""
     runs = [r for r in scan_runs(Path(folder), max_depth) if is_standard_sir_run(r.root)]
     for r in runs:
-        r.tags = {"subject": r.subject, "state": r.state}
+        r.tags = {"subject": r.subject, "state": r.state,
+                  "folder": folder_group(r.root, Path(folder))}
     return runs
 
 
@@ -750,7 +777,8 @@ def sir_group_of(run: GroupRun, mode: str) -> str:
     """The group of *run* under grouping *mode* (see ``SIR_GROUP_MODES``)."""
     return {"state": run.tags.get("state", run.state),
             "subject": run.tags.get("subject", run.subject),
-            "run": run.root.name}.get(mode, run.state)
+            "run": run.root.name,
+            "folder": run.tags.get("folder") or folder_group(run.root)}.get(mode, run.state)
 
 
 def sir_points(res) -> pd.DataFrame:

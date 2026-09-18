@@ -83,6 +83,8 @@ class SpontMember:
     #: the labels as read from the names, before any grouping or hand edit
     parsed_subject: str = ""
     parsed_state: str = ""
+    #: the user's grouping folder: the first folder under the one added to the tab
+    folder: str = ""
 
     @property
     def label(self) -> str:
@@ -105,10 +107,13 @@ def scan_members(folder: Path, max_depth: int = 4) -> list[SpontMember]:
         except Exception:
             ok = False
         if ok:
+            from .group import folder_group
+
             for cond in res.conditions():
                 subject, state = parse_condition(d.name, cond)
                 found.append(SpontMember(d, cond, subject, state,
-                                         parsed_subject=subject, parsed_state=state))
+                                         parsed_subject=subject, parsed_state=state,
+                                         folder=folder_group(d, folder)))
             return
         try:
             children = sorted(p for p in d.iterdir() if p.is_dir())
@@ -132,6 +137,8 @@ GROUP_MODES = {
     "subject+state": "задача + стимуляция",
     "condition": "условие целиком",
     "run": "прогон",
+    "folder": "папка (подпапка добавленной папки)",
+    "folder+state": "папка + стимуляция",
 }
 
 
@@ -145,6 +152,8 @@ def group_of(member: SpontMember, mode: str) -> str:
         "subject+state": f"{subject} · {state}",
         "condition": member.condition,
         "run": member.root.name,
+        "folder": member.folder or member.root.parent.name,
+        "folder+state": f"{member.folder or member.root.parent.name} · {state}",
     }.get(mode, state)
 
 
