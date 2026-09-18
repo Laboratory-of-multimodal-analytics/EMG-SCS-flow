@@ -365,6 +365,26 @@ emgflow/            the interactive toolbox  → emgflow/README.md
 run.py              CLI
 ```
 
-## Requirements
+## Installing
 
-Python 3.9+, `pip install -r requirements.txt`. The toolbox additionally needs `PySide6`.
+Install into **its own environment** with the **exact tested versions** — a newer
+plotting or array library can rename a function and stop a run halfway (matplotlib
+removed `cm.get_cmap` in 3.9 and `boxplot(labels=)` in 3.11; NumPy removed `np.trapz`).
+
+With conda (Anaconda / Miniconda), from the repository folder:
+
+```bash
+conda env create -f environment.yml
+conda activate emgflow
+python -m emgflow
+```
+
+Without conda: `python3.13 -m venv .venv`, activate it, `pip install -r requirements-lock.txt`.
+
+To update the code later: `git pull`, then `pip install -r requirements-lock.txt` inside
+the environment (the list may have changed). Do not `pip install --upgrade` single
+libraries in this environment. The GUI writes a warning to its log and status bar when the
+installed versions differ from `requirements-lock.txt`.
+
+`requirements.txt` holds the compatible ranges (with upper bounds on major versions) for
+development; the code also runs on the newest releases checked in September 2026.

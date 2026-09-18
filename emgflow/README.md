@@ -34,6 +34,15 @@ headlessly.
   ran, and when. Double-click to open. The scan runs in the background; the *first* scan of a
   Google Drive folder is slow because Drive fetches every directory listing over the network,
   after which it is instant.
+- **Process several…** — a queue of recordings processed one after another: add files, or a
+  whole folder (results folders, `*_annotations.txt` and non-Neurosoft text files are skipped).
+  Each row shows what the file is, its mode (SIR / StartStop; Neurosoft exports always SIR) and
+  whether it already has results; those are skipped unless you untick that. A recording
+  processed before re-runs with its own saved `review/session.json` (settings and hand edits);
+  any other takes the Settings tab, without the hand edits of the recording on screen. Neurosoft
+  exports get their windows fitted to the file and keep their previous scenario. Results go next
+  to each recording or into one chosen folder. A failure is marked in its row and the batch goes
+  on; "Stop after this recording" ends it between files. Double-click a finished row to open it.
 
 ## The surfaces
 

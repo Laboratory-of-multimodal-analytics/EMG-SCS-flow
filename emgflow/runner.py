@@ -93,12 +93,47 @@ class _QtLogHandler(logging.Handler):
             pass
 
 
-class PipelineWorker(QObject):
-    """Runs run_pipeline() off the GUI thread.
+def run_session(session, emit_log, emit_progress) -> Path:
+    """One run of the real pipeline for *session*, its output and progress streamed out.
 
     The session's settings and edits are applied to the imported src.pipeline module
     right before the call, so the run is exactly what the equivalent runner script does.
     """
+    import src.pipeline as P
+    from src import run_pipeline
+
+    session.apply_to_pipeline(P)
+
+    handler = _QtLogHandler(emit_log)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+
+    emit_log(f"Running {session.mode.upper()} mode on {session.input_path}")
+    if session.template_dir is not None:
+        emit_log(f"Template bank: {session.template_dir}")
+
+    out_stream = _LogStream(emit_log)
+    err_stream = _ProgressStream(emit_progress, emit_log)
+    try:
+        with redirect_stdout(out_stream), redirect_stderr(err_stream):
+            out = run_pipeline(
+                session.input_path,
+                output_dir=session.output_dir,
+                startstop_mode=(session.mode == "startstop"),
+                force_scenario=session.force_scenario,
+                **session.kwargs(),
+            )
+        out_stream.flush()
+        err_stream.flush()
+    finally:
+        root.removeHandler(handler)
+    emit_log(f"Done. Outputs under: {out}")
+    return Path(out)
+
+
+class PipelineWorker(QObject):
+    """Runs run_pipeline() off the GUI thread."""
 
     log = Signal(str)
     progress = Signal(str, int, int)  # phase, n, total
@@ -111,40 +146,48 @@ class PipelineWorker(QObject):
 
     def run(self) -> None:
         try:
-            import src.pipeline as P
-            from src import run_pipeline
-
-            self.session.apply_to_pipeline(P)
-
-            handler = _QtLogHandler(self.log.emit)
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            root = logging.getLogger()
-            root.addHandler(handler)
-
-            self.log.emit(f"Running {self.session.mode.upper()} mode on {self.session.input_path}")
-            if self.session.template_dir is not None:
-                self.log.emit(f"Template bank: {self.session.template_dir}")
-
-            out_stream = _LogStream(self.log.emit)
-            err_stream = _ProgressStream(self.progress.emit, self.log.emit)
-            try:
-                with redirect_stdout(out_stream), redirect_stderr(err_stream):
-                    out = run_pipeline(
-                        self.session.input_path,
-                        output_dir=self.session.output_dir,
-                        startstop_mode=(self.session.mode == "startstop"),
-                        force_scenario=self.session.force_scenario,
-                        **self.session.kwargs(),
-                    )
-                out_stream.flush()
-                err_stream.flush()
-            finally:
-                root.removeHandler(handler)
-
-            self.log.emit(f"Done. Outputs under: {out}")
-            self.finished.emit(Path(out))
+            self.finished.emit(run_session(self.session, self.log.emit, self.progress.emit))
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+class BatchWorker(QObject):
+    """Runs several recordings one after another, each with its own session.
+
+    A recording that fails is reported and the batch goes on. ``stop()`` takes
+    effect between recordings: a run cut halfway would leave half-written outputs.
+    Each finished run saves its session next to its results, as a single run does.
+    """
+
+    log = Signal(str)
+    progress = Signal(str, int, int)
+    file_started = Signal(int)
+    file_done = Signal(int, object, str)   # index, output root (or None), traceback ("" if ok)
+    finished = Signal()
+
+    def __init__(self, sessions) -> None:
+        super().__init__()
+        self.sessions = list(sessions)
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        for i, session in enumerate(self.sessions):
+            if self._stop:
+                break
+            self.file_started.emit(i)
+            try:
+                out = run_session(session, self.log.emit, self.progress.emit)
+                session.output_dir = out
+                session.save_json(Path(out) / "review" / "session.json")
+                self.file_done.emit(i, out, "")
+            except Exception:
+                tb = traceback.format_exc()
+                self.log.emit(tb)
+                self.file_done.emit(i, None, tb)
+        self.finished.emit()
 
 
 class RunController(QObject):
@@ -155,6 +198,9 @@ class RunController(QObject):
     finished = Signal(object)
     failed = Signal(str)
     busy_changed = Signal(bool)
+    batch_file_started = Signal(int)
+    batch_file_done = Signal(int, object, str)
+    batch_finished = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -180,6 +226,32 @@ class RunController(QObject):
         self._thread.start()
         self.busy_changed.emit(True)
         return True
+
+    def start_batch(self, sessions) -> bool:
+        """Run *sessions* one after another (see BatchWorker)."""
+        if self.busy or not sessions:
+            return False
+        self._thread = QThread()
+        self._worker = BatchWorker(sessions)
+        self._worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._worker.run)
+        self._worker.log.connect(self.log)
+        self._worker.progress.connect(self.progress)
+        self._worker.file_started.connect(self.batch_file_started)
+        self._worker.file_done.connect(self.batch_file_done)
+        self._worker.finished.connect(self._on_batch_finished)
+        self._thread.start()
+        self.busy_changed.emit(True)
+        return True
+
+    def stop_batch(self) -> None:
+        if isinstance(self._worker, BatchWorker):
+            self._worker.stop()
+
+    def _on_batch_finished(self) -> None:
+        self._teardown()
+        self.batch_finished.emit()
 
     def _teardown(self) -> None:
         if self._thread is not None:

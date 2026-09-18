@@ -1,0 +1,9 @@
+# conda env create -f environment.yml   ->   conda activate emgflow   ->   python -m emgflow
+name: emgflow
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - -r requirements-lock.txt

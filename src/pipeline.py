@@ -118,6 +118,7 @@ from .constants import (
     DRIFT_MEDIAN_WIN_MS,
     ART_PEAK_WIDTH_MS,
     ART_PEAK_HEIGHT,
+    ART_DETECT_CHANNEL,
     ANTAGONIST_PAIRS,
 )
 from .detection import (
@@ -564,10 +565,19 @@ def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
         raise ValueError("No valid samplerate values found in MAT file.")
     sfreq = float(np.max(rates))
 
-    block_indices = [i for i in range(samplerate.shape[1]) if np.isclose(samplerate[0, i], sfreq)]
+    # A LabChart selection export can lead with an empty marker channel ('Channel':
+    # samplerate 0, datastart -1 in every block). It holds no samples, so it is
+    # dropped, and the block layout is read off the first channel that has data.
+    real = [i for i in range(len(titles))
+            if np.any(datastart[i, :] > 0) and np.any(samplerate[i, :] > 0)]
+    if not real:
+        raise ValueError("No channel with data found in MAT file.")
+    ref = real[0]
+    titles = [titles[i] for i in real]
+    block_indices = [i for i in range(samplerate.shape[1]) if np.isclose(samplerate[ref, i], sfreq)]
 
     channel_data = []
-    for ch_idx in range(len(titles)):
+    for ch_idx in real:
         parts = []
         for block_idx in block_indices:
             start = datastart[ch_idx, block_idx] - 1
@@ -593,8 +603,8 @@ def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
     block_pos = {block_idx: pos for pos, block_idx in enumerate(block_indices)}
     block_lengths = []
     for block_idx in block_indices:
-        start = datastart[0, block_idx] - 1
-        end = dataend[0, block_idx] - 1
+        start = datastart[ref, block_idx] - 1
+        end = dataend[ref, block_idx] - 1
         block_lengths.append(end - start + 1)
     block_offsets = np.cumsum([0] + block_lengths)
 
@@ -640,7 +650,11 @@ def _resolve_art_channels(
 
 
 def _get_art_signal(raw: mne.io.BaseRaw, art_chans: list[str]) -> np.ndarray:
-    data = raw.get_data(picks=art_chans)
+    # ART_DETECT_CHANNEL (read at call time, so the GUI's setting reaches it) picks
+    # one clean artifact channel instead of the mean of all of them.
+    picks = ([ART_DETECT_CHANNEL] if ART_DETECT_CHANNEL and ART_DETECT_CHANNEL in art_chans
+             else art_chans)
+    data = raw.get_data(picks=picks)
     if data.ndim == 2 and data.shape[0] > 1:
         return data.mean(axis=0)
     return data[0]
@@ -2773,7 +2787,8 @@ def run_manifest_path(output_root: str | Path) -> Path:
     return Path(output_root) / "review" / RUN_MANIFEST_NAME
 
 
-def write_run_manifest(output_root: Path, edf_path: Path, scenario: str | None) -> None:
+def write_run_manifest(output_root: Path, edf_path: Path, scenario: str | None,
+                       mode: str | None = None) -> None:
     """Record which recording produced these results.
 
     Without it a results folder is a dead end: opened later — in the GUI's run
@@ -2783,14 +2798,16 @@ def write_run_manifest(output_root: Path, edf_path: Path, scenario: str | None) 
     file by hand.
 
     Written after the recording has loaded, so a file that fails to parse leaves
-    no folder behind.
+    no folder behind. ``mode`` ("sir" / "startstop") is what the GUI reopens the
+    folder in: a StartStop run that detected nothing has no other mark of its mode.
     """
     p = run_manifest_path(output_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(
         {"input": str(Path(edf_path).resolve()),
          "input_name": Path(edf_path).name,
-         "scenario": scenario},
+         "scenario": scenario,
+         "mode": mode},
         ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -3194,7 +3211,8 @@ def _run_pipeline(
         # steps along the curve, so nothing about the fixed-t0 SIR path applies.
         # Its own analysis writes the complete deliverable and returns.
         if not use_startstop and neurosoft_scenario == CONDITION:
-            write_run_manifest(output_root, edf_path, neurosoft_scenario)
+            write_run_manifest(output_root, edf_path, neurosoft_scenario,
+                               "startstop" if startstop_mode else "sir")
             cond_info = scen_info.get("signal")
             if cond_info is None:
                 _, cond_info = is_condition_paradigm(arr, float(ready.info["sfreq"]))
@@ -3236,7 +3254,8 @@ def _run_pipeline(
     else:
         raw = mne.io.read_raw_edf(edf_path, preload=True)
 
-    write_run_manifest(output_root, edf_path, neurosoft_scenario)
+    write_run_manifest(output_root, edf_path, neurosoft_scenario,
+                       "startstop" if startstop_mode else "sir")
 
     original_fif_path = ensure_dir(paths["data_dir"]) / f"{edf_path.stem}_original_raw.fif"
     raw.save(original_fif_path, overwrite=True)
@@ -4297,7 +4316,7 @@ def _run_pipeline(
     # own grouping instead — by curve for recruitment, by amplitude group for
     # the Jendrassik manoeuvre.
     if emit_sir_diagnostics:
-        plot_boxplots(df, boxplot_dir)
+        plot_boxplots(df_results, boxplot_dir)
 
     # ── Scenario deliverables (Neurosoft .txt exports only) ──
     # The previous scenario's outputs were cleared before the layout was

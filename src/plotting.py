@@ -13,6 +13,18 @@ import pandas as pd
 from .constants import ANTAGONIST_PAIRS
 matplotlib.use("Agg")
 
+
+def _cmap(name: str):
+    """A colormap by name on every matplotlib version: ``matplotlib.cm.get_cmap`` is
+    gone since 3.9, the ``matplotlib.colormaps`` registry exists since 3.5."""
+    return matplotlib.colormaps[name]
+
+
+# Axes.boxplot renamed ``labels`` to ``tick_labels`` in matplotlib 3.9 and dropped the
+# old name in 3.11; pick the one the installed version takes.
+_BOX_LABELS = ("tick_labels" if tuple(int(v) for v in matplotlib.__version__.split(".")[:2]) >= (3, 9)
+               else "labels")
+
 _AMP_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
 #: Colour ramp for a stimulation sweep: the LATER the curve, the DARKER it is.
@@ -185,7 +197,7 @@ def plot_grouped_by_amplitude(
     out_dir: Path,
     art_chans: set[str],
 ) -> None:
-    cmap = matplotlib.cm.get_cmap("tab10")
+    cmap = _cmap("tab10")
 
     for config, ch_dict in group_store.items():
         channels = [ch for ch in ch_dict.keys() if ch not in art_chans]
@@ -354,7 +366,7 @@ def plot_boxplots(df: pd.DataFrame, output_dir: Path) -> None:
                 bp = ax.boxplot(
                     data,
                     positions=x_pos,
-                    labels=labels,
+                    **{_BOX_LABELS: labels},
                     showfliers=False,
                     whis=(5, 95),
                     patch_artist=True,
@@ -590,7 +602,7 @@ def plot_burst_envelopes_overlay(
     if not bursts:
         return
     fig, ax = plt.subplots(1, 1, figsize=(12, 6), dpi=300)
-    cmap = matplotlib.cm.get_cmap("tab20")
+    cmap = _cmap("tab20")
     for i, b in enumerate(bursts):
         ax.plot(b["t_rel"], b["env"], color=cmap(i % 20), linewidth=1.6, label=b["label"])
     ax.set_xlabel("Time from burst onset (s)")
@@ -623,7 +635,7 @@ def plot_burst_envelopes_by_channel(
     fig, axes = plt.subplots(n, 1, figsize=(12, 2.4 * n), dpi=300, sharex=False)
     if n == 1:
         axes = [axes]
-    cmap = matplotlib.cm.get_cmap("tab10")
+    cmap = _cmap("tab10")
     for ax, ch in zip(axes, channels):
         for i, b in enumerate(bursts_by_ch[ch]):
             ax.plot(b["t_rel"], b["env"], color=cmap(i % 10), linewidth=1.6,
@@ -668,7 +680,7 @@ def plot_spontaneous_boxplots(
             ax.axis("off")
             continue
         x = np.arange(1, len(data) + 1)
-        bp = ax.boxplot(data, positions=x, labels=labels, showfliers=False,
+        bp = ax.boxplot(data, positions=x, **{_BOX_LABELS: labels}, showfliers=False,
                         whis=(5, 95), patch_artist=True, widths=0.6)
         for box in bp["boxes"]:
             box.set_alpha(0.25)
@@ -693,7 +705,7 @@ def plot_envelopes_overlay(
 ) -> None:
     """All channel RMS envelopes overlaid on one axes (µV) for comparison."""
     fig, ax = plt.subplots(1, 1, figsize=(14, 6), dpi=300)
-    cmap = matplotlib.cm.get_cmap("tab10")
+    cmap = _cmap("tab10")
     for i, (ch, env) in enumerate(env_by_ch.items()):
         ax.plot(env_times, env, color=cmap(i % 10), linewidth=1.5, label=ch)
     ax.set_xlabel("Time (s)")

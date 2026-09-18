@@ -1,0 +1,16 @@
+# The exact versions EMG-SCS-flow is run and tested with (Python 3.13).
+# Install these into a separate environment (see README, "Installing"), so that
+# nothing else on the computer upgrades them. The GUI warns at start-up when the
+# installed versions differ from these.
+#
+# Updating: install the newest versions into a scratch environment, run a recording
+# of every kind (SIR .mat/.fif/.edf, StartStop .mat, Neurosoft .txt) and the GUI,
+# and only then change the numbers here.
+numpy==2.3.5
+scipy==1.16.3
+pandas==2.3.3
+matplotlib==3.10.6
+mne==1.11.0
+tqdm==4.67.1
+XlsxWriter==3.2.9
+PySide6==6.9.2

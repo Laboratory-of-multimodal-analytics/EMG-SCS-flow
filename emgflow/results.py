@@ -109,11 +109,14 @@ def _mode_from_manifest(root: Path) -> str | None:
     """
     try:
         with open(Path(root) / "review" / "run.json", encoding="utf-8") as fh:
-            scenario = json.load(fh).get("scenario")
+            manifest = json.load(fh)
     except (OSError, ValueError):
         return None
+    scenario = manifest.get("scenario")
     if scenario is None:
-        return None
+        # runs since September 2026 also record the mode they ran in
+        mode = manifest.get("mode")
+        return mode if mode in ("sir", "startstop") else None
     return "condition" if scenario == "condition" else "sir"
 
 
@@ -150,6 +153,10 @@ def detect_mode(root: Path) -> str | None:
     ss = mode_dir(root, SS_DIR)
     ss_raw = ss / "Detections raw"
     if (ss_raw.exists() and any(ss_raw.glob("*.fif"))):
+        return "startstop"
+    # A StartStop run that detected nothing writes no annotated .fif; its channel
+    # QC table and the spontaneous-EMG analysis are there regardless.
+    if (ss / "Excel" / "STARTSTOP_channel_qc.csv").exists() or (ss / "Spontaneous EMG").is_dir():
         return "startstop"
 
     # Metrics CSV alone: both modes write the same file name, so it can only

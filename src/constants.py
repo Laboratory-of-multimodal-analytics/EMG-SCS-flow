@@ -10,6 +10,11 @@ THRESH = 4
 ART_PEAK_WIDTH_MS = None
 # Height range (in V) for artifact peak detection. None to use THRESH-based detection.
 ART_PEAK_HEIGHT = None
+# The one artifact channel the stimuli are found on. Empty = the mean of every
+# artifact channel. The pig recordings need "Art": their "Art 2" is a noisy
+# carrier that, averaged in, wrecks the stimulus threshold. Every artifact
+# channel is left out of the EMG analysis either way.
+ART_DETECT_CHANNEL = ""
 
 # Power-line notch base frequency (Hz). The full harmonic comb (base, 2x, 3x,
 # ... up to Nyquist) is removed from the EMG channels. Applied independently of

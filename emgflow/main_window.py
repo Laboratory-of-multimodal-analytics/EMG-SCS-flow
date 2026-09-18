@@ -18,6 +18,7 @@ from .results import SIRResults, SpontaneousResults, StartStopResults, detect_mo
 from .review_store import ReviewStore
 from .runner import RunController
 from .session import Session
+from .widgets.batch_dialog import BatchDialog
 from .widgets.database_dialog import DatabaseDialog
 from .widgets.raw_browser import RawBrowser
 from .widgets.settings_panel import SettingsPanel
@@ -62,6 +63,7 @@ class MainWindow(QMainWindow):
         self.last_scan_dir: Path | None = None
         self._raw_source = None
         self._raw_loaded = None
+        self._batch: BatchDialog | None = None
 
         # ---- top bar ----
         self.file_label = QLabel("No file loaded")
@@ -72,6 +74,10 @@ class MainWindow(QMainWindow):
         browse_btn = QPushButton("Processed recordings…")
         browse_btn.setToolTip("Scan a folder for runs that already have results and open one.")
         browse_btn.clicked.connect(self.browse_database)
+        batch_btn = QPushButton("Process several…")
+        batch_btn.setToolTip("Pick several recordings (or a folder) and process them one after "
+                             "another.")
+        batch_btn.clicked.connect(self.open_batch)
 
         self.mode_box = QComboBox()
         self.mode_box.addItems([m[0] for m in MODES])
@@ -100,6 +106,7 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(open_btn)
         top.addWidget(browse_btn)
+        top.addWidget(batch_btn)
         top.addWidget(self.file_label, 1)
         top.addWidget(QLabel("Mode:"))
         top.addWidget(self.mode_box)
@@ -166,6 +173,21 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._sync_tabs()
+        self._warn_about_versions()
+
+    def _warn_about_versions(self) -> None:
+        """Say so when the installed libraries are not the tested ones (requirements-lock.txt)."""
+        from .versions import version_mismatches
+
+        diff = version_mismatches()
+        if not diff:
+            return
+        self._log("Library versions differ from the tested set: " + ", ".join(diff)
+                  + ". If a run fails, install requirements-lock.txt into its own "
+                    "environment (README, 'Installing').")
+        self.statusBar().showMessage(
+            "Library versions differ from the tested set (View → Show log). "
+            "If a run fails, see README, 'Installing'.", 30000)
 
     # ------------------------------------------------------------------ #
     def _build_menu(self) -> None:
@@ -174,6 +196,7 @@ class MainWindow(QMainWindow):
             ("Open recording…", self.open_file),
             ("Open results folder…", self.open_results),
             ("Browse processed recordings…", self.browse_database),
+            ("Process several recordings…", self.open_batch),
             (None, None),
             ("Load session…", self.load_session),
             ("Save session…", self.save_session),
@@ -557,6 +580,15 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(self.session.input_path is not None)
         self._log(f"Loaded {mode.upper()} results from {root}")
         self.show_results(root, mode)
+
+    def open_batch(self) -> None:
+        """The batch window: kept between openings, so a running batch can be looked at again."""
+        if self._batch is None:
+            self._batch = BatchDialog(self)
+            self._batch.mode_box.setCurrentIndex(1 if self.session.mode == "startstop" else 0)
+        self._batch.show()
+        self._batch.raise_()
+        self._batch.activateWindow()
 
     def browse_database(self) -> None:
         base = self.last_scan_dir

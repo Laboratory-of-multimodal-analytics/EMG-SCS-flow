@@ -178,9 +178,16 @@ class Session:
         # Point both modes at a session-local template bank. `_resolve_startstop_template_dir`
         # is looked up as a module global at call time, so replacing it is enough — no edit
         # to src/ needed.
+        # The stock resolver is kept, so a session WITHOUT its own bank gets the stock
+        # one back instead of the bank of whichever session ran before it (one GUI run
+        # after another, or one recording of a batch after another).
+        if not hasattr(P, "_stock_resolve_startstop_template_dir"):
+            P._stock_resolve_startstop_template_dir = P._resolve_startstop_template_dir
         if self.template_dir is not None:
             tdir = Path(self.template_dir)
             P._resolve_startstop_template_dir = lambda _d=tdir: _d
+        else:
+            P._resolve_startstop_template_dir = P._stock_resolve_startstop_template_dir
 
     # ------------------------------------------------------------------ #
     # Persistence / reproducibility

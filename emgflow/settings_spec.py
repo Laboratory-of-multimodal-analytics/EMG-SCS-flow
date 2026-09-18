@@ -56,6 +56,10 @@ SHARED: list[Lever] = [
     Lever("ARTCHAN", "Artifact channel(s)", "str", "", "Artifact", "both", "global",
           "Comma-separated. Empty = auto-detect by name containing 'art'. "
           "StartStop tolerates no artifact channel; SIR raises."),
+    Lever("ART_DETECT_CHANNEL", "Stimulus detection channel", "str", "", "Artifact", "sir", "global",
+          "Find the stimuli on this one artifact channel instead of the mean of all of them "
+          "(pigs: 'Art' - their 'Art 2' is a noisy carrier). Every artifact channel is still "
+          "left out of the EMG analysis. Empty = the mean."),
     Lever("THRESH", "Adaptive artifact threshold (x std)", "float", 4.0, "Artifact", "sir", "global",
           "Used when the explicit peak height is empty."),
     Lever("art_min_distance_ms", "Min distance between stimuli (ms)", "float", 100.0, "Artifact", "sir", "kwarg", ""),

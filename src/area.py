@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import numpy as np
 
+# np.trapezoid exists from NumPy 2.0; np.trapz is its old name, removed in newer NumPy.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 AREA_ENVELOPE_MS = 1.0
 AREA_QUIET_MS = 3.0
 AREA_K_NOISE = 3.0
@@ -88,7 +91,7 @@ def response_area(x: np.ndarray, times: np.ndarray, onset: float, end: float) ->
     m = (times >= onset) & (times <= end)
     if int(m.sum()) < 2:
         return np.nan
-    return float(np.trapz(np.abs(x[m]), times[m]))
+    return float(_trapezoid(np.abs(x[m]), times[m]))
 
 
 def channel_areas(
