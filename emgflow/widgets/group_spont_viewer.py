@@ -88,7 +88,8 @@ class GroupSpontViewer(GroupTab):
         for key, label in S.GROUP_MODES.items():
             self.group_box.addItem(label, key)
         self.group_box.currentIndexChanged.connect(lambda _: self._regroup())
-        self.table = member_table(["", "Задача", "Группа", "Условие", "Прогон"], stretch_col=3)
+        self.table = member_table(["", "Задача", "Группа", "Подгруппа", "Условие", "Прогон"],
+                                  stretch_col=4)
         self.table.setToolTip("Галочка — условие участвует. Группу можно переименовать двойным щелчком.")
         self.table.itemChanged.connect(self._on_table_edit)
         self.btn_all = QPushButton("отметить все")
@@ -100,6 +101,9 @@ class GroupSpontViewer(GroupTab):
         self.aliases.setToolTip("Одна мышца под разными именами в разных файлах: «имя в файле=общее "
                                 "имя» через «;». Регистр, пробелы и подчёркивания и так не важны.")
         self.aliases.editingFinished.connect(self._read_all)
+        self.split_sub = QCheckBox("делить группы по подгруппам")
+        self.split_sub.setToolTip("Запись с заполненной подгруппой сравнивается в группе «группа · подгруппа»; записи без подгруппы остаются в своей группе.")
+        self.split_sub.toggled.connect(lambda _: (self._fill_table(), self._membership_changed()))
         self.members_note = QLabel("")
         self.members_note.setStyleSheet("color: #555; font-size: 11px;")
 
@@ -143,6 +147,7 @@ class GroupSpontViewer(GroupTab):
         row.addWidget(self.btn_all)
         row.addWidget(self.btn_none)
         lv.addLayout(row)
+        lv.addWidget(self.split_sub)
         lv.addWidget(self.members_note)
         lv.addWidget(QLabel("<b>Псевдонимы каналов</b>"))
         lv.addWidget(self.aliases)
@@ -241,11 +246,12 @@ class GroupSpontViewer(GroupTab):
             check.setCheckState(Qt.Checked if m.include else Qt.Unchecked)
             self.table.setItem(i, 0, check)
             for col, text, editable in ((1, m.subject, False), (2, m.state, True),
-                                        (3, m.condition, False), (4, m.root.name, False)):
+                                        (3, m.subgroup, True), (4, m.condition, False),
+                                        (5, m.root.name, False)):
                 item = QTableWidgetItem(text)
                 if not editable:
                     item.setFlags(Qt.ItemIsEnabled)
-                if col == 4:
+                if col == 5:
                     item.setToolTip(str(m.root))
                 self.table.setItem(i, col, item)
         end_fill(self.table)
@@ -258,6 +264,8 @@ class GroupSpontViewer(GroupTab):
             m.include = item.checkState() == Qt.Checked
         elif item.column() == 2:
             m.state = item.text().strip() or m.state
+        elif item.column() == 3:
+            m.subgroup = item.text().strip()
         else:
             return
         self._membership_changed()
@@ -271,11 +279,16 @@ class GroupSpontViewer(GroupTab):
     def _active(self) -> list[S.SpontMember]:
         return [m for m in self.members if m.include]
 
+    def _group_of(self, member) -> str:
+        """The group a recording is compared in: its group, split by the hand-typed subgroup."""
+        sub = (member.subgroup or "").strip()
+        return f"{member.state} · {sub}" if sub and self.split_sub.isChecked() else member.state
+
     def _membership_changed(self) -> None:
         active = self._active()
         info = []
-        for g in S.sort_states(m.state for m in active):
-            ms = [m for m in active if m.state == g]
+        for g in S.sort_states(self._group_of(m) for m in active):
+            ms = [m for m in active if self._group_of(m) == g]
             info.append((g, len(ms), len({m.subject for m in ms})))
         self.picker.set_groups(info)
         current = self.base_box.currentText()
@@ -316,7 +329,8 @@ class GroupSpontViewer(GroupTab):
     def prepare(self) -> None:
         active = self._active()
         labels = pd.DataFrame([{"run": str(m.root), "condition": m.condition,
-                                "_group": m.state, "_subject": m.subject} for m in active])
+                                "_group": self._group_of(m), "_subject": m.subject}
+                               for m in active])
 
         def relabel(frame: pd.DataFrame) -> pd.DataFrame:
             if frame.empty or labels.empty:
@@ -516,7 +530,8 @@ class GroupSpontViewer(GroupTab):
         if not self.norm_env.empty:
             save(S.mean_burst_envelope(self.norm_env[self.norm_env["state"].isin(groups)]),
                  "spont_group_mean_burst_envelope.csv")
-        save(pd.DataFrame([{"task": m.subject, "group": m.state, "included": m.include,
+        save(pd.DataFrame([{"task": m.subject, "group": m.state, "subgroup": m.subgroup,
+                            "group_compared": self._group_of(m), "included": m.include,
                             "condition": m.condition, "run": str(m.root)} for m in self.members]),
              "spont_group_membership.csv")
         return written

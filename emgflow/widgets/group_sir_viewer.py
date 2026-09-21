@@ -137,9 +137,9 @@ class GroupSIRViewer(GroupTab):
         for key, label in G.SIR_GROUP_MODES.items():
             self.group_box.addItem(label, key)
         self.group_box.currentIndexChanged.connect(lambda _: self._regroup())
-        self.table = member_table(["", "Субъект", "Группа", "Запись"], stretch_col=3)
-        self.table.setToolTip("Галочка — запись участвует. Субъект и группу можно поправить "
-                              "двойным щелчком.")
+        self.table = member_table(["", "Субъект", "Группа", "Подгруппа", "Запись"], stretch_col=4)
+        self.table.setToolTip("Галочка — запись участвует. Субъекта, группу и подгруппу можно "
+                              "поправить двойным щелчком.")
         self.table.itemChanged.connect(self._on_table_edit)
         self.btn_all = QPushButton("отметить все")
         self.btn_all.clicked.connect(lambda: self._set_all(True))
@@ -153,6 +153,9 @@ class GroupSIRViewer(GroupTab):
                                  "токов, не участвует: у кривой из пары токов нет ни максимума, "
                                  "ни порога (у свиней на 60 day есть сессии из 1–3 токов).")
         self.min_amps.valueChanged.connect(lambda _: self.invalidate())
+        self.split_sub = QCheckBox("делить группы по подгруппам")
+        self.split_sub.setToolTip("Запись с заполненной подгруппой сравнивается в группе «группа · подгруппа»; записи без подгруппы остаются в своей группе.")
+        self.split_sub.toggled.connect(lambda _: self._membership_changed(refill=True))
         self.members_note = QLabel("")
         self.members_note.setStyleSheet("color: #555; font-size: 11px;")
 
@@ -212,6 +215,7 @@ class GroupSIRViewer(GroupTab):
         row.addWidget(self.btn_all)
         row.addWidget(self.btn_none)
         lv.addLayout(row)
+        lv.addWidget(self.split_sub)
         lv.addWidget(self.members_note)
 
         self.build_layout(left, [QLabel("<b>Конфигурация</b>"), self.config_box,
@@ -318,10 +322,11 @@ class GroupSIRViewer(GroupTab):
             self.table.setItem(i, 0, check)
             self.table.setItem(i, 1, QTableWidgetItem(r.subject))
             self.table.setItem(i, 2, QTableWidgetItem(r.state))
+            self.table.setItem(i, 3, QTableWidgetItem(r.subgroup))
             name = QTableWidgetItem(r.root.name)
             name.setFlags(Qt.ItemIsEnabled)
             name.setToolTip(str(r.root))
-            self.table.setItem(i, 3, name)
+            self.table.setItem(i, 4, name)
         end_fill(self.table)
 
     def _on_table_edit(self, item: QTableWidgetItem) -> None:
@@ -336,6 +341,8 @@ class GroupSIRViewer(GroupTab):
                 self.points_all.loc[self.points_all["run"] == str(run.root), "subject"] = run.subject
         elif item.column() == 2:
             run.state = item.text().strip() or run.state
+        elif item.column() == 3:
+            run.subgroup = item.text().strip()
         else:
             return
         self._membership_changed()
@@ -347,6 +354,11 @@ class GroupSIRViewer(GroupTab):
 
     def _active_runs(self) -> list[G.GroupRun]:
         return [r for r in self.runs if r.include]
+
+    def _group_of(self, member) -> str:
+        """The group a recording is compared in: its group, split by the hand-typed subgroup."""
+        sub = (member.subgroup or "").strip()
+        return f"{member.state} · {sub}" if sub and self.split_sub.isChecked() else member.state
 
     def _membership_changed(self, refill: bool = False) -> None:
         if refill:
@@ -392,8 +404,8 @@ class GroupSIRViewer(GroupTab):
             self.channels.set_channels(names, checked=common)
         in_config = [r for r in active if str(r.root) in have]
         info = []
-        for g in G.sort_states(r.state for r in in_config):
-            rs = [r for r in in_config if r.state == g]
+        for g in G.sort_states(self._group_of(r) for r in in_config):
+            rs = [r for r in in_config if self._group_of(r) == g]
             info.append((g, len(rs), len({r.subject for r in rs})))
         self.picker.set_groups(info)
         current = self.base_box.currentText()
@@ -442,7 +454,7 @@ class GroupSIRViewer(GroupTab):
     def prepare(self) -> None:
         active = self._active_runs()
         config = self.config_box.currentData()
-        state_of = {str(r.root): r.state for r in active}
+        state_of = {str(r.root): self._group_of(r) for r in active}
         subject_of = {str(r.root): r.subject for r in active}
         pts = self.points_all[self.points_all["run"].isin(state_of)
                               & (self.points_all["config"] == config)].copy()
@@ -776,6 +788,7 @@ class GroupSIRViewer(GroupTab):
             _, bands = G.current_bands(self.values, self.grid, "value", "state",
                                        absent_as_zero=not self._latency())
             save(bands, f"sir_group_{config}_curve_bands.csv")
-        save(pd.DataFrame([{"subject": r.subject, "group": r.state, "included": r.include,
+        save(pd.DataFrame([{"subject": r.subject, "group": r.state, "subgroup": r.subgroup,
+                            "group_compared": self._group_of(r), "included": r.include,
                             "run": str(r.root)} for r in self.runs]), "sir_group_membership.csv")
         return written

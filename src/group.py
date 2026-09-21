@@ -159,6 +159,8 @@ class GroupRun:
     state: str
     include: bool = True
     note: str = ""
+    #: typed by hand in the tab, to split a group further (empty = not used)
+    subgroup: str = ""
     #: everything the name could be read for (Neurosoft runs); see parse_neurosoft
     tags: dict = field(default_factory=dict)
 

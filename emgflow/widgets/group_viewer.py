@@ -157,13 +157,17 @@ class GroupViewer(GroupTab):
         self.group_box.setToolTip("Из каких меток названия складывается группа записи. "
                                   "Группу можно поправить руками в списке.")
         self.group_box.currentIndexChanged.connect(lambda _: self._regroup())
-        self.table = member_table(["", "Субъект", "Группа", "Запись"], stretch_col=3)
-        self.table.setToolTip("Галочка — запись участвует. Группу можно переименовать двойным щелчком.")
+        self.table = member_table(["", "Субъект", "Группа", "Подгруппа", "Запись"], stretch_col=4)
+        self.table.setToolTip("Галочка — запись участвует. Группу и подгруппу можно вписать "
+                              "двойным щелчком.")
         self.table.itemChanged.connect(self._on_table_edit)
         self.btn_all = QPushButton("отметить все")
         self.btn_all.clicked.connect(lambda: self._set_all(True))
         self.btn_none = QPushButton("снять все")
         self.btn_none.clicked.connect(lambda: self._set_all(False))
+        self.split_sub = QCheckBox("делить группы по подгруппам")
+        self.split_sub.setToolTip("Запись с заполненной подгруппой сравнивается в группе «группа · подгруппа»; записи без подгруппы остаются в своей группе.")
+        self.split_sub.toggled.connect(lambda _: self._membership_changed(refill=True))
         self.members_note = QLabel("")
         self.members_note.setStyleSheet("color: #555; font-size: 11px;")
 
@@ -224,6 +228,7 @@ class GroupViewer(GroupTab):
         row.addWidget(self.btn_all)
         row.addWidget(self.btn_none)
         lv.addLayout(row)
+        lv.addWidget(self.split_sub)
         lv.addWidget(self.members_note)
 
         self.build_layout(left, [QLabel("<b>Показатель</b>"), self.metric_box,
@@ -357,11 +362,12 @@ class GroupViewer(GroupTab):
             subject.setFlags(Qt.ItemIsEnabled)
             self.table.setItem(i, 1, subject)
             self.table.setItem(i, 2, QTableWidgetItem(r.state))
+            self.table.setItem(i, 3, QTableWidgetItem(r.subgroup))
             name = QTableWidgetItem(r.root.name)
             name.setFlags(Qt.ItemIsEnabled)
             name.setToolTip(str(r.root) + "\n" + ", ".join(
                 f"{k}: {v}" for k, v in r.tags.items() if v not in ("—", "") and k != "subject"))
-            self.table.setItem(i, 3, name)
+            self.table.setItem(i, 4, name)
         end_fill(self.table)
 
     def _on_table_edit(self, item: QTableWidgetItem) -> None:
@@ -373,6 +379,8 @@ class GroupViewer(GroupTab):
             run.include = item.checkState() == Qt.Checked
         elif item.column() == 2:
             run.state = item.text().strip() or run.state
+        elif item.column() == 3:
+            run.subgroup = item.text().strip()
         else:
             return
         self._membership_changed()
@@ -382,13 +390,18 @@ class GroupViewer(GroupTab):
             r.include = on
         self._membership_changed(refill=True)
 
+    def _group_of(self, member) -> str:
+        """The group a recording is compared in: its group, split by the hand-typed subgroup."""
+        sub = (member.subgroup or "").strip()
+        return f"{member.state} · {sub}" if sub and self.split_sub.isChecked() else member.state
+
     def _membership_changed(self, refill: bool = False) -> None:
         if refill:
             self._fill_table()
         active = self._active_runs()
         info = []
-        for g in G.sort_states(r.state for r in active):
-            rs = [r for r in active if r.state == g]
+        for g in G.sort_states(self._group_of(r) for r in active):
+            rs = [r for r in active if self._group_of(r) == g]
             info.append((g, len(rs), len({r.subject for r in rs})))
         self.picker.set_groups(info)
         current = self.base_box.currentText()
@@ -426,7 +439,7 @@ class GroupViewer(GroupTab):
 
     def prepare(self) -> None:
         active = self._active_runs()
-        state_of = {str(r.root): r.state for r in active}
+        state_of = {str(r.root): self._group_of(r) for r in active}
         pts = self.points_all[self.points_all["run"].isin(state_of)].copy()
         pts["state"] = pts["run"].map(state_of)
         self.raw_points = pts
@@ -589,7 +602,7 @@ class GroupViewer(GroupTab):
         top_legend(view.figure, entries, title=note)
 
     def _draw_waves(self, view, groups, colors, channels) -> None:
-        active = [r for r in self._active_runs() if r.state in groups]
+        active = [r for r in self._active_runs() if self._group_of(r) in groups]
         missing = [str(r.root) for r in active if str(r.root) not in self._waves]
         if missing:
             self._load_waves(missing)
@@ -604,7 +617,7 @@ class GroupViewer(GroupTab):
             for r in active:
                 times, waves = self._waves.get(str(r.root), (None, {}))
                 if times is not None and raw in waves:
-                    loaded.append((r.state, str(r.root), times, waves[raw]))
+                    loaded.append((self._group_of(r), str(r.root), times, waves[raw]))
             grid, bands, traces = G.waveform_bands(loaded)
             if grid.size == 0:
                 empty_panel(ax, ch, "нет сохранённых эпох")
@@ -770,7 +783,8 @@ class GroupViewer(GroupTab):
                 save(ST.describe_groups(frame, unit_col, value, "state", self.picker.groups(),
                                         units=units), f"neurosoft_group_{stem}_by_group.csv")
         save(self._asymmetry()[1], "neurosoft_group_asymmetry_by_recording.csv")
-        save(pd.DataFrame([{"subject": r.subject, "group": r.state, "included": r.include,
+        save(pd.DataFrame([{"subject": r.subject, "group": r.state, "subgroup": r.subgroup,
+                            "group_compared": self._group_of(r), "included": r.include,
                             **{k: v for k, v in r.tags.items() if k != "subject"},
                             "run": str(r.root)} for r in self.runs]),
              "neurosoft_group_membership.csv")

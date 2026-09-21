@@ -85,6 +85,8 @@ class SpontMember:
     parsed_state: str = ""
     #: the user's grouping folder: the first folder under the one added to the tab
     folder: str = ""
+    #: typed by hand in the tab, to split a group further (empty = not used)
+    subgroup: str = ""
 
     @property
     def label(self) -> str:
