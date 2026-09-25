@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from src.constants import HREFLEX_NOISE_TAIL_MS, HREFLEX_RESP_TMAX, TEXT_CURVES_RESP_TMAX
 import src.curve_blocks as CB
+import src.jendrassik_trials as JT
 from src.plotting import SWEEP_CMAP
 from src.recruitment import choose_n_groups, cluster_amplitudes
 from matplotlib.widgets import SpanSelector
@@ -70,15 +71,44 @@ COMPONENT_LABELS = {"M": "M-ответ (прямой)", "H": "H-рефлекс"}
 #: Group colours, matching src/jendrassik.py so the GUI and the PNGs agree.
 GROUP_COLORS = ["#4575b4", "#f0a202", "#d73027", "#4d9221", "#7b3294"]
 
+#: Rest and manoeuvre of a Jendrassik trial, matching src/jendrassik.py TRIAL_COLORS.
+#: The SAME two colours in every trial: the trials are read by comparing them with
+#: each other, and a per-trial palette would make that impossible.
+TRIAL_COLORS = {"R": "#4575b4", "A": "#d73027"}
+TRIAL_KIND_RU = {"R": "покой", "A": "приём"}
+
 
 def _label_colour(label: str, labels: list[str]):
-    """Colour of a group (G…, by rank) or of a Jendrassik block (B…, by number, as in the PNGs)."""
+    """Colour of a group (G…, by rank), a Jendrassik block (B…) or a trial half (R…/A…)."""
     from matplotlib import colormaps
 
-    if str(label).startswith("B"):
-        return colormaps["tab10"]((int(str(label)[1:]) - 1) % 10)
+    s = str(label)
+    if s[:1] in TRIAL_COLORS and s[1:].isdigit():
+        return TRIAL_COLORS[s[0]]
+    if s.startswith("B"):
+        return colormaps["tab10"]((int(s[1:]) - 1) % 10)
     i = labels.index(label)
     return GROUP_COLORS[i] if i < len(GROUP_COLORS) else colormaps["tab10"](i % 10)
+
+
+def _num(v, fmt: str) -> str:
+    """A number, or an em dash where it could not be computed."""
+    return fmt.format(v) if np.isfinite(v) else "—"
+
+
+def _p(v) -> str:
+    """A p value. Rounded to three decimals a tiny p reads as 0.000, which is not a p."""
+    if not np.isfinite(v):
+        return "—"
+    return "<0.001" if v < 0.001 else f"{v:.3f}"
+
+
+def _label_text(label: str) -> str:
+    """How a group label is written in a legend: trial halves get words, others stay as they are."""
+    s = str(label)
+    if s[:1] in TRIAL_KIND_RU and s[1:].isdigit():
+        return f"{TRIAL_KIND_RU[s[0]]} (проба {s[1:]})"
+    return s
 
 
 def _assign_groups(amps: pd.Series, n_groups: int | None) -> pd.Series:
@@ -122,6 +152,10 @@ class ScenarioViewer(QWidget):
         self.n_groups: int | None = None
         #: The current channel's Jendrassik blocks (None on every other scenario).
         self._blocks: list | None = None
+        #: The current channel's Jendrassik trials (None on every other scenario).
+        #: Computed by src/jendrassik_trials.py — the same code that writes the
+        #: saved table, so the screen and the CSV can never disagree.
+        self._trials: list[dict] | None = None
         #: "curve" (a Neurosoft export, one stimulus per curve) or "amplitude"
         #: (a crop per mA). Decides what the x axis MEANS; everything keyed on
         #: the ramp position keeps working either way.
@@ -179,6 +213,22 @@ class ScenarioViewer(QWidget):
         self.show_band.setChecked(True)
         self.show_band.toggled.connect(lambda _: self._draw())
 
+        # Jendrassik only: A. D. reads the trials ONE AT A TIME — ten curves of one
+        # trial drown among the rest when everything is drawn at once, and rest
+        # cannot be told from manoeuvre by eye. The picker filters to one trial;
+        # everything outside it stays grey.
+        self.trial_box = QComboBox()
+        self.trial_box.setToolTip("Какую пробу показывать: пятёрка покоя против пятёрки приёма.")
+        self.trial_box.currentIndexChanged.connect(lambda _: self._draw())
+        self.trial_label = QLabel("<b>Проба</b>")
+        self.btn_best = QPushButton("Подсветить лучшую пробу")
+        self.btn_best.setToolTip(
+            "Перейти к пробе с наибольшим |d| Коэна на этом канале.\n"
+            "Отбор по модулю: снижение ответа — такой же эффект приёма, как рост.")
+        self.btn_best.clicked.connect(self._show_best_trial)
+        for w in (self.trial_label, self.trial_box, self.btn_best):
+            w.setVisible(False)
+
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider)
@@ -230,7 +280,7 @@ class ScenarioViewer(QWidget):
         self.stats.setHorizontalHeaderLabels(["Group", "N", "mean µV", "SD", "median"])
         self.stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.stats.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.stats.setMaximumHeight(150)
+        self.stats.setMaximumHeight(190)
 
         left = QWidget()
         lv = QVBoxLayout(left)
@@ -244,6 +294,9 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.color_box)
         lv.addWidget(self.show_all)
         lv.addWidget(self.show_band)
+        lv.addWidget(self.trial_label)
+        lv.addWidget(self.trial_box)
+        lv.addWidget(self.btn_best)
         lv.addWidget(self.curve_label)
         lv.addWidget(self.slider)
         lv.addWidget(self.component_label)
@@ -253,7 +306,8 @@ class ScenarioViewer(QWidget):
                   self.btn_window, self.btn_apply):
             lv.addWidget(b)
         lv.addWidget(self.mark_label)
-        lv.addWidget(QLabel("<b>Amplitude groups</b>"))
+        self.stats_title = QLabel("<b>Amplitude groups</b>")
+        lv.addWidget(self.stats_title)
         lv.addWidget(self.stats)
 
         # ---- right: the two plots ----
@@ -275,7 +329,7 @@ class ScenarioViewer(QWidget):
         split = QSplitter(Qt.Horizontal)
         split.addWidget(left)
         split.addWidget(right)
-        split.setSizes([260, 900])
+        split.setSizes([330, 900])
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -343,8 +397,17 @@ class ScenarioViewer(QWidget):
         label = SCENARIOS.get(self.scenario, (self.scenario, "curve order", None))[0]
         config = self.config
         jendrassik = self.scenario == "Jendrassik"
-        self.color_box.setItemText(1, "colour by block" if jendrassik else "colour by amplitude group")
-        self.show_band.setText("block mean ± SD" if jendrassik else "group mean ± SD")
+        self.color_box.setItemText(1, "colour by trial" if jendrassik else "colour by amplitude group")
+        self.show_band.setText("trial mean ± SD" if jendrassik else "group mean ± SD")
+        self.stats_title.setText("<b>Пробы: покой против приёма</b>" if jendrassik
+                                 else "<b>Amplitude groups</b>")
+        for w in (self.trial_label, self.trial_box, self.btn_best):
+            w.setVisible(jendrassik)
+        if jendrassik:
+            # the trials are the point of the protocol, so they are what opens
+            self.color_box.blockSignals(True)
+            self.color_box.setCurrentIndex(1)
+            self.color_box.blockSignals(False)
         if self.is_hreflex:
             self.by_curve = self.results.hreflex_by_curve(config, self.session)
         else:
@@ -502,6 +565,7 @@ class ScenarioViewer(QWidget):
     def _on_channel(self, ch: str) -> None:
         self.channel = ch or None
         self.selected_curve = None
+        self._fill_trial_box(ch)
         n = len(self.waves.get(ch, []))
         self.slider.blockSignals(True)
         self.slider.setEnabled(n > 0)
@@ -509,6 +573,26 @@ class ScenarioViewer(QWidget):
         self.slider.setValue(1)
         self.slider.blockSignals(False)
         self._draw()
+
+    def _fill_trial_box(self, ch: str) -> None:
+        """Re-list this channel's trials. Channels differ in how many they have."""
+        if self.scenario != "Jendrassik":
+            self._trials = None
+            return
+        self._trials = self._compute_trials(ch)
+        self.trial_box.blockSignals(True)
+        self.trial_box.clear()
+        self.trial_box.addItem("все пробы", 0)
+        for t in self._trials:
+            self.trial_box.addItem(
+                f"проба {t['Trial']}: покой {t['Rest curves']} → приём {t['Act curves']}",
+                t["Trial"])
+        # One trial per view is what was asked for; "all" stays available for a
+        # first look at a channel.
+        self.trial_box.setCurrentIndex(1 if self._trials else 0)
+        self.trial_box.blockSignals(False)
+        self.trial_box.setEnabled(bool(self._trials))
+        self.btn_best.setEnabled(JT.best_trial(self._trials) is not None)
 
     def _on_slider(self, value: int) -> None:
         self.selected_curve = int(value)
@@ -598,15 +682,61 @@ class ScenarioViewer(QWidget):
             out[j] = abs(float(waves[curves[j] - 1][i]))
         return out
 
+    def _compute_trials(self, ch: str) -> list[dict]:
+        """This channel's trials, by the very code that writes the saved table.
+
+        Always on the AMPLITUDE, whatever the metric picker shows, so the trial
+        chosen here is the trial the CSV marks as best. A channel with gaps in
+        its curve numbering is left without trials: the run is cut by position,
+        and one missing curve would shift the phase — rest would be read as
+        manoeuvre. Better no trials than inverted ones.
+        """
+        if self.scenario != "Jendrassik" or self.by_curve is None:
+            return []
+        g = self.by_curve[self.by_curve["Channel"] == ch].sort_values("curve")
+        if g.empty or "amp_uv" not in g.columns:
+            return []
+        curves = g["curve"].to_numpy(int)
+        if len(curves) > 1 and not (np.diff(curves) == 1).all():
+            return []
+        return JT.channel_trials(curves, g["amp_uv"].to_numpy(float))
+
+    def _trial_labels(self, n: int) -> list:
+        """One label per curve: ``R<k>`` rest of trial k, ``A<k>`` its manoeuvre.
+
+        None outside the picked trial (and for the unpaired tail pentad), which
+        is what leaves those curves grey in every plot.
+        """
+        sel = self.trial_box.currentData()
+        out: list[str | None] = [None] * n
+        for t in self._trials or []:
+            if sel not in (None, 0) and t["Trial"] != sel:
+                continue
+            for pos, kind in ((t["_rest"], "R"), (t["_act"], "A")):
+                for i in range(pos.start, min(pos.stop, n)):
+                    out[i] = f"{kind}{t['Trial']}"
+        return out
+
+    def _show_best_trial(self) -> None:
+        """Jump to the trial with the largest |d| — the one that goes to the group base."""
+        k = JT.best_trial(self._trials or [])
+        if k is None:
+            return
+        i = self.trial_box.findData(k)
+        if i >= 0:
+            self.trial_box.setCurrentIndex(i)      # fires _draw itself
+
     def _groups_for(self, ch: str) -> pd.DataFrame:
         g = self.by_curve[self.by_curve["Channel"] == ch].sort_values("curve").copy()
         if self.scenario == "Jendrassik":
-            # contiguous blocks, exactly as the exported tables cut the run; silent
-            # blocks carry no label, so their curves stay grey
-            self._blocks = CB.find_blocks(g["amp_uv"].to_numpy(float), g["curve"].to_numpy(int))
-            g["group"] = CB.labels_per_curve(self._blocks, len(g), silent_label=False)
+            # fixed trials: five curves of rest against five of the manoeuvre
+            # (src/jendrassik_trials.py), exactly as the exported table cuts the run
+            self._blocks = None
+            self._trials = self._compute_trials(ch)
+            g["group"] = self._trial_labels(len(g))
         else:
             self._blocks = None
+            self._trials = None
             g["group"] = _assign_groups(g["amp_uv"], self.n_groups)
         return g
 
@@ -919,8 +1049,23 @@ class ScenarioViewer(QWidget):
                 m = ((g["group"] == lab).to_numpy()) & got
                 if m.any():
                     ax_top.plot(xs[m], amps[m], "o", ms=5, color=_label_colour(lab, labels),
-                                label=f"{lab} (n={int(m.sum())})")
+                                label=f"{_label_text(lab)} (n={int(m.sum())})")
             ax_top.plot(xs, amps, "-", lw=0.8, color="0.7", zorder=0)
+            if self._trials is not None and self.show_band.isChecked():
+                # each pentad's level and scatter over its own stretch of curves
+                grp = g["group"].to_numpy(object)
+                for lab in labels:
+                    m = (grp == lab) & got
+                    if not m.any():
+                        continue
+                    x0, x1 = float(xs[m].min()) - 0.4, float(xs[m].max()) + 0.4
+                    v = amps[m]
+                    mean = float(v.mean())
+                    sd = float(v.std(ddof=1)) if v.size > 1 else 0.0
+                    colour = _label_colour(lab, labels)
+                    ax_top.fill_between([x0, x1], mean - sd, mean + sd, color=colour,
+                                        alpha=0.15, lw=0, zorder=0)
+                    ax_top.plot([x0, x1], [mean, mean], color=colour, lw=1.4, zorder=1)
             if self._blocks is not None and self.show_band.isChecked():
                 # each block's level and scatter over its own stretch of curves
                 pos = {int(c): k for k, c in enumerate(curves)}
@@ -989,6 +1134,8 @@ class ScenarioViewer(QWidget):
         ax_top.set_ylabel("area of the response, µV·ms" if self._use_area() else "PTP / |P1|, µV")
         verdict = ("" if self._blocks is None
                    else f" · {CB.VERDICT_RU[CB.verdict(self._blocks)]}")
+        if self._trials is not None:
+            verdict = f" · {self._trial_headline()}"
         ax_top.set_title(
             f"{ch} — response vs " + ("amplitude" if by_amp else "curve") + verdict,
             fontsize=10, loc="left")
@@ -1034,7 +1181,7 @@ class ScenarioViewer(QWidget):
                 ax_bot.fill_between(t_ms, m - sd, m + sd, color=_label_colour(lab, labels),
                                     alpha=0.18, lw=0, zorder=2)
                 ax_bot.plot(t_ms, m, color=_label_colour(lab, labels), lw=1.8, zorder=3,
-                            label=f"{lab} mean")
+                            label=f"{_label_text(lab)}, среднее")
             if labels:   # a silent channel has no groups, hence no legend
                 ax_bot.legend(fontsize=7, frameon=False, ncol=len(labels))
 
@@ -1092,7 +1239,9 @@ class ScenarioViewer(QWidget):
         ax_bot.set_ylabel("µV")
         ax_bot.set_title(
             f"{ch} — curves, "
-            + (("coloured by block" if self._blocks is not None else "coloured by amplitude group")
+            + (("coloured by trial (покой / приём)" if self._trials is not None
+                else "coloured by block" if self._blocks is not None
+                else "coloured by amplitude group")
                if by_group else "coloured by order (later = darker)"),
             fontsize=10, loc="left",
         )
@@ -1298,7 +1447,58 @@ class ScenarioViewer(QWidget):
                 "Paired stimulation": PAIRED,
                 "H-reflex": HREFLEX_KEY}.get(self.scenario or "")
 
+    def _trial_headline(self) -> str:
+        """One line for the plot title: what the picked trial shows, or where the best one is."""
+        best = JT.best_trial(self._trials or [])
+        sel = self.trial_box.currentData()
+        if sel in (None, 0):
+            return f"лучшая проба {best}" if best else "проб нет"
+        t = next((x for x in self._trials if x["Trial"] == sel), None)
+        if t is None:
+            return "проб нет"
+        bits = [f"проба {sel}"]
+        if np.isfinite(t["Delta %"]):
+            bits.append(f"{t['Delta %']:+.0f}%")
+        if np.isfinite(t["Cohen d"]):
+            bits.append(f"d={t['Cohen d']:+.2f}")
+        if np.isfinite(t["p Mann-Whitney"]):
+            bits.append(f"p={t['p Mann-Whitney']:.3f}")
+        return " · ".join(bits) + (" · ★ лучшая" if best == sel else "")
+
+    def _fill_trial_stats(self) -> None:
+        """One row per trial: rest against manoeuvre, the effect and both p values.
+
+        Always on the amplitude, in µV — the metric the table on disk selects the
+        best trial by. The star marks the trial that goes to the group base.
+        """
+        best = JT.best_trial(self._trials or [])
+        self.stats.setColumnCount(6)
+        # by content, not stretched: six equal columns in this panel are unreadable
+        self.stats.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.stats.setHorizontalHeaderLabels(
+            ["Проба", "покой µV", "приём µV", "Δ %", "d", "p (MW / Уэлч)"])
+        trials = self._trials or []
+        self.stats.setRowCount(len(trials))
+        for r, t in enumerate(trials):
+            star = "★ " if t["Trial"] == best else ""
+            cells = [
+                f"{star}{t['Trial']}: {t['Rest curves']}→{t['Act curves']}",
+                _num(t["Rest mean uV"], "{:.1f}") + " ± " + _num(t["Rest SD uV"], "{:.0f}"),
+                _num(t["Act mean uV"], "{:.1f}") + " ± " + _num(t["Act SD uV"], "{:.0f}"),
+                _num(t["Delta %"], "{:+.1f}"),
+                _num(t["Cohen d"], "{:+.2f}"),
+                _p(t["p Mann-Whitney"]) + " / " + _p(t["p Welch"]),
+            ]
+            for c, v in enumerate(cells):
+                self.stats.setItem(r, c, QTableWidgetItem(v))
+        self.stats.resizeColumnsToContents()
+
     def _fill_stats(self, g: pd.DataFrame, labels: list[str]) -> None:
+        if self._trials is not None:
+            self._fill_trial_stats()
+            return
+        self.stats.setColumnCount(5)
+        self.stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         unit = "µV·ms" if self._use_area() else "µV"
         blocks = self._blocks is not None
         self.stats.setHorizontalHeaderLabels(
