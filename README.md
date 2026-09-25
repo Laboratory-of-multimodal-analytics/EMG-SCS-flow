@@ -93,7 +93,7 @@ produced — no template diagnostics, no per-amplitude box-plots, no averaging p
 | Scenario | Name tokens | Deliverable (under `results/`) |
 | --- | --- | --- |
 | **Recruitment curve** | `RC`, `rec curve`, `kr rec`, `кр рек`, `КР` | `Recruitment/` — amplitude vs curve number per channel, top-N and amplitude-group box-plots, per-curve tables |
-| **Jendrassik manoeuvre** | `JM`, `ендр`, `Ендрассик` | `Jendrassik/` — every curve drawn, grouped by amplitude with group mean ± SD, group statistics |
+| **Jendrassik manoeuvre** | `JM`, `ендр`, `Ендрассик` | `Jendrassik/` — fixed trials of five rest curves against five manoeuvre curves, one figure per trial, the trial-by-trial profile, and a table with the effect size and both p values per trial |
 | **Paired stimulation** | `2 stim`, `2ст`, `двойная стим`, `парная`, `paired` | `Paired stimulation/` (same as Jendrassik), or the Condition-test outputs when the ISI is recoverable |
 | **H-reflex** | `H reflex`, `Н рефлекс`, or a muscle name alone (`сол`, `SOL`, `soleus`, `GM`, `FCU`, `гастрик`) | `H-reflex/` — M and H recruitment curves per channel, latency plots, per-curve tables with a column set per component, Hmax/Mmax; plus amplitude groups on the reflex when the file is a Jendrassik run too |
 
@@ -110,6 +110,40 @@ the conditioning modality, so the name cannot be asked" — does not hold for a 
 the deliverable. The muscle-name fallback is read off the dataset rather than guessed — these
 patterns select exactly the 75 files the processing journal marks as H-reflex out of all 415,
 with no false positive and none missed.
+
+#### The Jendrassik scenario: trials of five against five
+
+The protocol is fixed: five stimuli at rest, five with the manoeuvre, then the next
+intensity and the same again. So the run is cut into **blocks of five by position** and the
+blocks are paired — first pentad rest, second pentad manoeuvre, and that pair is trial 1;
+the next two are trial 2, and so on. In roughly a third of the recordings the number of
+pentads is odd; the last one is left unpaired and does not enter any comparison.
+
+Per trial and channel: mean and SD of each pentad, the gain in µV and in % of rest, Cohen's
+*d* on the pooled SD, and two tests of the five against five — Welch and Mann–Whitney.
+**Everything carries a sign and is selected on its absolute value**: the manoeuvre can just as
+well suppress the response as enhance it, and a response that disappears under the manoeuvre is
+the strongest effect there is, not a missing measurement. A curve with no detected response is
+therefore counted as an amplitude of **zero** (`MISSING_IS_ZERO` in `src/jendrassik_trials.py`);
+flip that constant to drop those curves instead.
+
+The **best trial** of each channel is the one with the largest |d| (ties go to the larger
+relative gain, then to the earlier trial). It is the single row per recording and channel that
+the group analysis is meant to compare across cohorts.
+
+At 5 against 5 Mann–Whitney is exact while no two values tie, and its two-sided p never falls
+below 2/252 ≈ 0.0079. With zeros standing in for undetected responses the ties push scipy onto
+its normal approximation and that floor stops applying.
+
+`Jendrassik/` gets `Trials/trial_NN.png` — one figure per trial, five rest curves and five
+manoeuvre curves with their means ± SD, the best trial starred — and `trials_profile.png`,
+where rest and manoeuvre are plotted trial by trial with a line joining each pair, so the trial
+with the largest effect is read off at a glance. `Excel/jendrassik_trials.csv` is the table.
+
+The earlier reading — contiguous blocks found from the data, with a verdict per channel from
+the within-block spread (`src/curve_blocks.py`) — still runs and still writes its own tables
+and figures beside these. It is what the H-reflex files that are also Jendrassik runs use, and
+having both lets a recording be checked one against the other.
 
 #### The H-reflex scenario: two responses per curve
 
@@ -187,6 +221,17 @@ scenario the run produced ("Recruitment curve" / "Jendrassik manoeuvre" / "Paire
 not by the exported PNGs: pick a channel, click a point on the response-vs-curve plot (or drag the
 slider) to pull that curve up bold with its markers, switch the colouring between curve order and
 amplitude group, and read the group mean/SD table beside it.
+
+On a **Jendrassik** run the surface works in trials instead of amplitude groups. A picker lists
+this channel's trials (`проба 2: покой 11-15 → приём 16-20`) and shows **one at a time** — the
+manoeuvre is read by comparing its five curves with the five before them, and ten curves of one
+trial drown among the rest when everything is drawn together; the curves outside the picked trial
+stay grey, and "все пробы" is there for a first look. Rest and manoeuvre keep the same two colours
+in every trial, so trials can be compared with each other. **Подсветить лучшую пробу** jumps to
+the trial with the largest |d| — the row the group base will take. The table beside the plots
+gives, per trial, both means ± SD, the relative gain, *d*, and both p values, with a star on the
+best. The numbers come from `src/jendrassik_trials.py`, the same code that writes the CSV, so the
+screen and the saved table cannot disagree.
 
 The **Crop review** tab also draws these files properly: its recruitment panel falls back to the
 curve number when the export carries no amplitude labels (previously it went blank), and the epoch
@@ -305,6 +350,7 @@ Two things keep the tree flat:
     ├── Boxplots/, Templates/, Template overlays/
     ├── Recruitment/ | Jendrassik/ | Paired stimulation/ | H-reflex/
     │                                 (Neurosoft .txt: exactly one of these)
+    │   └── Trials/                   Jendrassik: one PNG per trial (rest vs manoeuvre)
     │  StartStop:
     ├── Excel/                        metrics, summary, and three diagnostic tables:
     │                                 accepted anchors, discarded anchors + reason, channel QC
