@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from . import curve_blocks as CB
+from . import jendrassik_trials as JT
 from .constants import TEXT_CURVES_RESP_TMIN
 from .io_utils import ensure_dir
 from .neurosoft import JENDRASSIK, PAIRED
@@ -359,7 +360,247 @@ def run_jendrassik_blocks(output_root: Path) -> Path | None:
     counts = res.verdict["Verdict"].value_counts().to_dict()
     print(f"[JENDRASSIK] {len(responders)} channels, {tidy['Curve'].nunique()} curves, "
           f"contiguous blocks; verdicts {counts} -> {out_dir}; tables -> {excel_dir}", flush=True)
+    # The fixed five-curve trials, which is what the recording was made for (see
+    # run_jendrassik_trials). Its own table and its own figures, beside the blocks:
+    # until the new reading has been run over real files, its failure must not cost
+    # the previous result, which does work.
+    try:
+        run_jendrassik_trials(output_root)
+    except Exception as exc:                        # noqa: BLE001 - reported, not raised
+        print(f"[JENDRASSIK] trials skipped ({type(exc).__name__}: {exc})", flush=True)
     return out_dir
+
+
+#: Trials: the names of what goes on disk. The previous reading's block tables are
+#: written beside these and left alone — they are still read, and worth comparing against.
+JENDRASSIK_TRIALS_CSV = "jendrassik_trials.csv"
+JENDRASSIK_TRIALS_DIR = "Trials"
+JENDRASSIK_TRIALS_PROFILE = "trials_profile.png"
+
+#: Rest and manoeuvre. The same colours in the PNGs and in the GUI, so a figure and
+#: the screen are read the same way.
+TRIAL_COLORS = {"rest": "#4575b4", "act": "#d73027"}
+
+
+def _trials_by_channel(tidy: pd.DataFrame, responders: list[str],
+                       metric: str = "Amplitude uV") -> tuple[dict, dict]:
+    """``({channel: [trials]}, {channel: curve numbers})`` for one recording.
+
+    A channel with gaps in its curve numbering is skipped whole: the run is cut by
+    position, and one missing curve would shift the phase — rest would be read as
+    manoeuvre. Better to leave a channel uncounted than to count it inverted.
+    """
+    trials_of, curves_of = {}, {}
+    for ch in responders:
+        d = tidy[tidy["Channel"] == ch].sort_values("Curve")
+        curves = d["Curve"].to_numpy(int)
+        if len(curves) > 1 and not (np.diff(curves) == 1).all():
+            print(f"[JENDRASSIK] {ch}: gaps in the curve numbering — channel skipped",
+                  flush=True)
+            continue
+        if metric not in d.columns:
+            continue
+        ts = JT.channel_trials(curves, d[metric].to_numpy(float))
+        if ts:
+            trials_of[ch] = ts
+            curves_of[ch] = curves
+    return trials_of, curves_of
+
+
+def run_jendrassik_trials(output_root: Path, metric: str = "Amplitude uV") -> Path | None:
+    """One recording's trials of five rest curves against five manoeuvre curves.
+
+    The curves are cut five in a row, the pentads paired into rest/manoeuvre trials,
+    each pair compared (means, SDs, the gain, Cohen's d, Welch and Mann-Whitney), and
+    within each channel the trial with the largest |d| is marked — the one row that
+    goes on to the group base. See ``src/jendrassik_trials.py``.
+
+    Writes ``jendrassik_trials.csv``, one figure per trial under ``Jendrassik/Trials/``
+    (five rest curves and five manoeuvre curves with their means) and the summary
+    ``trials_profile.png`` — trial by trial, with the best one highlighted.
+
+    Returns the scenario directory, or None when there is nothing to compare.
+    """
+    output_root = Path(output_root)
+    csv = _metrics_csv(output_root)
+    if not csv.exists():
+        print("[JENDRASSIK] No SIR metrics CSV found; skipping trials.", flush=True)
+        return None
+    tidy, responders = _tidy_metrics(csv)
+    if tidy is None:
+        print("[JENDRASSIK] No responding channels; skipping trials.", flush=True)
+        return None
+
+    trials_of, _curves_of = _trials_by_channel(tidy, responders, metric)
+    if not trials_of:
+        print("[JENDRASSIK] No complete pair of pentads; no trials computed.", flush=True)
+        return None
+
+    recording = output_root.name
+    rows = [{"Recording": recording, "Channel": ch,
+             **{k: v for k, v in t.items() if not k.startswith("_")}}
+            for ch in trials_of for t in trials_of[ch]]
+    trials = JT.mark_best(pd.DataFrame(rows))
+    # p values are NOT rounded: round(3) would turn 4e-08 into 0.0
+    for c in ["Rest mean uV", "Rest SD uV", "Act mean uV", "Act SD uV",
+              "Delta uV", "Delta %", "Cohen d", "|d|", "|Delta %|"]:
+        trials[c] = trials[c].round(3)
+
+    out_dir = ensure_dir(_sir_dir(output_root) / "Jendrassik")
+    excel_dir = ensure_dir(shared_excel_dir(output_root))
+    trials.to_csv(excel_dir / JENDRASSIK_TRIALS_CSV, index=False)
+
+    # ── figures ──
+    drawn = list(trials_of)
+    best_of = {ch: JT.best_trial(ts) for ch, ts in trials_of.items()}
+    _plot_trials_profile(trials_of, drawn, best_of, out_dir / JENDRASSIK_TRIALS_PROFILE)
+
+    times, waves = _load_epoch_waveforms(output_root)
+    have_waves = [ch for ch in drawn if ch in waves]
+    n_png = 0
+    if times is not None and have_waves:
+        trials_dir = ensure_dir(out_dir / JENDRASSIK_TRIALS_DIR)
+        # A re-run can end up with fewer trials: figures left over from the previous
+        # one would report trials the table no longer has.
+        for stale in trials_dir.glob("trial_*.png"):
+            stale.unlink()
+        for k in sorted({t["Trial"] for ts in trials_of.values() for t in ts}):
+            _plot_trial_curves(times, waves, trials_of, have_waves, k, best_of,
+                               trials_dir / f"trial_{k:02d}.png")
+            n_png += 1
+    else:
+        print("[JENDRASSIK] No saved epochs — per-trial figures skipped.", flush=True)
+
+    n_best = int((trials["Best"] != "").sum())
+    print(f"[JENDRASSIK] trials: {trials['Channel'].nunique()} channels, "
+          f"{len(trials)} trials, best marked on {n_best}; {n_png} figures "
+          f"-> {out_dir}; table -> {excel_dir / JENDRASSIK_TRIALS_CSV}", flush=True)
+    return out_dir
+
+
+def _plot_trial_curves(times, waves, trials_of, responders, trial: int, best_of: dict,
+                       out_path: Path, tag: str = "приём Ендрассика") -> None:
+    """One trial per figure: five rest curves and five manoeuvre curves with their means.
+
+    A. D. asked to look at the trials one at a time rather than all at once: on a
+    single picture the ten curves of one trial drown among the rest, and rest cannot
+    be told from manoeuvre by eye. One subplot per channel — the channels are what
+    gets compared with each other.
+
+    The y scale is fitted to the data AFTER the stimulus artifact: the artifact is two
+    orders of magnitude larger than the response and would otherwise flatten every
+    curve onto the zero line.
+    """
+    times = np.asarray(times)
+    t_ms = times * 1e3
+    post = times >= TEXT_CURVES_RESP_TMIN
+
+    fig, axes, nrow, ncol = _grid(len(responders))
+    for i, ch in enumerate(responders):
+        ax = axes[i // ncol][i % ncol]
+        ch_waves = waves[ch]
+        t = next((x for x in trials_of.get(ch, []) if x["Trial"] == trial), None)
+        if t is None:
+            ax.text(0.5, 0.5, f"{ch}: пробы {trial} нет", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=8, color="0.5")
+            ax.set_axis_off()
+            continue
+
+        for key, kind, name in (("_rest_curves", "rest", "покой"),
+                                ("_act_curves", "act", "приём")):
+            colour = TRIAL_COLORS[kind]
+            # curve numbers are 1-based, rows of the array 0-based
+            rows = [c - 1 for c in t[key] if 0 < c <= len(ch_waves)]
+            if not rows:
+                continue
+            block = ch_waves[sorted(rows)]
+            for w in block:
+                ax.plot(t_ms, w, color=colour, lw=0.5, alpha=0.30)
+            m = block.mean(axis=0)
+            sd = block.std(axis=0, ddof=1) if len(block) > 1 else np.zeros_like(m)
+            ax.fill_between(t_ms, m - sd, m + sd, color=colour, alpha=0.18, lw=0)
+            span = t["Rest curves"] if kind == "rest" else t["Act curves"]
+            ax.plot(t_ms, m, color=colour, lw=1.8, label=f"{name} ({span}), n={len(block)}")
+
+        ax.axhline(0, color="0.7", lw=0.6)
+        seg = ch_waves[:, post]
+        if seg.size and np.isfinite(seg).any():
+            lo, hi = float(np.nanmin(seg)), float(np.nanmax(seg))
+            pad = 0.08 * (hi - lo) if hi > lo else max(abs(hi), 1.0) * 0.1
+            ax.set_ylim(lo - pad, hi + pad)
+        d, rel = t["Cohen d"], t["Delta %"]
+        head = f"{ch}{'  ★ лучшая проба' if best_of.get(ch) == trial else ''}"
+        sub = (f"d={d:+.2f}" if np.isfinite(d) else "d=—")
+        sub += f", {rel:+.0f}%" if np.isfinite(rel) else ""
+        if np.isfinite(t["p Mann-Whitney"]):
+            sub += f", p={t['p Mann-Whitney']:.3f}"
+        ax.set_title(f"{head} — {sub}", fontsize=9, loc="left")
+        ax.set_ylabel("мкВ")
+        ax.grid(alpha=0.3)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7)
+
+    for j in range(len(responders), nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    for ax in axes[-1]:
+        ax.set_xlabel("мс от стимула")
+    fig.suptitle(f"Проба {trial}: покой против приёма, среднее ± SD ({tag})", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _plot_trials_profile(trials_of, responders, best_of: dict, out_path: Path,
+                         tag: str = "приём Ендрассика") -> None:
+    """The summary figure, trial by trial: where the manoeuvre's effect is largest.
+
+    Each trial's rest point and manoeuvre point, joined by a line: the length of the
+    line IS the effect and its direction the sign. A channel's best trial (largest
+    |d|) is highlighted, so it is clear which row of the table to read.
+    """
+    fig, axes, nrow, ncol = _grid(len(responders))
+    for i, ch in enumerate(responders):
+        ax = axes[i // ncol][i % ncol]
+        ts = trials_of.get(ch, [])
+        if not ts:
+            ax.set_axis_off()
+            continue
+        x = [t["Trial"] for t in ts]
+        rest = [t["Rest mean uV"] for t in ts]
+        act = [t["Act mean uV"] for t in ts]
+        best = best_of.get(ch)
+        if best is not None:
+            ax.axvspan(best - 0.3, best + 0.3, color="#ffe9b0", lw=0, zorder=0)
+        for xi, r, a in zip(x, rest, act):
+            ax.plot([xi, xi], [r, a], color="0.55", lw=1.0, zorder=1)
+        ax.plot(x, rest, "o-", color=TRIAL_COLORS["rest"], lw=1.4, ms=5,
+                label="покой", zorder=2)
+        ax.plot(x, act, "o-", color=TRIAL_COLORS["act"], lw=1.4, ms=5,
+                label="приём", zorder=2)
+        # Headroom for the d labels: without it they run into the channel's title.
+        top = max([v for v in rest + act if np.isfinite(v)], default=1.0)
+        ax.set_xlim(min(x) - 0.5, max(x) + 0.5)
+        ax.set_ylim(0, top * 1.25 if top > 0 else 1.0)
+        for t in ts:
+            d = t["Cohen d"]
+            if np.isfinite(d):
+                ax.annotate(f"{d:+.1f}",
+                            (t["Trial"], max(t["Rest mean uV"], t["Act mean uV"])),
+                            textcoords="offset points", xytext=(0, 7),
+                            ha="center", fontsize=7, color="0.35", zorder=4)
+        ax.set_title(ch + (f" — лучшая проба {best}" if best else ""), fontsize=10, loc="left")
+        ax.set_xticks(x)
+        ax.set_ylabel("Амплитуда, мкВ")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7, loc="lower left", framealpha=0.85)
+    for j in range(len(responders), nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    for ax in axes[-1]:
+        ax.set_xlabel("номер пробы")
+    fig.suptitle(f"Проба за пробой: покой и приём, подписано d Коэна ({tag})", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
 
 
 def run_jendrassik_analysis(output_root: Path, n_groups: int | None = None):
