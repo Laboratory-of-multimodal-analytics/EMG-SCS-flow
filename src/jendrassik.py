@@ -443,7 +443,7 @@ def run_jendrassik_trials(output_root: Path, metric: str = "Amplitude uV") -> Pa
     trials = JT.mark_best(pd.DataFrame(rows))
     # p values are NOT rounded: round(3) would turn 4e-08 into 0.0
     for c in ["Rest mean uV", "Rest SD uV", "Act mean uV", "Act SD uV",
-              "Delta uV", "Delta %", "Cohen d", "|d|", "|Delta %|"]:
+              "Delta uV", "Delta %", "Cohen d", "Cohen d raw", "|d|", "|Delta %|"]:
         trials[c] = trials[c].round(3)
 
     out_dir = ensure_dir(_sir_dir(output_root) / "Jendrassik")

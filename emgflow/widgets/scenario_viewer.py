@@ -103,6 +103,22 @@ def _p(v) -> str:
     return "<0.001" if v < 0.001 else f"{v:.3f}"
 
 
+def _missing_note(trial: dict) -> str:
+    """" · 3 кривые без ответа", or "" when every curve of the trial was detected.
+
+    A trial where the detector found nothing is counted as an amplitude of zero,
+    which is deliberate — but it is also the trial whose d the floor in
+    src/jendrassik_trials.py holds down, so it has to be visible on screen rather
+    than only in the CSV.
+    """
+    n = int(trial.get("N missing rest", 0)) + int(trial.get("N missing act", 0))
+    if not n:
+        return ""
+    word = "кривая" if n % 10 == 1 and n % 100 != 11 else (
+        "кривые" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "кривых")
+    return f" · {n} {word} без ответа"
+
+
 def _label_text(label: str) -> str:
     """How a group label is written in a legend: trial halves get words, others stay as they are."""
     s = str(label)
@@ -585,7 +601,8 @@ class ScenarioViewer(QWidget):
         self.trial_box.addItem("все пробы", 0)
         for t in self._trials:
             self.trial_box.addItem(
-                f"проба {t['Trial']}: покой {t['Rest curves']} → приём {t['Act curves']}",
+                f"проба {t['Trial']}: покой {t['Rest curves']} → приём {t['Act curves']}"
+                + _missing_note(t),
                 t["Trial"])
         # One trial per view is what was asked for; "all" stays available for a
         # first look at a channel.
@@ -1482,7 +1499,8 @@ class ScenarioViewer(QWidget):
         for r, t in enumerate(trials):
             star = "★ " if t["Trial"] == best else ""
             cells = [
-                f"{star}{t['Trial']}: {t['Rest curves']}→{t['Act curves']}",
+                f"{star}{t['Trial']}: {t['Rest curves']}→{t['Act curves']}"
+                + _missing_note(t),
                 _num(t["Rest mean uV"], "{:.1f}") + " ± " + _num(t["Rest SD uV"], "{:.0f}"),
                 _num(t["Act mean uV"], "{:.1f}") + " ± " + _num(t["Act SD uV"], "{:.0f}"),
                 _num(t["Delta %"], "{:+.1f}"),

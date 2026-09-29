@@ -131,6 +131,19 @@ The **best trial** of each channel is the one with the largest |d| (ties go to t
 relative gain, then to the earlier trial). It is the single row per recording and channel that
 the group analysis is meant to compare across cohorts.
 
+Counting an undetected curve as zero has one consequence that has to be undone: five
+undetected curves give a pentad an SD of exactly **0**, the pooled SD collapses, and |d| runs
+to 15–20 on the weakest responses in the file — so the best trial gets picked on a failure of
+detection rather than on an effect of the manoeuvre. On the 450 Neurosoft channels that
+happened on 64 of them. The pooled SD is therefore floored at the detection threshold itself
+(`SD_FLOOR_UV = STIM_PTP_MIN_UV`, 30 µV): a response below it is never reported, so a pentad
+of undetected curves is known to lie *under* the threshold, not to be identical. `Cohen d` is
+the floored value and is what the star is chosen on; `Cohen d raw` keeps the plain unfloored
+number that the two SD columns reproduce, and `N missing rest` / `N missing act` say how many
+of the five curves carried no detected response. The floor changes nothing wherever a pentad
+already spreads by more than 30 µV, and a manoeuvre that genuinely silences a large response
+still wins — 500 µV going to nothing is |d| ≈ 15 even floored.
+
 At 5 against 5 Mann–Whitney is exact while no two values tie, and its two-sided p never falls
 below 2/252 ≈ 0.0079. With zeros standing in for undetected responses the ties push scipy onto
 its normal approximation and that floor stops applying.
@@ -230,8 +243,10 @@ stay grey, and "все пробы" is there for a first look. Rest and manoeuvre
 in every trial, so trials can be compared with each other. **Подсветить лучшую пробу** jumps to
 the trial with the largest |d| — the row the group base will take. The table beside the plots
 gives, per trial, both means ± SD, the relative gain, *d*, and both p values, with a star on the
-best. The numbers come from `src/jendrassik_trials.py`, the same code that writes the CSV, so the
-screen and the saved table cannot disagree.
+best. A trial where the detector found nothing on some curves is labelled `· 3 кривые без ответа`
+in the picker and in the table, because those are the zeros the SD floor holds down. The numbers
+come from `src/jendrassik_trials.py`, the same code that writes the CSV, so the screen and the
+saved table cannot disagree.
 
 The **Crop review** tab also draws these files properly: its recruitment panel falls back to the
 curve number when the export carries no amplitude labels (previously it went blank), and the epoch

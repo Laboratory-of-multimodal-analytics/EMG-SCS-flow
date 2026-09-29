@@ -21,6 +21,16 @@ altogether is showing the strongest effect there is, and losing it would be wors
 than any rounding. Switch with ``MISSING_IS_ZERO`` or with each function's
 ``missing_is_zero`` argument.
 
+Those zeros are why the pooled SD carries a floor (``SD_FLOOR_UV``). Five
+undetected curves give an SD of exactly 0, which is not a measurement of "no
+spread": the toolbox reports nothing below ``STIM_PTP_MIN_UV``, so all that is
+known about those curves is that they lie under it. Left unfloored the pooled SD
+collapses, |d| runs to 15-20 on the very weakest responses in a file, and the
+best trial is picked on a failure of detection rather than on an effect of the
+manoeuvre — on our 450 Neurosoft channels that happened on 64 of them. ``Cohen
+d`` is therefore computed on SDs floored at the detection threshold, and ``Cohen
+d raw`` keeps the plain unfloored value that the two SD columns reproduce.
+
 Knows nothing about Qt, matplotlib or the folder layout: arrays in, numbers out.
 Both the pipeline (``src/jendrassik.py``) and the interactive surface
 (``emgflow/widgets/scenario_viewer.py``) go through it, so the trials on screen
@@ -32,6 +42,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .constants import STIM_PTP_MIN_UV
 from .curve_blocks import curve_span
 
 #: Curves in one block: five of rest, five of the manoeuvre.
@@ -39,6 +50,13 @@ BLOCK_SIZE = 5
 
 #: An undetected response is an amplitude of 0, not "no data". See the module docstring.
 MISSING_IS_ZERO = True
+
+#: Smallest spread a pentad is allowed to claim, in µV. It is the detection
+#: threshold itself: a response under it is never reported, so a pentad of
+#: undetected curves is known only to lie below it, not to be identical. The
+#: number also happens to be A. Militskova's 30 µV — the spread she calls the
+#: sign of a working manoeuvre — which is why no second constant is introduced.
+SD_FLOOR_UV = STIM_PTP_MIN_UV
 
 
 def split_blocks(n_curves: int, size: int = BLOCK_SIZE) -> list[range]:
@@ -64,10 +82,19 @@ def _prepare(values, missing_is_zero: bool) -> np.ndarray:
     return v[np.isfinite(v)]
 
 
-def compare_pair(rest, act, missing_is_zero: bool | None = None) -> dict:
+def compare_pair(rest, act, missing_is_zero: bool | None = None,
+                 sd_floor: float = SD_FLOOR_UV) -> dict:
     """One trial on one channel: the pentad of rest against the pentad of manoeuvre.
 
     The sign is "manoeuvre minus rest" throughout: plus is a rise, minus a fall.
+
+    ``Cohen d`` divides by a pooled SD whose two halves are floored at *sd_floor*
+    (the detection threshold — see ``SD_FLOOR_UV``), because a pentad of
+    undetected curves reports an SD of 0 and would otherwise carry every
+    comparison. ``Cohen d raw`` is the same quantity without the floor, i.e. what
+    the ``Rest SD uV`` / ``Act SD uV`` columns reproduce; the selection uses the
+    floored one. ``N missing rest`` / ``N missing act`` say how many of the five
+    curves had no detected response, which is what makes the two differ.
 
     The two guards before the tests are there for different reasons. With zero
     spread in BOTH groups Welch divides by zero and returns ``p = 0.0`` — a number
@@ -83,6 +110,8 @@ def compare_pair(rest, act, missing_is_zero: bool | None = None) -> dict:
     """
     if missing_is_zero is None:
         missing_is_zero = MISSING_IS_ZERO
+    n_missing1 = int(np.isnan(np.asarray(rest, dtype=float)).sum())
+    n_missing2 = int(np.isnan(np.asarray(act, dtype=float)).sum())
     rest = _prepare(rest, missing_is_zero)
     act = _prepare(act, missing_is_zero)
 
@@ -95,10 +124,19 @@ def compare_pair(rest, act, missing_is_zero: bool | None = None) -> dict:
     delta = m2 - m1                                   # µV, signed
     rel = 100.0 * delta / m1 if m1 > 0 else np.nan    # % of rest, signed
 
-    # Cohen's d: difference of means over the pooled SD
-    pooled = (np.sqrt(((n1 - 1) * sd1 ** 2 + (n2 - 1) * sd2 ** 2) / (n1 + n2 - 2))
-              if n1 > 1 and n2 > 1 else np.nan)
+    # Cohen's d: difference of means over the pooled SD, once on the SDs as
+    # measured and once on SDs no smaller than the detection floor. The floored
+    # one is what the best trial is chosen on.
+    def _pooled(s1: float, s2: float) -> float:
+        if not (n1 > 1 and n2 > 1 and np.isfinite(s1) and np.isfinite(s2)):
+            return np.nan
+        return float(np.sqrt(((n1 - 1) * s1 ** 2 + (n2 - 1) * s2 ** 2) / (n1 + n2 - 2)))
+
+    pooled_raw = _pooled(sd1, sd2)
+    pooled = _pooled(max(sd1, sd_floor) if np.isfinite(sd1) else sd1,
+                     max(sd2, sd_floor) if np.isfinite(sd2) else sd2)
     d = delta / pooled if np.isfinite(pooled) and pooled > 0 else np.nan
+    d_raw = delta / pooled_raw if np.isfinite(pooled_raw) and pooled_raw > 0 else np.nan
 
     p_welch = p_mw = np.nan
     if n1 >= 2 and n2 >= 2:
@@ -115,10 +153,11 @@ def compare_pair(rest, act, missing_is_zero: bool | None = None) -> dict:
 
     return {
         "N rest": n1, "N act": n2,
+        "N missing rest": n_missing1, "N missing act": n_missing2,
         "Rest mean uV": m1, "Rest SD uV": sd1,
         "Act mean uV": m2, "Act SD uV": sd2,
         "Delta uV": delta, "Delta %": rel,
-        "Cohen d": d,
+        "Cohen d": d, "Cohen d raw": d_raw,
         "p Welch": p_welch, "p Mann-Whitney": p_mw,
     }
 
