@@ -31,6 +31,16 @@ manoeuvre — on our 450 Neurosoft channels that happened on 64 of them. ``Cohen
 d`` is therefore computed on SDs floored at the detection threshold, and ``Cohen
 d raw`` keeps the plain unfloored value that the two SD columns reproduce.
 
+Each trial is measured TWICE: on the peak-to-peak span and on the response area
+(``src/area.py``). The span reads only the two largest phases, so a response that
+breaks into several smaller deflections measures the same as a clean biphasic one
+of the same span, and the manoeuvre can reshape a response without changing it.
+Both land in one row of the saved table; ``AREA_COLUMNS`` holds the names the area
+takes there. ``SD_FLOOR_UV`` is NOT carried over to it: that floor is the detection
+threshold in µV and means nothing in µV·ms, so the area is compared with the floor
+switched off and its Cohen's d is the plain unfloored value. The marked trial is
+chosen on the SPAN either way, so the table and the GUI star the same trial.
+
 Knows nothing about Qt, matplotlib or the folder layout: arrays in, numbers out.
 Both the pipeline (``src/jendrassik.py``) and the interactive surface
 (``emgflow/widgets/scenario_viewer.py``) go through it, so the trials on screen
@@ -162,13 +172,46 @@ def compare_pair(rest, act, missing_is_zero: bool | None = None,
     }
 
 
-def channel_trials(curves, values, missing_is_zero: bool | None = None) -> list[dict]:
+#: How ``compare_pair``'s columns are renamed when the measured quantity is the
+#: response area, so one row of the saved table can carry the span and the area side
+#: by side. Named as the H-reflex tables name their two responses — the
+#: distinguishing prefix first, the unit a bare suffix ("M area uV·ms").
+#:
+#: ``N rest`` / ``N act`` get no counterpart (they are the same five curves), and
+#: neither does ``Cohen d raw``: with the SD floor switched off (see the module
+#: docstring) the floored value and the raw one are the same number.
+AREA_COLUMNS = {
+    "Rest mean uV": "Area rest mean uV·ms",
+    "Rest SD uV": "Area rest SD uV·ms",
+    "Act mean uV": "Area act mean uV·ms",
+    "Act SD uV": "Area act SD uV·ms",
+    "Delta uV": "Area delta uV·ms",
+    "Delta %": "Area delta %",
+    "Cohen d": "Area Cohen d",
+    "N missing rest": "Area N missing rest",
+    "N missing act": "Area N missing act",
+    "p Welch": "Area p Welch",
+    "p Mann-Whitney": "Area p Mann-Whitney",
+}
+
+#: Of those, the ones a table may round. A p value rounded to three decimals becomes
+#: 0.0, and a count of undetected curves is already an integer.
+AREA_ROUNDED = [name for key, name in AREA_COLUMNS.items()
+                if not key.startswith(("p ", "N "))]
+
+
+def channel_trials(curves, values, missing_is_zero: bool | None = None,
+                   sd_floor: float = SD_FLOOR_UV) -> list[dict]:
     """Every trial of one channel: a dict per trial, in run order.
 
     ``curves`` holds the curve numbers in run order, ``values`` the measured
     quantity at the same places (NaN where no response was found). The
     ``_rest``/``_act`` keys carry the pentads' positions (``range`` objects) for
     whoever draws the curves; they do not go into the table — hence the underscore.
+
+    ``sd_floor`` is handed to ``compare_pair`` and is in the UNITS OF ``values``:
+    the default is the amplitude threshold, so a quantity measured in anything else
+    has to pass its own (the response area passes 0 — see ``AREA_COLUMNS``).
 
     One entry point for both the pipeline and the GUI: the trials on screen and the
     trials in the saved table have to be the same trials.
@@ -185,7 +228,7 @@ def channel_trials(curves, values, missing_is_zero: bool | None = None) -> list[
             "Rest curves": curve_span(curves[rest.start:rest.stop]),
             "Act curves": curve_span(curves[act.start:act.stop]),
             **compare_pair(values[rest.start:rest.stop],
-                           values[act.start:act.stop], missing_is_zero),
+                           values[act.start:act.stop], missing_is_zero, sd_floor),
         })
     return out
 
