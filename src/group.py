@@ -130,6 +130,18 @@ def parse_labels(run_root: Path) -> tuple[str, str]:
     return name, "—"
 
 
+def is_control_group(name) -> bool:
+    """True when a group's name says the group is a control.
+
+    A search for the word, not a comparison: the name is built from the tags
+    (``cohort``, ``level``, …) or typed by hand in the list, so "control",
+    "контроль" and "control · Th11-12" all have to count. The group views ask this
+    to give the controls their own colour family whichever side they are compared
+    on, so that red never means "patients" on one figure and "controls" on the next.
+    """
+    return bool(_CONTROL.search(str(name)))
+
+
 def folder_group(run_root: Path, base: Path | None = None) -> str:
     """The user's own grouping folder of a run: the first folder under *base*.
 
@@ -321,6 +333,139 @@ def split_component(channel: str) -> tuple[str, str | None]:
         if channel.endswith(suffix):
             return channel[: -len(suffix)], comp
     return channel, None
+
+
+# --------------------------------------------------------------------------- #
+# Jendrassik: the trials each recording has already measured
+# --------------------------------------------------------------------------- #
+#: The table every processed Jendrassik run writes (``src/jendrassik.py``).
+JENDRASSIK_TRIALS_CSV = "jendrassik_trials.csv"
+
+#: What a trial of the manoeuvre is compared on, and the units it is read in. Every
+#: one of them is a CHANGE of the manoeuvre's pentad against the rest pentad, so
+#: zero means "the manoeuvre changed nothing" and a negative number is a SUPPRESSED
+#: response — which is why the view draws a baseline. The three A. Militskova asked
+#: for, no more: the response area is in each recording's own table and is not
+#: compared across recordings here.
+JENDRASSIK_METRICS = {
+    "delta_pct": "прирост, % от покоя",
+    "cohen_d": "d Коэна",
+    "delta_uv": "прирост, мкВ",
+}
+
+#: The column of ``jendrassik_trials.csv`` behind each of them.
+_JENDRASSIK_COLUMNS = {
+    "delta_pct": "Delta %",
+    "cohen_d": "Cohen d",
+    "delta_uv": "Delta uV",
+}
+
+
+def jendrassik_trials_path(run_root) -> Path:
+    """Where a finished run keeps its table of trials, in either output layout."""
+    from emgflow.results import SIR_DIR, mode_dir
+
+    return mode_dir(Path(run_root), SIR_DIR) / "Excel" / JENDRASSIK_TRIALS_CSV
+
+
+def collect_jendrassik_trials(runs) -> pd.DataFrame:
+    """Every selected run's Jendrassik trials in one long table.
+
+    Columns: ``subject, state, run, channel, trial, best, rest_curves, act_curves,
+    n_missing``, plus one per measure in ``JENDRASSIK_METRICS``.
+
+    Nothing is recomputed here. The trials are read from the table the pipeline
+    wrote, so a group view and a recording's own table cannot disagree — and the
+    marked best trial is the one that recording marked. A run of another protocol,
+    or one whose trials were never computed, contributes nothing.
+    """
+    frames = []
+    for run in runs:
+        if not run.include:
+            continue
+        path = jendrassik_trials_path(run.root)
+        if not path.is_file():
+            continue
+        try:
+            t = pd.read_csv(path)
+        except Exception:                           # noqa: BLE001 - that run is skipped
+            continue
+        if t.empty or "Channel" not in t.columns:
+            continue
+        out = pd.DataFrame({
+            "subject": run.subject, "state": run.state, "run": str(run.root),
+            "channel": t["Channel"].astype(str),
+            "trial": pd.to_numeric(t.get("Trial"), errors="coerce"),
+            # NaN never equals "best", so a channel left unmarked stays unmarked
+            "best": t["Best"].eq("best") if "Best" in t.columns else False,
+            "rest_curves": (t["Rest curves"].astype(str) if "Rest curves" in t.columns else ""),
+            "act_curves": (t["Act curves"].astype(str) if "Act curves" in t.columns else ""),
+            "n_missing": sum(pd.to_numeric(t[c], errors="coerce").fillna(0)
+                             for c in ("N missing rest", "N missing act") if c in t.columns),
+        })
+        for key, column in _JENDRASSIK_COLUMNS.items():
+            out[key] = (pd.to_numeric(t[column], errors="coerce") if column in t.columns
+                        else np.nan)
+        frames.append(out)
+    if not frames:
+        return pd.DataFrame(columns=["subject", "state", "run", "channel", "trial", "best",
+                                     *JENDRASSIK_METRICS])
+    return pd.concat(frames, ignore_index=True)
+
+
+def jendrassik_sources(runs) -> tuple[int, int, int]:
+    """``(runs, those with a trials table on disk, those whose table did not read)``.
+
+    What a view says when it has nothing to draw: "there is no such table" and "the
+    table is there but did not come back" are different problems, and the second is
+    what a Google Drive folder that has not materialised the file looks like. The
+    message must not guess which one happened, so it counts.
+    """
+    total = with_table = unreadable = 0
+    for run in runs:
+        if not run.include:
+            continue
+        total += 1
+        path = jendrassik_trials_path(run.root)
+        try:
+            if not path.is_file():
+                continue
+            with_table += 1
+            if pd.read_csv(path).empty:
+                unreadable += 1
+        except Exception:                           # noqa: BLE001 - the failure IS the answer
+            unreadable += 1
+    return total, with_table, unreadable
+
+
+def jendrassik_by_recording(trials: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """One row per recording and channel: its best trial's *metric* and the spread
+    over all of that recording's trials.
+
+    One row, not one per trial: a recording that ran six trials would otherwise
+    weigh six times in a comparison whose unit is the recording. The value is the
+    trial the recording's own table marked — the largest |d| on the SPAN, whatever
+    *metric* is asked for here, so the dot and that table report the same trial.
+    ``lo``/``hi`` span every trial of the recording, for the optional range behind
+    the dot.
+
+    A channel whose table marked no best trial, or whose *metric* was never measured
+    (the area on a run made before it existed), drops out instead of being filled in
+    with a guess.
+    """
+    keys = ["subject", "state", "run", "channel"]
+    columns = [*keys, "trial", "value", "lo", "hi", "n_trials"]
+    if trials.empty or metric not in trials.columns:
+        return pd.DataFrame(columns=columns)
+    d = trials.copy()
+    d["_v"] = pd.to_numeric(d[metric], errors="coerce")
+    g = d.groupby(keys, sort=False)["_v"]
+    spread = pd.concat({"lo": g.min(), "hi": g.max(), "n_trials": g.count()},
+                       axis=1).reset_index()
+    best = d[d["best"].fillna(False)].drop_duplicates(keys, keep="first")
+    out = (best[[*keys, "trial", "_v"]].rename(columns={"_v": "value"})
+           .merge(spread, on=keys, how="left"))
+    return out.dropna(subset=["value"])[columns]
 
 
 # --------------------------------------------------------------------------- #

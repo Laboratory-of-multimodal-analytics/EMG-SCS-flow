@@ -22,6 +22,7 @@ pieces so they read the same and behave the same:
 
 from __future__ import annotations
 
+import colorsys
 import math
 from pathlib import Path
 
@@ -33,15 +34,21 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QCursor, QFont
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
                                QHeaderView, QLabel, QLayout, QPushButton, QScrollArea,
                                QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QToolTip, QVBoxLayout, QWidget)
 
+import matplotlib.colors as mcolors
+
+import src.group as G
 import src.group_stats as ST
 
-#: Group A and group B keep these two colours in every view of both tabs.
+#: Group A and group B keep these two colours in every view of both tabs — except
+#: that a CONTROL group always takes the warm one, whichever side it is picked on
+#: (``GroupPicker.colors``): the figures are read as "controls in red", and swapping
+#: A and B must not swap what a colour means.
 COLOR_A = "#2166ac"
 COLOR_B = "#d6604d"
 #: When all groups are shown at once.
@@ -213,39 +220,91 @@ def _set_legend_title(fig, legend, text: str) -> None:
     legend.get_title().set_multialignment("center")
 
 
+def shades(color, n: int, lightest: float = 0.66, darkest: float = 0.28) -> list[tuple]:
+    """*n* shades of one colour, light to dark, all plainly of the same family.
+
+    One per SUBJECT, so the recordings of one person share a tone while the group
+    they belong to stays readable at a glance: only the lightness moves, the hue and
+    the saturation stay where the group's colour put them. The range stops short of
+    white and of black, where neighbouring shades stop being telling apart and a dot
+    stops reading as its group's colour at all — the light end is also kept off
+    white because a pale dot on a white panel is a dot that gets missed.
+
+    Many subjects in one group means many shades and neighbours that are close; the
+    shades are there to see WHICH dots belong together, not to read a name off a
+    colour — that is what the tooltip is for.
+    """
+    base = mcolors.to_rgb(color)
+    if n <= 1:
+        return [base]
+    h, _, s = colorsys.rgb_to_hls(*base)
+    return [colorsys.hls_to_rgb(h, float(x), s)
+            for x in np.linspace(lightest, darkest, n)]
+
+
 def _jitter(n: int, width: float, seed: int) -> np.ndarray:
     return np.random.default_rng(seed).uniform(-width, width, n) if n else np.array([])
 
 
 def dots_and_box(ax, pos: float, values, color: str, seed: int = 0, width: float = 0.56,
-                 ranges=None) -> None:
+                 ranges=None, colors=None, labels=None) -> list[tuple[float, float, str]]:
     """One group at x = *pos*: a dot per recording, median line, quartile box.
+
+    The median line appears from two recordings and the box from three: below
+    those a "median" and "quartiles" describe nothing the dots do not already show.
 
     ``ranges`` (optional, one ``(lo, hi)`` per value) draws a thin vertical line
     behind each dot — e.g. the spread of a recording's last five curves — so a
     recording's own scatter stays attached to its dot.
+
+    ``colors`` (optional, one per value — see ``shades``) shades each dot by the
+    SUBJECT it came from, so the several recordings of one person are visibly one
+    person. The median and the box keep the group's colour itself: they describe the
+    group, not anyone in it.
+
+    Returns the dots actually drawn, as ``(x, y, label)`` in data coordinates, for a
+    caller that wants to point at them (``PlotView.set_hover``). The jitter is
+    decided here, so only here knows where a dot ended up; a recording whose value
+    was missing is simply not in the list. ``labels`` (one per value) is what each
+    dot is called — without it the labels come back empty.
     """
     v = np.asarray(values, dtype=float)
     keep = np.isfinite(v)
     xs = pos + _jitter(int(v.size), width * 0.32, seed)
+    kept_labels = [t for t, ok in zip(labels, keep) if ok] if labels is not None else []
     if ranges is not None:
-        segs = [[(x, lo), (x, hi)] for x, (lo, hi), ok in zip(xs, ranges, keep)
-                if ok and np.isfinite(lo) and np.isfinite(hi)]
-        if segs:
-            ax.add_collection(LineCollection(segs, colors=color, linewidths=0.9, alpha=0.35,
-                                             zorder=2), autolim=True)
+        shade = colors if colors is not None else [color] * len(v)
+        drawn = [([(x, lo), (x, hi)], c)
+                 for x, (lo, hi), ok, c in zip(xs, ranges, keep, shade)
+                 if ok and np.isfinite(lo) and np.isfinite(hi)]
+        if drawn:
+            # The line belongs to the dot it hangs off, so it takes the same shade;
+            # with one colour for all of them a dense panel loses which line belongs
+            # to which dot.
+            ax.add_collection(LineCollection([seg for seg, _ in drawn],
+                                             colors=[c for _, c in drawn],
+                                             linewidths=0.9, alpha=0.35, zorder=2),
+                              autolim=True)
+    dot_colors = color
+    if colors is not None:
+        dot_colors = [c for c, ok in zip(colors, keep) if ok] or color
     v, xs = v[keep], xs[keep]
     if v.size == 0:
-        return
+        return []
     if v.size >= 3:
         q1, q3 = np.percentile(v, [25, 75])
         ax.add_patch(Rectangle((pos - width / 2, q1), width, q3 - q1, facecolor=color,
                                alpha=0.13, edgecolor=color, lw=0.8, zorder=1))
-    med = float(np.median(v))
-    ax.plot([pos - width / 2, pos + width / 2], [med, med], color=color, lw=2.6, zorder=4,
-            solid_capstyle="butt")
-    ax.scatter(xs, v, s=26, color=color, alpha=0.85, edgecolor="white", linewidths=0.6,
+    # The median of a single recording is that recording, and a bold line drawn
+    # through its dot reads as a bar — as if the panel showed a summary of
+    # something. Same rule as the quartile box above, one threshold lower.
+    if v.size >= 2:
+        med = float(np.median(v))
+        ax.plot([pos - width / 2, pos + width / 2], [med, med], color=color, lw=2.6,
+                zorder=4, solid_capstyle="butt")
+    ax.scatter(xs, v, s=26, color=dot_colors, alpha=0.85, edgecolor="white", linewidths=0.6,
                zorder=3)
+    return list(zip(xs.tolist(), v.tolist(), kept_labels))
 
 
 def group_ticks(ax, labels: list[tuple[str, int]]) -> None:
@@ -289,6 +348,10 @@ class PlotView(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self.canvas)
         self.width_hint = 0
+        #: ``(ax, x, y, text)`` per dot the current figure drew — what the pointer
+        #: can be told about. Rebuilt by whoever draws; dropped when the figure is.
+        self._hover: list = []
+        self.canvas.mpl_connect("motion_notify_event", self._on_hover)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -298,11 +361,16 @@ class PlotView(QWidget):
     def panels(self, n: int, legend_entries: int = 1, bottom_extra: int = 0) -> list:
         """*n* axes of the fixed panel size; the columns follow the window width.
 
+        Clears the hover points: the axes this returns are new ones, and a tooltip
+        still pointing into the previous figure would answer for a dot that is no
+        longer on screen.
+
         ``legend_entries`` is how many entries the figure legend will have (0 for no
         legend): the space above the panels grows with its number of lines, so a long
         legend never runs into the panel titles. ``bottom_extra`` adds room under each
         panel for tilted group names (``label_space``); the plotting area keeps its size.
         """
+        self._hover = []
         n = max(int(n), 1)
         width = max(self.scroll.viewport().width(), self.width_hint, PANEL_W) - 2
         ncol = max(1, min(n, width // PANEL_W, MAX_COLUMNS))
@@ -330,6 +398,34 @@ class PlotView(QWidget):
         for ax in axes[n:]:
             ax.set_axis_off()
         return axes[:n]
+
+    #: How near the pointer has to be to a dot, in pixels, for the dot to answer.
+    HOVER_RADIUS_PX = 11.0
+
+    def set_hover(self, points) -> None:
+        """``(ax, x, y, text)`` per dot: what a tooltip says when the pointer is on it.
+
+        Called after drawing. A Qt tooltip rather than an annotation on the figure:
+        these panels are expensive to redraw, and a tooltip costs no redraw at all.
+        """
+        self._hover = list(points)
+
+    def _on_hover(self, event) -> None:
+        if event.inaxes is None or not self._hover or event.x is None:
+            QToolTip.hideText()
+            return
+        best, best_d = None, self.HOVER_RADIUS_PX
+        for ax, x, y, text in self._hover:
+            if ax is not event.inaxes or not text:
+                continue
+            px, py = ax.transData.transform((x, y))
+            d = math.hypot(px - event.x, py - event.y)
+            if d < best_d:
+                best, best_d = text, d
+        if best is None:
+            QToolTip.hideText()
+            return
+        QToolTip.showText(QCursor.pos(), best, self.canvas)
 
     def message(self, text: str) -> None:
         ax = self.panels(1, legend_entries=0)[0]
@@ -511,9 +607,8 @@ class GroupPicker(QWidget):
         self.all = QCheckBox("все группы")
         self.all.setToolTip("Показать все группы сразу, без сравнения двух.")
         self.all.toggled.connect(self._on_all)
-        dot_a, dot_b = QLabel("●"), QLabel("●")
-        dot_a.setStyleSheet(f"color: {COLOR_A}; font-size: 16px;")
-        dot_b.setStyleSheet(f"color: {COLOR_B}; font-size: 16px;")
+        self._dot_a, self._dot_b = QLabel("●"), QLabel("●")
+        dot_a, dot_b = self._dot_a, self._dot_b
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         for w in (QLabel("<b>Сравнить</b>"), dot_a, self.a, QLabel("и"), dot_b, self.b, self.all):
@@ -526,7 +621,20 @@ class GroupPicker(QWidget):
 
     def _on_pick(self) -> None:
         self._wanted = (self.a.currentData(), self.b.currentData())
+        self._sync_dots()
         self.changed.emit()
+
+    def _sync_dots(self) -> None:
+        """The two dots beside the combo boxes say which colour each side got.
+
+        They are not fixed to A and B, because a control group takes the warm
+        colour whichever side it sits on, and an indicator that disagrees with the
+        figure is worse than no indicator.
+        """
+        picked = self.colors()
+        a, b = self.a.currentData(), self.b.currentData()
+        for dot, group, fallback in ((self._dot_a, a, COLOR_A), (self._dot_b, b, COLOR_B)):
+            dot.setStyleSheet(f"color: {picked.get(group, fallback)}; font-size: 16px;")
 
     def _on_all(self, on: bool) -> None:
         self.a.setEnabled(not on)
@@ -557,6 +665,7 @@ class GroupPicker(QWidget):
                 box.setCurrentIndex(names.index(target))
             box.blockSignals(False)
         self._names = names
+        self._sync_dots()
 
     def groups(self) -> list[str]:
         """The groups drawn: A and B, or all of them."""
@@ -575,7 +684,13 @@ class GroupPicker(QWidget):
     def colors(self) -> dict[str, str]:
         groups = self.groups()
         if self.pair() is not None:
-            return {groups[0]: COLOR_A, groups[1]: COLOR_B}
+            a, b = groups[0], groups[1]
+            # The control group takes the warm colour even when it is picked as A.
+            # Only when exactly one side is a control: two controls, or none, leave
+            # the A/B order to decide, as everywhere else in the tab.
+            if G.is_control_group(a) and not G.is_control_group(b):
+                return {a: COLOR_B, b: COLOR_A}
+            return {a: COLOR_A, b: COLOR_B}
         return {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(self._names)}
 
 

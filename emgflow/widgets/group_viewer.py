@@ -3,7 +3,7 @@
 A group is a set of processed Neurosoft exports sharing a label read off the recording
 names — cohort, stimulation level, side, … ("Группировать по"); the label can be edited
 by hand in the list. The tab compares two groups, A in blue and B in red, or shows all
-of them, channel by channel, in four views:
+of them, channel by channel, in five views:
 
 * Плато — A. Militskova's summary of a recording: the mean response of its last five
   curves, the end of the ramp. One dot per recording, a thin line for the range of its
@@ -16,6 +16,11 @@ of them, channel by channel, in four views:
   recording, and each group's mean with a 95 % confidence band.
 * Асимметрия — the left/right index of the channel pairs on the same five curves
   (src/asymmetry.py; the sides are provisional).
+* Приём Ендрассика — the effect of the manoeuvre, for the recordings of that
+  protocol: one dot per recording (its best trial of five rest curves against five
+  with the manoeuvre), read as a gain in %, in µV or as Cohen's d. A baseline at
+  zero, because the manoeuvre suppresses a response as often as it enhances one.
+  The trials are read from each recording's own table, never recomputed.
 
 Recordings are read once, in the background, when a folder is added. Grouping, the
 compared groups, metric, normalisation and channels all work on what is in memory;
@@ -42,7 +47,7 @@ from src.constants import TEXT_CURVES_RESP_TMIN
 
 from .group_common import (plural, records, subjects, GroupTab, begin_fill, comparison_display, dots_and_box, empty_panel,
                            end_fill, group_ticks, groups_display, label_space, legend_note, median_band,
-                           member_table, style_axes, top_legend)
+                           member_table, shades, style_axes, top_legend)
 
 #: The metrics offered, in this order, with the units they are read in.
 METRIC_LABELS = {
@@ -69,12 +74,15 @@ VIEWS = [
     ("curves", "Кривые рекрутирования"),
     ("waves", "Формы ответов"),
     ("asym", "Асимметрия"),
+    ("jendrassik", "Приём Ендрассика"),
 ]
 
 
 class _PointReader(QThread):
-    """Reads the recordings' metrics (and which channels they recorded) off disk."""
-    done = Signal(object, object, object)
+    """Reads the recordings' metrics, their Jendrassik trials and which channels
+    they recorded off disk. One pass over the batch: the trials table is small, and
+    a second trip to a Google Drive folder costs more than reading it."""
+    done = Signal(object, object, object, object)
 
     def __init__(self, runs) -> None:
         super().__init__()
@@ -83,15 +91,16 @@ class _PointReader(QThread):
     def run(self) -> None:
         try:
             points = G.collect_points(self._runs)
+            trials = G.collect_jendrassik_trials(self._runs)
             recorded = {}
             for run in self._runs:
                 try:
                     recorded[str(run.root)] = A.recorded_channels(run.root)
                 except Exception:                      # noqa: BLE001 - falls back to the table
                     recorded[str(run.root)] = None
-            self.done.emit(points, recorded, None)
+            self.done.emit(points, trials, recorded, None)
         except Exception as exc:                       # noqa: BLE001 - shown to the user
-            self.done.emit(None, None, f"{type(exc).__name__}: {exc}")
+            self.done.emit(None, None, None, f"{type(exc).__name__}: {exc}")
 
 
 class _WaveReader(QThread):
@@ -127,6 +136,7 @@ class GroupViewer(GroupTab):
         super().__init__(session)
         self.runs: list[G.GroupRun] = []
         self.points_all = pd.DataFrame()
+        self.trials_all = pd.DataFrame()
         self._recorded: dict = {}
         self._waves: dict = {}
         self._pending: list[G.GroupRun] = []
@@ -137,6 +147,7 @@ class GroupViewer(GroupTab):
         self.plateau = pd.DataFrame()
         self.plateau_curves = pd.DataFrame()
         self.hm = pd.DataFrame()
+        self.jm = pd.DataFrame()
         self._asym = None
         self._missing: list[str] = []
 
@@ -205,11 +216,25 @@ class GroupViewer(GroupTab):
         self.asym_box.currentIndexChanged.connect(lambda _: self.redraw())
         self.asym_note = QLabel(A.SIDES_NOTE_RU)
         self.asym_note.setStyleSheet("color: #777;")
+        self.jm_metric_box = QComboBox()
+        for key, label in G.JENDRASSIK_METRICS.items():
+            self.jm_metric_box.addItem(label, key)
+        self.jm_metric_box.setToolTip(
+            "Чем мерить эффект приёма. Все величины — изменение относительно покоя, "
+            "поэтому ноль на рисунке означает «приём ничего не изменил», а минус — "
+            "что приём ответ подавил.")
+        self.jm_metric_box.currentIndexChanged.connect(lambda _: self.redraw())
+        self.jm_all_trials = QCheckBox("разброс по всем пробам записи")
+        self.jm_all_trials.setToolTip(
+            "Точка — всегда лучшая проба записи, та же, что помечена в её таблице. "
+            "С галочкой за точкой рисуется разброс по всем пробам этой записи.")
+        self.jm_all_trials.toggled.connect(lambda _: self.redraw())
         self.view_options = {
             "plateau": [self.show_five],
             "curves": [self.align_box, self.show_ramps],
             "waves": [self.show_traces],
             "asym": [self.asym_box, self.asym_note],
+            "jendrassik": [self.jm_metric_box, self.jm_all_trials],
         }
 
         left = QWidget()
@@ -285,7 +310,7 @@ class GroupViewer(GroupTab):
         self._reader.done.connect(self._on_points)
         self._reader.start()
 
-    def _on_points(self, points, recorded, error) -> None:
+    def _on_points(self, points, trials, recorded, error) -> None:
         if error:
             self.status.setText(error)
             QMessageBox.warning(self, "Не удалось прочитать записи", error)
@@ -297,6 +322,9 @@ class GroupViewer(GroupTab):
                 points["config"] = "Neurosoft"
                 self.points_all = (points if self.points_all.empty
                                    else pd.concat([self.points_all, points], ignore_index=True))
+            if trials is not None and not trials.empty:
+                self.trials_all = (trials if self.trials_all.empty
+                                   else pd.concat([self.trials_all, trials], ignore_index=True))
             self._recorded.update(recorded or {})
         self._read_pending()
         self._membership_changed()
@@ -305,6 +333,7 @@ class GroupViewer(GroupTab):
         self.runs, self._pending = [], []
         self.points_all = self.raw_points = self.values = pd.DataFrame()
         self.plateau = self.plateau_curves = self.hm = pd.DataFrame()
+        self.trials_all = self.jm = pd.DataFrame()
         self._recorded, self._waves, self._asym = {}, {}, None
         self._fill_scenarios()
         self._fill_table()
@@ -451,6 +480,13 @@ class GroupViewer(GroupTab):
         self.values, self._missing = G.apply_normalisation(pts, factors, metric)
         self.plateau, self.plateau_curves = G.plateau_table(self.values, G.LAST_N)
         self.hm = self._hmax_mmax(pts) if metric == "amp_uv" else pd.DataFrame()
+        # The trials are read, not recomputed, and carry no normalisation: a gain and
+        # a d are already relative to the recording's own rest pentad.
+        self.jm = pd.DataFrame()
+        if not self.trials_all.empty:
+            jm = self.trials_all[self.trials_all["run"].isin(state_of)].copy()
+            jm["state"] = jm["run"].map(state_of)
+            self.jm = jm
         self._asym = None
 
         bits = [records(len(active)), subjects(len({r.subject for r in active})),
@@ -500,6 +536,46 @@ class GroupViewer(GroupTab):
         return {r[unit_col]: r["p"] for _, r in t.iterrows()} if not t.empty else {}
 
     @staticmethod
+    def _shades_by_subject(frame, groups, colors) -> dict:
+        """``{(group, subject): colour}`` — one shade of the group's colour per subject.
+
+        Per subject and not per recording, because the subject is what the
+        comparison counts: a patient with six recordings is six of the dots on a
+        panel and one of the numbers in the test, and one tone for those six is what
+        makes that visible. It also answers "is this outlier on ch3 the same person
+        as the one on ch7?", which no amount of per-recording colouring could.
+
+        Built once per figure over EVERY subject of a group, not over the ones that
+        happen to have a response on the channel being drawn: otherwise a subject
+        would change shade from panel to panel and the shades would say nothing.
+        Subjects are taken in name order, so the same selection always produces the
+        same shades.
+        """
+        out: dict = {}
+        if frame is None or frame.empty or "subject" not in frame.columns:
+            return out
+        for g in groups:
+            people = sorted(frame.loc[frame["state"] == g, "subject"].dropna().unique())
+            for subject, shade in zip(people, shades(colors[g], len(people))):
+                out[(g, subject)] = shade
+        return out
+
+    @staticmethod
+    def _dot_colors(shade_of: dict, group: str, subjects) -> list:
+        return [shade_of.get((group, s)) for s in subjects]
+
+    @staticmethod
+    def _dot_labels(dg) -> list[str]:
+        """What a dot answers when the pointer stops on it: which recording it is.
+
+        The recording's FOLDER name and nothing else — it is what the list on the
+        left shows and what the run is called on disk, and everything else the dot
+        could say is already on the figure: the group is its colour and its position,
+        the value its height.
+        """
+        return [Path(str(run)).name or "—" for run in dg.get("run", [])]
+
+    @staticmethod
     def _title(name: str, p) -> str:
         if p is None or not np.isfinite(p):
             return name
@@ -525,6 +601,8 @@ class GroupViewer(GroupTab):
         pvals = self._p_values(p, "channel", "mean")
         unit = self._unit()
         latency = self.metric_box.currentData().endswith("_ms")
+        shade_of = self._shades_by_subject(p, groups, colors)
+        hover = []
         axes = view.panels(len(channels), legend_entries=len(groups) + self.show_five.isChecked(),
                            bottom_extra=label_space(groups))
         for i, (ax, ch) in enumerate(zip(axes, channels)):
@@ -537,8 +615,10 @@ class GroupViewer(GroupTab):
             for k, g in enumerate(present):
                 dg = d[d["state"] == g]
                 ranges = list(zip(dg["min"], dg["max"])) if self.show_five.isChecked() else None
-                dots_and_box(ax, k, dg["mean"].to_numpy(float), colors[g], seed=k + 7 * i,
-                             ranges=ranges)
+                hover += [(ax, *dot) for dot in dots_and_box(
+                    ax, k, dg["mean"].to_numpy(float), colors[g], seed=k + 7 * i,
+                    ranges=ranges, colors=self._dot_colors(shade_of, g, dg["subject"]),
+                    labels=self._dot_labels(dg))]
                 labels.append((g, len(dg)))
             group_ticks(ax, labels)
             style_axes(ax, self._title(ch, pvals.get(ch)), ylabel=unit)
@@ -548,8 +628,95 @@ class GroupViewer(GroupTab):
         if self.show_five.isChecked():
             entries.append((f"разброс {G.LAST_N} кривых записи", "0.45", "faint"))
         top_legend(view.figure, entries)
-        legend_note(view.figure, f"точка — запись (среднее последних {G.LAST_N} кривых) · черта — "
-                             "медиана группы · рамка — квартили")
+        legend_note(view.figure, f"точка — запись (среднее последних {G.LAST_N} кривых) · "
+                             "оттенок — субъект · черта — медиана группы · рамка — квартили · "
+                             "наведите на точку, чтобы увидеть запись")
+        view.set_hover(hover)
+
+    def _draw_jendrassik(self, view, groups, colors, channels) -> None:
+        key = self.jm_metric_box.currentData()
+        by_recording = G.jendrassik_by_recording(self.jm, key)
+        if by_recording.empty:
+            view.message(self._jendrassik_nothing(key))
+            return
+        d_all = by_recording[by_recording["state"].isin(groups)
+                             & by_recording["channel"].isin(channels)]
+        pvals = self._p_values(d_all, "channel", "value")
+        unit = G.JENDRASSIK_METRICS[key]
+        spread = self.jm_all_trials.isChecked()
+        shade_of = self._shades_by_subject(d_all, groups, colors)
+        hover = []
+        axes = view.panels(len(channels), legend_entries=len(groups) + spread,
+                           bottom_extra=label_space(groups))
+        for i, (ax, ch) in enumerate(zip(axes, channels)):
+            d = d_all[d_all["channel"] == ch]
+            present = [g for g in groups if (d["state"] == g).any()]
+            if not present:
+                empty_panel(ax, ch, "в этих группах нет проб")
+                continue
+            labels = []
+            for k, g in enumerate(present):
+                dg = d[d["state"] == g]
+                ranges = list(zip(dg["lo"], dg["hi"])) if spread else None
+                hover += [(ax, *dot) for dot in dots_and_box(
+                    ax, k, dg["value"].to_numpy(float), colors[g], seed=k + 13 * i,
+                    ranges=ranges, colors=self._dot_colors(shade_of, g, dg["subject"]),
+                    labels=self._dot_labels(dg))]
+                labels.append((g, len(dg)))
+            # Zero is the baseline here, not the bottom of the axis: the manoeuvre
+            # suppresses a response as often as it enhances one, and without the line
+            # the sign of the effect is not read off the panel. Drawn ABOVE the
+            # quartile box (zorder 1), which would otherwise wash it out, and below
+            # the dots.
+            ax.axhline(0.0, color="0.35", lw=1.0, ls=(0, (5, 3)), zorder=1.5)
+            # Keep zero INSIDE the panel. Autoscale puts it on the frame when every
+            # recording fell on one side of it — which is exactly the case the line
+            # is there to show — and a baseline drawn on the axis is not read as one.
+            lo, hi = ax.get_ylim()
+            span = (hi - lo) or 1.0
+            ax.set_ylim(min(lo, -0.12 * span) if lo >= 0 else lo,
+                        max(hi, 0.12 * span) if hi <= 0 else hi)
+            group_ticks(ax, labels)
+            style_axes(ax, self._title(ch, pvals.get(ch)), ylabel=unit)
+        entries = [(g, colors[g], "dot") for g in groups]
+        if spread:
+            entries.append(("разброс проб записи", "0.45", "faint"))
+        top_legend(view.figure, entries)
+        view.set_hover(hover)
+        note = ("точка — запись (её лучшая проба) · оттенок — субъект · черта — медиана "
+                "группы · рамка — квартили · пунктир — приём ничего не изменил · "
+                "наведите на точку, чтобы увидеть запись")
+        if key.endswith("_pct"):
+            note += " · процент не определён там, где в покое ответа нет"
+        legend_note(view.figure, note)
+
+    def _jendrassik_nothing(self, key: str) -> str:
+        """Why this view has nothing to draw — counted, not guessed.
+
+        A table that is on disk but does not read is what a Google Drive folder
+        looks like when it has not fetched the file yet, and it is silent: the
+        collector skips that recording. Saying "there is no such table" there would
+        send the user looking for the wrong problem.
+        """
+        if not self.jm.empty:
+            if key == "delta_pct":
+                return ("Ни у одной отмеченной записи прирост в % не определён:\n"
+                        "в покое ответа нет, делить не на что. Возьмите d Коэна или мкВ.")
+            return ("В таблицах проб этих записей нет отмеченной лучшей пробы\n"
+                    "(d Коэна не определён ни в одной пробе).")
+        total, with_table, unreadable = G.jendrassik_sources(self._active_runs())
+        if with_table == 0:
+            return (f"Ни в одной из отмеченных записей ({total}) нет таблицы проб "
+                    "Excel/jendrassik_trials.csv.\nЕё пишут только прогоны сценария "
+                    "«приём Ендрассика».")
+        if unreadable:
+            return (f"Таблица проб есть у {with_table} записей из {total}, но прочитать "
+                    f"её не удалось ({unreadable} шт.).\nТак выглядит папка Google Drive, "
+                    "которая ещё не отдала файл: откройте его один раз в Finder "
+                    "или пометьте «Доступно офлайн», затем «Очистить» и добавьте папку заново.")
+        return (f"Таблица проб есть у {with_table} записей из {total}, но на момент "
+                "чтения её не было.\nВкладка читает записи один раз при добавлении: "
+                "после перезапуска обработки нажмите «Очистить» и добавьте папку заново.")
 
     def _draw_curves(self, view, groups, colors, channels) -> None:
         align = self.align_box.currentData()
@@ -695,6 +862,8 @@ class GroupViewer(GroupTab):
             d_all = d_all[d_all[col] > 0]
         pvals = self._p_values(d_all, "pair", col)
         ylabel = {"ai": "(R − L) / (R + L)", "ratio": "R / L", "diff": "R − L, мс"}[mode]
+        shade_of = self._shades_by_subject(d_all, groups, colors)
+        hover = []
         axes = view.panels(len(pairs), legend_entries=len(groups), bottom_extra=label_space(groups))
         for i, (ax, (left, right)) in enumerate(zip(axes, pairs)):
             name = A.pair_name(left, right)
@@ -707,7 +876,10 @@ class GroupViewer(GroupTab):
             labels = []
             for k, g in enumerate(present):
                 dg = d[d["state"] == g]
-                dots_and_box(ax, k, dg[col].to_numpy(float), colors[g], seed=k + 11 * i)
+                hover += [(ax, *dot) for dot in dots_and_box(
+                    ax, k, dg[col].to_numpy(float), colors[g], seed=k + 11 * i,
+                    colors=self._dot_colors(shade_of, g, dg["subject"]),
+                    labels=self._dot_labels(dg))]
                 labels.append((g, len(dg)))
             ax.axhline(1.0 if mode == "ratio" else 0.0, color="0.5", lw=0.9, ls="--", zorder=0)
             if mode == "ai":
@@ -719,7 +891,9 @@ class GroupViewer(GroupTab):
         top_legend(view.figure, [(g, colors[g], "dot") for g in groups])
         hint = {"ai": "0 — симметрично, +1 — ответ только справа, −1 — только слева",
                 "ratio": "1 — симметрично", "diff": "0 — одинаковая латентность"}[mode]
-        legend_note(view.figure, f"точка — запись (последние {G.LAST_N} кривых) · {hint} · "
+        view.set_hover(hover)
+        legend_note(view.figure, f"точка — запись (последние {G.LAST_N} кривых) · оттенок — "
+                             f"субъект · {hint} · наведите на точку, чтобы увидеть запись · "
                              f"{A.SIDES_NOTE_RU}")
 
     # ------------------------------------------------------------------ #
@@ -738,6 +912,13 @@ class GroupViewer(GroupTab):
             units = [A.pair_name(l, r) for l, r in A.PAIRS
                      if (l in channels or r in channels) and A.pair_name(l, r) in set(frame["pair"])]
             return frame[frame["pair"].isin(units)], "pair", "пара каналов", col, units
+        if key == "jendrassik":
+            frame = G.jendrassik_by_recording(self.jm, self.jm_metric_box.currentData())
+            if frame.empty:
+                return pd.DataFrame(), "channel", "канал", "value", []
+            frame = frame[frame["state"].isin(groups) & frame["channel"].isin(channels)]
+            return (frame, "channel", "канал", "value",
+                    [c for c in channels if (frame["channel"] == c).any()])
         frame = self.plateau[self.plateau["state"].isin(groups) & self.plateau["channel"].isin(channels)]
         units = list(channels)
         if not self.hm.empty:
@@ -771,8 +952,10 @@ class GroupViewer(GroupTab):
         save(self.values, "neurosoft_group_points_long.csv")
         save(self.plateau, "neurosoft_group_plateau_by_recording.csv")
         save(self.plateau_curves, "neurosoft_group_plateau_curves.csv")
+        save(self.jm, "neurosoft_group_jendrassik_trials.csv")
         pair = self.picker.pair()
-        for key, stem in (("plateau", "plateau"), ("asym", "asymmetry")):
+        for key, stem in (("plateau", "plateau"), ("asym", "asymmetry"),
+                          ("jendrassik", "jendrassik")):
             frame, unit_col, _, value, units = self._stat_frame(key)
             if frame.empty:
                 continue
