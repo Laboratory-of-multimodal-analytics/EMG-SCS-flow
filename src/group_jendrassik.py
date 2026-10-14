@@ -28,6 +28,17 @@ matches the per-recording table the pipeline wrote, and "where the manoeuvre act
 stays a property of the recording instead of moving every time the metric combo is
 switched.
 
+There are two ways to a group table of trials, and the repository has both.
+``group.collect_jendrassik_trials`` READS the ``jendrassik_trials.csv`` each finished
+recording carries, which cannot disagree with that recording's own table by
+construction. This module RECOMPUTES the trials from the per-curve metrics the group
+tab has already read, which costs nothing extra, works on a recording processed
+before the trials existed (and on an H-reflex run made with the manoeuvre, whose
+scenario folder keeps no such table), and lets the tab offer a metric the saved table
+does not carry. Checked against the saved tables of 16 recordings: 76 channels, every
+number and every marked trial identical. The reader stays for whoever wants the file
+itself.
+
 Knows nothing about Qt or matplotlib: points in, tables out.
 """
 

@@ -27,6 +27,12 @@ Three views:
   and the two answer different questions: "does the manoeuvre do anything on
   average" against "how large is it where it works".
 
+This tab replaced the "Приём Ендрассика" view of Group: Neurosoft (i-upri, PR #8),
+which asked the same question of the best trials alone; everything that view did is
+here, and what it brought with it — dots shaded by subject, the tooltip naming the
+recording, zero kept inside the panel, the response area as a measure — is used by
+both tabs from group_common now.
+
 The analysis is in src/group_jendrassik.py, src/group_stats.py and src/group.py; this
 file only draws.
 """
@@ -48,10 +54,10 @@ import src.group_jendrassik as JM
 import src.group_stats as ST
 from src.constants import TEXT_CURVES_RESP_TMIN
 
-from .group_common import (GroupTab, begin_fill, comparison_display, dots_and_box, empty_panel,
-                           end_fill, group_ticks, groups_display, label_space, legend_note,
-                           member_table, plural, records, short_name, style_axes, subjects,
-                           top_legend)
+from .group_common import (GroupTab, begin_fill, comparison_display, dot_colors, dot_labels,
+                           dots_and_box, empty_panel, end_fill, group_ticks, groups_display,
+                           label_space, legend_note, member_table, plural, records,
+                           shades_by_subject, short_name, style_axes, subjects, top_legend)
 from .group_viewer import METRIC_LABELS
 
 VIEWS = [
@@ -474,6 +480,11 @@ class GroupJendrassikViewer(GroupTab):
         pvals = self._p_values(d_all, value, channels)
         ranges_of = self._trial_ranges(value) if spread else None
         clip = self.clip_box.isChecked()
+        # One tone per subject, over every subject of the group and not only the ones
+        # with a response on the channel drawn, so a person keeps their tone from
+        # panel to panel; the tooltip gives the recording a dot came from.
+        shade_of = shades_by_subject(d_all, groups, colors)
+        hover = []
         axes = view.panels(len(channels), legend_entries=len(groups) + bool(spread),
                            bottom_extra=label_space(groups))
         for i, (ax, ch) in enumerate(zip(axes, channels)):
@@ -487,20 +498,34 @@ class GroupJendrassikViewer(GroupTab):
                 dg = d[d["state"] == g]
                 ranges = ([ranges_of.get((r.run, r.channel), (np.nan, np.nan))
                            for r in dg.itertuples()] if ranges_of is not None else None)
-                dots_and_box(ax, k, dg[value].to_numpy(float), colors[g], seed=k + 7 * i,
-                             ranges=ranges)
+                hover += [(ax, *point) for point in dots_and_box(
+                    ax, k, dg[value].to_numpy(float), colors[g], seed=k + 7 * i,
+                    ranges=ranges, colors=dot_colors(shade_of, g, dg["subject"]),
+                    labels=dot_labels(dg))]
                 labels.append((g, len(dg)))
-            ax.axhline(0, color="0.45", lw=1.0, ls="--", zorder=0)
+            # Above the quartile box, which would wash it out, and below the dots.
+            ax.axhline(0, color="0.35", lw=1.0, ls=(0, (5, 3)), zorder=1.5)
             group_ticks(ax, labels)
             style_axes(ax, self._title(ch, pvals.get(ch)), ylabel=ylabel)
             if clip:
                 self._clip_outliers(ax, d[value].to_numpy(float))
+            # Zero stays INSIDE the panel: autoscale puts it on the frame exactly when
+            # every recording fell on one side of it — the case the line is there for.
+            lo, hi = ax.get_ylim()
+            span = (hi - lo) or 1.0
+            ax.set_ylim(min(lo, -0.12 * span) if lo >= 0 else lo,
+                        max(hi, 0.12 * span) if hi <= 0 else hi)
         entries = [(g, colors[g], "dot") for g in groups]
         if spread:
             entries.append(("разброс остальных проб записи", "0.45", "faint"))
         top_legend(view.figure, entries)
-        legend_note(view.figure, f"точка — {dot} · черта — медиана группы · рамка — квартили · "
-                                 "пунктир на нуле — приём ничего не изменил")
+        view.set_hover(hover)
+        note = (f"точка — {dot} · оттенок — субъект · черта — медиана группы · "
+                "рамка — квартили · пунктир на нуле — приём ничего не изменил · "
+                "наведите на точку, чтобы увидеть запись")
+        if self.effect_box.currentData() == "delta_pct":
+            note += " · процент не определён там, где в покое ответа нет"
+        legend_note(view.figure, note)
 
     def _draw_effect(self, view, groups, colors, channels) -> None:
         self._draw_dots(view, groups, colors, channels, self.trials,

@@ -129,7 +129,16 @@ flip that constant to drop those curves instead.
 
 The **best trial** of each channel is the one with the largest |d| (ties go to the larger
 relative gain, then to the earlier trial). It is the single row per recording and channel that
-the group analysis is meant to compare across cohorts.
+the group analysis compares across cohorts, in the **Приём Ендрассика** view of the
+`Group: Neurosoft` tab: one panel per channel, one dot per recording, read as the gain in % or
+in µV, or as *d*, with a dashed baseline at zero because the manoeuvre suppresses a response as
+often as it enhances one. The view never recomputes a trial — it collects the
+`jendrassik_trials.csv` of every selected recording (`collect_jendrassik_trials` in
+`src/group.py`), so the group plot and a recording's own table report the same numbers, and a
+recording weighs once however many trials it ran. Groups, the compared pair and the channel
+filter are the tab's usual ones. Ticking «разброс по всем пробам записи» adds a thin line behind
+each dot spanning that recording's other trials; the dot, and the statistics, stay on the best
+one.
 
 Counting an undetected curve as zero has one consequence that has to be undone: five
 undetected curves give a pentad an SD of exactly **0**, the pooled SD collapses, and |d| runs
@@ -152,6 +161,20 @@ its normal approximation and that floor stops applying.
 manoeuvre curves with their means ± SD, the best trial starred — and `trials_profile.png`,
 where rest and manoeuvre are plotted trial by trial with a line joining each pair, so the trial
 with the largest effect is read off at a glance. `Excel/jendrassik_trials.csv` is the table.
+
+**Each trial is measured twice** — on the peak-to-peak span and on the **response area**
+(`src/area.py`), asked for by A. Militskova for polyphasic responses. The span reads only the two
+largest phases, so a response that breaks into several smaller deflections measures the same as a
+clean biphasic one of the same span, and the manoeuvre can reshape a response without changing it.
+Both sit in one row: the area columns carry the prefix `Area` and the unit `uV·ms`
+(`Area rest mean uV·ms`, `Area delta %`, `Area Cohen d`, …; `AREA_COLUMNS` in
+`src/jendrassik_trials.py`). Two things do **not** carry over to the area. The SD floor: 30 µV is
+the detection threshold of an *amplitude* and means nothing in µV·ms — roughly a third of the area
+of a threshold-level response — so a floor of 30 there would look like a protection and never bind;
+the area is compared with the floor off, which is why it has one `Area Cohen d` and no `raw`
+counterpart. And the **star**: `Best` is chosen on the span in both cases, so the table and the GUI
+mark the same trial, and a recording still contributes one row per channel to the group base. A run
+made before the area existed simply has no `Area …` columns, and its table stays as it was.
 
 The earlier reading — contiguous blocks found from the data, with a verdict per channel from
 the within-block spread (`src/curve_blocks.py`) — still runs and still writes its own tables

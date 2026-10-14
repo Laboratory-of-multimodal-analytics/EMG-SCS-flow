@@ -383,14 +383,21 @@ TRIAL_COLORS = {"rest": "#4575b4", "act": "#d73027"}
 
 
 def _trials_by_channel(tidy: pd.DataFrame, responders: list[str],
-                       metric: str = "Amplitude uV") -> tuple[dict, dict]:
-    """``({channel: [trials]}, {channel: curve numbers})`` for one recording.
+                       metric: str = "Amplitude uV", also: str | None = None,
+                       also_floor: float = 0.0) -> tuple[dict, dict, dict]:
+    """``({channel: [trials]}, {channel: curve numbers}, {channel: [trials on *also*]})``.
 
     A channel with gaps in its curve numbering is skipped whole: the run is cut by
     position, and one missing curve would shift the phase — rest would be read as
     manoeuvre. Better to leave a channel uncounted than to count it inverted.
+
+    ``also`` measures the very same trials on a second metric (the response area),
+    in this one pass rather than a second one, so the two can never end up on
+    different channels or on differently cut pentads. ``also_floor`` is that
+    metric's SD floor in ITS OWN units: ``JT.SD_FLOOR_UV`` is 30 µV, an amplitude,
+    and says nothing in µV·ms, so the area passes 0 (see ``JT.AREA_COLUMNS``).
     """
-    trials_of, curves_of = {}, {}
+    trials_of, curves_of, also_of = {}, {}, {}
     for ch in responders:
         d = tidy[tidy["Channel"] == ch].sort_values("Curve")
         curves = d["Curve"].to_numpy(int)
@@ -404,7 +411,14 @@ def _trials_by_channel(tidy: pd.DataFrame, responders: list[str],
         if ts:
             trials_of[ch] = ts
             curves_of[ch] = curves
-    return trials_of, curves_of
+            # A run made before the area existed has no such column, and its table
+            # stays exactly as it was.
+            if also and also in d.columns:
+                extra = JT.channel_trials(curves, d[also].to_numpy(float),
+                                          sd_floor=also_floor)
+                if extra:
+                    also_of[ch] = extra
+    return trials_of, curves_of, also_of
 
 
 def run_jendrassik_trials(output_root: Path, metric: str = "Amplitude uV") -> Path | None:
@@ -414,6 +428,12 @@ def run_jendrassik_trials(output_root: Path, metric: str = "Amplitude uV") -> Pa
     each pair compared (means, SDs, the gain, Cohen's d, Welch and Mann-Whitney), and
     within each channel the trial with the largest |d| is marked — the one row that
     goes on to the group base. See ``src/jendrassik_trials.py``.
+
+    Every trial is compared twice: on *metric* (the peak-to-peak span) and on the
+    response area, which counts the phases the span misses — A. Militskova asks for
+    both, and a polyphasic response is exactly where they disagree. The marked trial
+    is chosen on the SPAN in either case, so the table's star and the one the GUI
+    highlights are the same trial.
 
     Writes ``jendrassik_trials.csv``, one figure per trial under ``Jendrassik/Trials/``
     (five rest curves and five manoeuvre curves with their means) and the summary
@@ -431,20 +451,33 @@ def run_jendrassik_trials(output_root: Path, metric: str = "Amplitude uV") -> Pa
         print("[JENDRASSIK] No responding channels; skipping trials.", flush=True)
         return None
 
-    trials_of, _curves_of = _trials_by_channel(tidy, responders, metric)
+    trials_of, _curves_of, area_of = _trials_by_channel(tidy, responders, metric,
+                                                        also="Area uV·ms")
     if not trials_of:
         print("[JENDRASSIK] No complete pair of pentads; no trials computed.", flush=True)
         return None
 
     recording = output_root.name
-    rows = [{"Recording": recording, "Channel": ch,
-             **{k: v for k, v in t.items() if not k.startswith("_")}}
-            for ch in trials_of for t in trials_of[ch]]
+    rows = []
+    for ch in trials_of:
+        # Both metrics were cut from the same rows in the same pass, so a trial
+        # number identifies the same ten curves in either of them.
+        area_of_trial = {t["Trial"]: t for t in area_of.get(ch, [])}
+        for t in trials_of[ch]:
+            row = {"Recording": recording, "Channel": ch,
+                   **{k: v for k, v in t.items() if not k.startswith("_")}}
+            area = area_of_trial.get(t["Trial"])
+            if area is not None:
+                row.update({area_col: area[span_col]
+                            for span_col, area_col in JT.AREA_COLUMNS.items()})
+            rows.append(row)
     trials = JT.mark_best(pd.DataFrame(rows))
     # p values are NOT rounded: round(3) would turn 4e-08 into 0.0
     for c in ["Rest mean uV", "Rest SD uV", "Act mean uV", "Act SD uV",
-              "Delta uV", "Delta %", "Cohen d", "Cohen d raw", "|d|", "|Delta %|"]:
-        trials[c] = trials[c].round(3)
+              "Delta uV", "Delta %", "Cohen d", "Cohen d raw", "|d|", "|Delta %|",
+              *JT.AREA_ROUNDED]:
+        if c in trials.columns:
+            trials[c] = trials[c].round(3)
 
     out_dir = ensure_dir(_sir_dir(output_root) / "Jendrassik")
     excel_dir = ensure_dir(shared_excel_dir(output_root))
@@ -472,9 +505,12 @@ def run_jendrassik_trials(output_root: Path, metric: str = "Amplitude uV") -> Pa
         print("[JENDRASSIK] No saved epochs — per-trial figures skipped.", flush=True)
 
     n_best = int((trials["Best"] != "").sum())
+    area_note = (f"area on {len(area_of)} channels" if area_of
+                 else "no response area in this run")
     print(f"[JENDRASSIK] trials: {trials['Channel'].nunique()} channels, "
-          f"{len(trials)} trials, best marked on {n_best}; {n_png} figures "
-          f"-> {out_dir}; table -> {excel_dir / JENDRASSIK_TRIALS_CSV}", flush=True)
+          f"{len(trials)} trials, best marked on {n_best}; {area_note}; "
+          f"{n_png} figures -> {out_dir}; "
+          f"table -> {excel_dir / JENDRASSIK_TRIALS_CSV}", flush=True)
     return out_dir
 
 

@@ -3,7 +3,7 @@
 A group is a set of processed Neurosoft exports sharing a label read off the recording
 names — cohort, stimulation level, side, … ("Группировать по"); the label can be edited
 by hand in the list. The tab compares two groups, A in blue and B in red, or shows all
-of them, channel by channel, in four views:
+of them, channel by channel, in five views:
 
 * Плато — A. Militskova's summary of a recording: the mean response of its last five
   curves, the end of the ramp. One dot per recording, a thin line for the range of its
@@ -16,6 +16,11 @@ of them, channel by channel, in four views:
   recording, and each group's mean with a 95 % confidence band.
 * Асимметрия — the left/right index of the channel pairs on the same five curves
   (src/asymmetry.py; the sides are provisional).
+* Приём Ендрассика — the effect of the manoeuvre, for the recordings of that
+  protocol: one dot per recording (its best trial of five rest curves against five
+  with the manoeuvre), read as a gain in %, in µV or as Cohen's d. A baseline at
+  zero, because the manoeuvre suppresses a response as often as it enhances one.
+  The trials are read from each recording's own table, never recomputed.
 
 Recordings are read once, in the background, when a folder is added. Grouping, the
 compared groups, metric, normalisation and channels all work on what is in memory;
@@ -40,9 +45,10 @@ import src.group as G
 import src.group_stats as ST
 from src.constants import TEXT_CURVES_RESP_TMIN
 
-from .group_common import (plural, records, subjects, GroupTab, begin_fill, comparison_display, dots_and_box, empty_panel,
-                           end_fill, group_ticks, groups_display, label_space, legend_note, median_band,
-                           member_table, style_axes, top_legend)
+from .group_common import (GroupTab, begin_fill, comparison_display, dot_colors, dot_labels,
+                           dots_and_box, empty_panel, end_fill, group_ticks, groups_display,
+                           label_space, legend_note, median_band, member_table, plural, records,
+                           shades_by_subject, style_axes, subjects, top_legend)
 
 #: The metrics offered, in this order, with the units they are read in.
 METRIC_LABELS = {
@@ -73,7 +79,7 @@ VIEWS = [
 
 
 class _PointReader(QThread):
-    """Reads the recordings' metrics (and which channels they recorded) off disk."""
+    """Reads the recordings' metrics and which channels they recorded off disk."""
     done = Signal(object, object, object)
 
     def __init__(self, runs) -> None:
@@ -525,6 +531,8 @@ class GroupViewer(GroupTab):
         pvals = self._p_values(p, "channel", "mean")
         unit = self._unit()
         latency = self.metric_box.currentData().endswith("_ms")
+        shade_of = shades_by_subject(p, groups, colors)
+        hover = []
         axes = view.panels(len(channels), legend_entries=len(groups) + self.show_five.isChecked(),
                            bottom_extra=label_space(groups))
         for i, (ax, ch) in enumerate(zip(axes, channels)):
@@ -537,8 +545,10 @@ class GroupViewer(GroupTab):
             for k, g in enumerate(present):
                 dg = d[d["state"] == g]
                 ranges = list(zip(dg["min"], dg["max"])) if self.show_five.isChecked() else None
-                dots_and_box(ax, k, dg["mean"].to_numpy(float), colors[g], seed=k + 7 * i,
-                             ranges=ranges)
+                hover += [(ax, *dot) for dot in dots_and_box(
+                    ax, k, dg["mean"].to_numpy(float), colors[g], seed=k + 7 * i,
+                    ranges=ranges, colors=dot_colors(shade_of, g, dg["subject"]),
+                    labels=dot_labels(dg))]
                 labels.append((g, len(dg)))
             group_ticks(ax, labels)
             style_axes(ax, self._title(ch, pvals.get(ch)), ylabel=unit)
@@ -548,8 +558,10 @@ class GroupViewer(GroupTab):
         if self.show_five.isChecked():
             entries.append((f"разброс {G.LAST_N} кривых записи", "0.45", "faint"))
         top_legend(view.figure, entries)
-        legend_note(view.figure, f"точка — запись (среднее последних {G.LAST_N} кривых) · черта — "
-                             "медиана группы · рамка — квартили")
+        legend_note(view.figure, f"точка — запись (среднее последних {G.LAST_N} кривых) · "
+                             "оттенок — субъект · черта — медиана группы · рамка — квартили · "
+                             "наведите на точку, чтобы увидеть запись")
+        view.set_hover(hover)
 
     def _draw_curves(self, view, groups, colors, channels) -> None:
         align = self.align_box.currentData()
@@ -695,6 +707,8 @@ class GroupViewer(GroupTab):
             d_all = d_all[d_all[col] > 0]
         pvals = self._p_values(d_all, "pair", col)
         ylabel = {"ai": "(R − L) / (R + L)", "ratio": "R / L", "diff": "R − L, мс"}[mode]
+        shade_of = shades_by_subject(d_all, groups, colors)
+        hover = []
         axes = view.panels(len(pairs), legend_entries=len(groups), bottom_extra=label_space(groups))
         for i, (ax, (left, right)) in enumerate(zip(axes, pairs)):
             name = A.pair_name(left, right)
@@ -707,7 +721,10 @@ class GroupViewer(GroupTab):
             labels = []
             for k, g in enumerate(present):
                 dg = d[d["state"] == g]
-                dots_and_box(ax, k, dg[col].to_numpy(float), colors[g], seed=k + 11 * i)
+                hover += [(ax, *dot) for dot in dots_and_box(
+                    ax, k, dg[col].to_numpy(float), colors[g], seed=k + 11 * i,
+                    colors=dot_colors(shade_of, g, dg["subject"]),
+                    labels=dot_labels(dg))]
                 labels.append((g, len(dg)))
             ax.axhline(1.0 if mode == "ratio" else 0.0, color="0.5", lw=0.9, ls="--", zorder=0)
             if mode == "ai":
@@ -719,7 +736,9 @@ class GroupViewer(GroupTab):
         top_legend(view.figure, [(g, colors[g], "dot") for g in groups])
         hint = {"ai": "0 — симметрично, +1 — ответ только справа, −1 — только слева",
                 "ratio": "1 — симметрично", "diff": "0 — одинаковая латентность"}[mode]
-        legend_note(view.figure, f"точка — запись (последние {G.LAST_N} кривых) · {hint} · "
+        view.set_hover(hover)
+        legend_note(view.figure, f"точка — запись (последние {G.LAST_N} кривых) · оттенок — "
+                             f"субъект · {hint} · наведите на точку, чтобы увидеть запись · "
                              f"{A.SIDES_NOTE_RU}")
 
     # ------------------------------------------------------------------ #
