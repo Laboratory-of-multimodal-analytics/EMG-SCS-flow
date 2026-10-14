@@ -162,13 +162,19 @@ def compare_pair(rest, act, missing_is_zero: bool | None = None,
     }
 
 
-def channel_trials(curves, values, missing_is_zero: bool | None = None) -> list[dict]:
+def channel_trials(curves, values, missing_is_zero: bool | None = None,
+                   sd_floor: float = SD_FLOOR_UV) -> list[dict]:
     """Every trial of one channel: a dict per trial, in run order.
 
     ``curves`` holds the curve numbers in run order, ``values`` the measured
     quantity at the same places (NaN where no response was found). The
     ``_rest``/``_act`` keys carry the pentads' positions (``range`` objects) for
     whoever draws the curves; they do not go into the table — hence the underscore.
+
+    ``sd_floor`` is the detection threshold of whatever ``values`` holds, so a
+    quantity that is not an amplitude in µV has to say so: the group tab reads
+    latencies and areas through here too, and 30 µV means nothing to them (see
+    ``src/group_jendrassik.py``). Pass 0 to switch the floor off.
 
     One entry point for both the pipeline and the GUI: the trials on screen and the
     trials in the saved table have to be the same trials.
@@ -185,7 +191,7 @@ def channel_trials(curves, values, missing_is_zero: bool | None = None) -> list[
             "Rest curves": curve_span(curves[rest.start:rest.stop]),
             "Act curves": curve_span(curves[act.start:act.stop]),
             **compare_pair(values[rest.start:rest.stop],
-                           values[act.start:act.stop], missing_is_zero),
+                           values[act.start:act.stop], missing_is_zero, sd_floor),
         })
     return out
 

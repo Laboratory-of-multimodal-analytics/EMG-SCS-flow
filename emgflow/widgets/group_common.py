@@ -617,8 +617,16 @@ class StatsTable(QTableWidget):
 
 
 def comparison_display(table: pd.DataFrame, unit_col: str, unit_label: str,
-                       a: str, b: str) -> tuple[pd.DataFrame, list[bool]]:
-    """The comparison table as it is read on screen; bold where p < 0.05."""
+                       a: str, b: str, unit_word: str = "записей",
+                       extra: dict[str, dict] | None = None) -> tuple[pd.DataFrame, list[bool]]:
+    """The comparison table as it is read on screen; bold where p < 0.05.
+
+    ``unit_word`` names what ``n_a`` counts: recordings everywhere except the
+    Jendrassik tab, where a group's dots are trials. ``extra`` adds columns after the
+    p value, as ``{column: {unit: value}}`` — the Jendrassik tab puts each group's
+    "the effect differs from zero" p there, because A against B does not answer
+    whether the manoeuvre worked at all.
+    """
     if table is None or table.empty:
         return pd.DataFrame(), []
     if short_name(a, 24) != short_name(b, 24):
@@ -627,27 +635,35 @@ def comparison_display(table: pd.DataFrame, unit_col: str, unit_label: str,
     for _, r in table.iterrows():
         rows.append({
             unit_label: r[unit_col],
-            f"{a}: записей (субъектов)": f"{r['n_a']} ({r['subjects_a']})",
+            f"{a}: {unit_word} (субъектов)": f"{r['n_a']} ({r['subjects_a']})",
             f"{a}: медиана [Q1–Q3]": _mq(r["median_a"], r["q1_a"], r["q3_a"]),
-            f"{b}: записей (субъектов)": f"{r['n_b']} ({r['subjects_b']})",
+            f"{b}: {unit_word} (субъектов)": f"{r['n_b']} ({r['subjects_b']})",
             f"{b}: медиана [Q1–Q3]": _mq(r["median_b"], r["q1_b"], r["q3_b"]),
             "разница медиан (B − A)": ST.format_number(r["delta"]),
             "B / A": ST.format_number(r["ratio"]),
             "p": ST.format_p(r["p"]),
+            **{name: values.get(r[unit_col], "") for name, values in (extra or {}).items()},
             "тест": r["test"],
         })
     bold = [bool(np.isfinite(p) and p < 0.05) for p in table["p"]]
     return pd.DataFrame(rows), bold
 
 
-def groups_display(table: pd.DataFrame, unit_col: str, unit_label: str) -> pd.DataFrame:
+def groups_display(table: pd.DataFrame, unit_col: str, unit_label: str,
+                   unit_word: str = "записей", columns: dict[str, str] | None = None) -> pd.DataFrame:
+    """One row per unit and group. ``columns`` adds ``{heading: column of table}``."""
     if table is None or table.empty:
         return pd.DataFrame()
-    return pd.DataFrame([{
-        unit_label: r[unit_col], "группа": short_name(r["group"], 40),
-        "записей (субъектов)": f"{r['n']} ({r['subjects']})",
-        "медиана [Q1–Q3]": _mq(r["median"], r["q1"], r["q3"]),
-    } for _, r in table.iterrows()])
+    rows = []
+    for _, r in table.iterrows():
+        row = {unit_label: r[unit_col], "группа": short_name(r["group"], 40),
+               f"{unit_word} (субъектов)": f"{r['n']} ({r['subjects']})",
+               "медиана [Q1–Q3]": _mq(r["median"], r["q1"], r["q3"])}
+        for heading, col in (columns or {}).items():
+            value = r.get(col, "")
+            row[heading] = ST.format_p(value) if col.startswith("p") else value
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _mq(med, q1, q3) -> str:

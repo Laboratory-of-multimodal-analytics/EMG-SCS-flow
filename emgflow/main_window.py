@@ -27,6 +27,7 @@ from .widgets.spontaneous_viewer import SpontaneousViewer
 from .widgets.startstop_viewer import StartStopViewer
 from .widgets.condition_viewer import ConditionViewer
 from .widgets.group_viewer import GroupViewer
+from .widgets.group_jm_viewer import GroupJendrassikViewer
 from .widgets.group_sir_viewer import GroupSIRViewer
 from .widgets.group_spont_viewer import GroupSpontViewer
 from .widgets.scenario_viewer import ScenarioViewer
@@ -43,7 +44,7 @@ SCENARIO_CHOICES = [("Auto-detect", None), ("Recruitment", "recruitment"),
 _SCENARIO_INDEX = {c[1]: i for i, c in enumerate(SCENARIO_CHOICES)}
 # tab indices (kept in one place so the sync logic below stays readable)
 TAB_SETTINGS, TAB_SIR, TAB_RECRUIT, TAB_STARTSTOP, TAB_SPONT, TAB_COND, TAB_RAW, \
-    TAB_GROUP, TAB_GROUP_SIR, TAB_GROUP_SPONT = range(10)
+    TAB_GROUP, TAB_GROUP_JM, TAB_GROUP_SIR, TAB_GROUP_SPONT = range(11)
 
 
 class MainWindow(QMainWindow):
@@ -121,6 +122,7 @@ class MainWindow(QMainWindow):
         self.sir_viewer.rerun_requested.connect(self.run)
         self.recruitment_viewer = ScenarioViewer(self.session)
         self.group_viewer = GroupViewer(self.session)
+        self.group_jm_viewer = GroupJendrassikViewer(self.session)
         self.group_sir_viewer = GroupSIRViewer(self.session)
         self.group_spont_viewer = GroupSpontViewer(self.session)
         self.startstop_viewer = StartStopViewer(self.session)
@@ -146,6 +148,9 @@ class MainWindow(QMainWindow):
         # enabled whatever mode the current recording is in, and survives
         # opening another one.
         self.tabs.addTab(self.group_viewer, "Group: Neurosoft")        # TAB_GROUP
+        # The manoeuvre is its own tab: its value is a within-recording difference,
+        # not a level, so none of the Neurosoft views answer anything about it.
+        self.tabs.addTab(self.group_jm_viewer, "Group: Jendrassik")    # TAB_GROUP_JM
         self.tabs.addTab(self.group_sir_viewer, "Group: stimulation (SIR)")  # TAB_GROUP_SIR
         self.tabs.addTab(self.group_spont_viewer, "Group: spontaneous")  # TAB_GROUP_SPONT
         self.tabs.currentChanged.connect(self._on_tab_changed)

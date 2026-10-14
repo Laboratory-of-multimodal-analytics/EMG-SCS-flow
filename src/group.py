@@ -514,6 +514,22 @@ def scenario_of(run_root: Path) -> str | None:
     return None
 
 
+def scenario_in_name(run_root) -> str | None:
+    """The protocol the recording's NAME claims, whatever folder the pipeline wrote.
+
+    ``scenario_of`` reads the deliverable folder and is right almost always, but an
+    H-reflex recording made WITH the manoeuvre is filed under H-reflex while being a
+    Jendrassik run as well. The name is the only place that says so, and the
+    Jendrassik pattern is tried first, so "JM" wins over "H-reflex" when both are in
+    the name.
+    """
+    name = Path(run_root).name
+    for key, rx in _SCENARIO_WORDS.items():
+        if rx.search(name):
+            return key
+    return None
+
+
 def parse_neurosoft(run_root: Path) -> dict[str, str]:
     """Tags of one Neurosoft run: subject, cohort, level, scenario, side, muscle, position, polarity.
 
@@ -684,6 +700,27 @@ def plateau_waveforms(run_root, n: int = LAST_N) -> tuple[np.ndarray | None, dic
         return None, {}
     return (np.asarray(times, dtype=float),
             {ch: np.asarray(w[-n:], dtype=float).mean(axis=0) for ch, w in waves.items() if len(w)})
+
+
+def curve_waveforms(run_root) -> tuple[np.ndarray | None, dict[str, np.ndarray]]:
+    """Every curve of a run on every channel (µV), and the shared time axis.
+
+    ``plateau_waveforms`` collapses a recording into one wave per channel. The
+    Jendrassik tab cannot: its two conditions are two pentads of curves INSIDE one
+    recording, so it needs the curves themselves. Row *i* is curve *i + 1* — the
+    numbering ``SIRResults.recruitment_by_curve`` gives the metrics — so a trial's
+    curve numbers index this array directly.
+    """
+    from emgflow.results import SIRResults
+
+    res = SIRResults(Path(run_root))
+    if not res.ok or not res.configs:
+        return None, {}
+    times, waves, _ = res.scenario_waves(res.configs[0])
+    if times is None or not waves:
+        return None, {}
+    return (np.asarray(times, dtype=float),
+            {ch: np.asarray(w, dtype=float) for ch, w in waves.items() if len(w)})
 
 
 def waveform_bands(loaded: list[tuple[str, str, np.ndarray, np.ndarray]], n_times: int = 500,

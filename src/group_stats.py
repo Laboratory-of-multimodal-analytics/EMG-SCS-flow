@@ -133,6 +133,73 @@ def describe_groups(frame: pd.DataFrame, unit_col: str, value: str, group_col: s
     return pd.DataFrame(rows)
 
 
+def compare_with_zero(values, subject_col_values=None) -> dict:
+    """Is a set of within-recording effects different from zero? (median, p, the test)
+
+    The companion of ``compare_two`` for a quantity that is ALREADY a contrast: a
+    Jendrassik trial is the manoeuvre against rest on the same channel of the same
+    recording, so the first question is not "do the groups differ" but "does the
+    manoeuvre do anything in this group". That is the one-sample question, and its
+    unit is the subject for the same reason as everywhere else.
+
+    The smallest p the signed-rank test can reach with *n* subjects is 2 / 2**n
+    (every subject on the same side, the most extreme ranks possible). At five
+    subjects that is 0.0625, so the test CANNOT return a significant p however large
+    the effect — the floor goes into the test text rather than being left for the
+    reader to rediscover.
+    """
+    v = pd.Series(values, dtype=float)
+    if subject_col_values is not None:
+        v = v.groupby(pd.Series(list(subject_col_values), index=v.index)).mean()
+    v = v[np.isfinite(v)]
+    n = int(v.size)
+    q1, med, q3 = _quartiles(v)
+    p, floor = np.nan, 2.0 / 2 ** n if n else np.nan
+    try:
+        from scipy.stats import wilcoxon
+    except Exception:                                  # noqa: BLE001 - reported, not raised
+        wilcoxon = None
+    if n >= MIN_PAIRS and wilcoxon is not None and float(v.abs().sum()) > 0:
+        try:
+            p = float(wilcoxon(v).pvalue)
+        except ValueError:                             # every value is exactly zero
+            p = np.nan
+        test = f"Уилкоксон против 0: {n} субъектов"
+        if np.isfinite(floor) and floor > 0.001:
+            test += f" (минимум p = {floor:.3f})"
+    else:
+        test = f"мало данных ({n} субъектов)"
+    return {"n_subjects": n, "median_subjects": med, "q1_subjects": q1, "q3_subjects": q3,
+            "p0": p, "test0": test, "p0_floor": floor}
+
+
+def vs_zero(frame: pd.DataFrame, unit_col: str, value: str, group_col: str,
+            groups: list[str], subject_col: str = "subject",
+            units: list[str] | None = None) -> pd.DataFrame:
+    """``compare_with_zero`` for every unit and every group, plus the descriptives.
+
+    ``n`` counts the ROWS the dots are drawn from (trials, or recordings when only
+    the best trial of each is kept); ``n_subjects`` is what the test ran on.
+    """
+    d = _clean(frame, value) if not frame.empty else frame
+    if d.empty:
+        return pd.DataFrame()
+    order = units if units is not None else list(dict.fromkeys(d[unit_col]))
+    rows = []
+    for unit in order:
+        du = d[d[unit_col] == unit]
+        for g in groups:
+            dg = du[du[group_col] == g]
+            if dg.empty:
+                continue
+            q1, med, q3 = _quartiles(dg[value])
+            rows.append({unit_col: unit, "group": g, "n": int(len(dg)),
+                         "subjects": int(dg[subject_col].nunique()),
+                         "median": med, "q1": q1, "q3": q3,
+                         **compare_with_zero(dg[value], dg[subject_col])})
+    return pd.DataFrame(rows)
+
+
 def format_number(v, digits: int = 3) -> str:
     """A table cell: three significant digits, thousands without an exponent."""
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
