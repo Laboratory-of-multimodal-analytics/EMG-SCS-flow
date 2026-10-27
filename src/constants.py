@@ -33,8 +33,18 @@ CAR_REREF = False
 # Enable side-specific CAR (left/right grouping) if implemented.
 LATERAL_CAR_REREF = False
 
-# Convert MAT signal units by dividing by 1000.
+# Allow LabChart .mat signals to be rescaled to volts on load. Whether a given
+# file is actually divided is decided from its channel range (see
+# MAT_AMPLIFIER_RANGE_V); set this to False to load the stored numbers as-is.
 MAT_DIVIDE_BY_1000 = True
+# LabChart labels every channel "V" whatever the amplifier does, so the input
+# range is what tells the two kinds of export apart. A range of whole volts is
+# the amplifier's own output at a 1000x gain (1 V on file = 1 mV at the
+# electrode) and has to be divided by 1000; a range well under a volt is
+# already electrode-referred (the 17-pig PolyResponses set records at
+# +-112.5 mV) and dividing it puts every response three orders of magnitude
+# below the absolute uV detection gates, so nothing is ever detected.
+MAT_AMPLIFIER_RANGE_V = 1.0
 
 
 # ── Spontaneous EMG analysis (doctor-requested RMS / mean-amplitude envelopes) ──

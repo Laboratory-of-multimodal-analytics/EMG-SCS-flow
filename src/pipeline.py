@@ -34,6 +34,7 @@ from .constants import (
     CAR_REREF,
     LATERAL_CAR_REREF,
     MAT_DIVIDE_BY_1000,
+    MAT_AMPLIFIER_RANGE_V,
     SPONTANEOUS_EMG_ANALYSIS,
     SPONTANEOUS_EMG_WINDOW_MS,
     SPONTANEOUS_EMG_ENV_HOP_MS,
@@ -500,6 +501,8 @@ def _labchart_mat4_blocks(mat_path) -> list[tuple[str, mne.io.Raw]]:
         if not keep:
             continue
         block_2d = np.vstack([data[s - 1:s - 1 + modal] for _r, s, _e in keep])
+        # A headerless export keeps no channel range, so there is nothing to
+        # read the scale off: divide, as every such file so far has needed.
         if MAT_DIVIDE_BY_1000:
             block_2d = block_2d / 1000.0
         ch_names = [f"ch{i + 1}" for i in range(block_2d.shape[0])]
@@ -548,6 +551,27 @@ def _labchart_mat4_blocks_if_broken(mat_path):
     return _labchart_mat4_blocks(mat_path)
 
 
+def _mat_is_amplifier_volts(mat) -> bool:
+    """Whether a LabChart .mat holds raw amplifier volts that need a /1000.
+
+    Read off the channel input range, which is the only thing in the file that
+    tells the two kinds of export apart -- the unit text is "V" either way.
+    Unreadable range: assume the amplifier export, which is what every file
+    before the 17-pig set was.
+    """
+    try:
+        span = np.concatenate([np.abs(np.asarray(mat["rangemin"], dtype=float)).ravel(),
+                               np.abs(np.asarray(mat["rangemax"], dtype=float)).ravel()])
+    except Exception:
+        return True
+    span = span[np.isfinite(span) & (span > 0)]
+    if span.size == 0:
+        return True
+    # Median over channels: one channel may carry its own odd range (the stim
+    # artifact is often given a wider one) without speaking for the export.
+    return float(np.median(span)) >= MAT_AMPLIFIER_RANGE_V
+
+
 def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
     mat = loadmat(mat_path)
     # Malformed/headerless LabChart "MATLAB Level 4" exports lose everything but
@@ -588,7 +612,7 @@ def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
         channel_data.append(np.concatenate(parts, axis=0))
 
     data_2d = np.vstack(channel_data)
-    if MAT_DIVIDE_BY_1000:
+    if MAT_DIVIDE_BY_1000 and _mat_is_amplifier_volts(mat):
         data_2d = data_2d / 1000.0
     ch_types = ["eeg" for _ in titles]
     info = mne.create_info(ch_names=titles, sfreq=sfreq, ch_types=ch_types)

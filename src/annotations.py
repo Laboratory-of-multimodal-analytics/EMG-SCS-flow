@@ -10,7 +10,13 @@ from difflib import SequenceMatcher
 
 MISSING_AMP_LABEL = "unspecified"
 
-CONFIG_RE = re.compile(r"^\s*(?P<cfg>\d+(?:[+-]\d+)+[+-]?(?:-[A-Za-z]+)?)\s*$")
+# A config header may carry a trailing array/location tag naming which electrode
+# array the pair sits on: "2+5-NE", but also "2+5- NE" and "2+7- under sci",
+# where LabChart was typed with a space after the pair. The tag is matched
+# separately and glued back on, so both spellings give the same config.
+CONFIG_RE = re.compile(r"^\s*(?P<cfg>\d+(?:[+-]\d+)+[+-]?)\s*(?P<tag>[A-Za-z][A-Za-z ]*?)?\s*$")
+# A trailing word that is only a stimulation unit ("2+8 mA") names no array.
+CONFIG_TAG_UNIT_RE = re.compile(r"(?:mA|uA|ms|Hz|ma|ua|mks|us)", re.IGNORECASE)
 CONFIG_WITH_AMP_RE = re.compile(
     r"^\s*(?P<cfg>\d+(?:[+-]\d+)+[+-]?)\s+(?P<amp>[+-]?\d+(?:[.,]\d+)?)(?:\s*(?:mA|uA|ms|Hz|ma|ua))?\s*$",
     re.IGNORECASE,
@@ -58,7 +64,10 @@ def _parse_annotation(desc: str) -> tuple[str | None, str | None]:
 
     m = CONFIG_RE.match(desc)
     if m:
-        return m.group("cfg").replace(" ", ""), None
+        tag = (m.group("tag") or "").strip()
+        if CONFIG_TAG_UNIT_RE.fullmatch(tag):
+            tag = ""
+        return (m.group("cfg") + tag).replace(" ", ""), None
 
     # Mixed-order config strings: "2HZ, 450mks,0+7-", "0+3-, 450,2hhz"
     # Keep this broad enough for real-world typos while requiring both

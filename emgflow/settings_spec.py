@@ -50,8 +50,11 @@ SHARED: list[Lever] = [
           "over this window. A high-pass filter is not available at 100 ms / 20 kHz. Shorter "
           "removes slower trends but starts eating broad responses — at 10 ms the Zh14 ch4 "
           "response drops from 260 to 109 uV. Empty switches it off."),
-    Lever("MAT_DIVIDE_BY_1000", "MAT: divide by 1000", "bool", True, "Filtering", "both", "global",
-          "LabChart unit rescaling on .mat load."),
+    Lever("MAT_DIVIDE_BY_1000", "MAT: rescale to volts", "bool", True, "Filtering", "both", "global",
+          "LabChart unit rescaling on .mat load. On, each file is divided by 1000 only if its "
+          "channel range says it holds raw amplifier volts (a range of whole volts, e.g. +-10 V); "
+          "a file already recorded in the electrode's own range (e.g. +-112.5 mV) is left alone. "
+          "Off loads the stored numbers as-is."),
 
     Lever("ARTCHAN", "Artifact channel(s)", "str", "", "Artifact", "both", "global",
           "Comma-separated. Empty = auto-detect by name containing 'art'. "
