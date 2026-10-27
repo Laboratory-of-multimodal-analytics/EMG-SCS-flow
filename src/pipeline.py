@@ -35,6 +35,7 @@ from .constants import (
     LATERAL_CAR_REREF,
     MAT_DIVIDE_BY_1000,
     MAT_AMPLIFIER_RANGE_V,
+    SPECIAL_CROPS,
     SPONTANEOUS_EMG_ANALYSIS,
     SPONTANEOUS_EMG_WINDOW_MS,
     SPONTANEOUS_EMG_ENV_HOP_MS,
@@ -551,14 +552,25 @@ def _labchart_mat4_blocks_if_broken(mat_path):
     return _labchart_mat4_blocks(mat_path)
 
 
-def _mat_is_amplifier_volts(mat) -> bool:
-    """Whether a LabChart .mat holds raw amplifier volts that need a /1000.
+def _mat_needs_volt_rescale(mat) -> bool:
+    """Whether a LabChart .mat holds numbers a thousand times larger than volts.
 
-    Read off the channel input range, which is the only thing in the file that
-    tells the two kinds of export apart -- the unit text is "V" either way.
-    Unreadable range: assume the amplifier export, which is what every file
-    before the 17-pig set was.
+    A file written in millivolts says so in its unit text and simply needs the
+    unit conversion (the ФМБА patient recordings). A file written in "V" is one
+    of two things and only the channel input range tells them apart: the
+    amplifier's own output at a 1000x gain, a range of whole volts, which every
+    pig and EES file before the 17-pig set is and which needs the same
+    division; or already electrode-referred, a range well under a volt (the
+    17-pig PolyResponses set records at +-112.5 mV), which must be left alone.
+    Nothing readable to go on: assume the amplifier export, as before.
     """
+    try:
+        units = {str(u).strip().lower()
+                 for u in np.asarray(mat["unittext"], dtype=object).ravel()}
+    except Exception:
+        units = set()
+    if units and units <= {"mv"}:
+        return True
     try:
         span = np.concatenate([np.abs(np.asarray(mat["rangemin"], dtype=float)).ravel(),
                                np.abs(np.asarray(mat["rangemax"], dtype=float)).ravel()])
@@ -612,7 +624,7 @@ def _load_raw_from_mat(mat_path: Path) -> mne.io.Raw:
         channel_data.append(np.concatenate(parts, axis=0))
 
     data_2d = np.vstack(channel_data)
-    if MAT_DIVIDE_BY_1000 and _mat_is_amplifier_volts(mat):
+    if MAT_DIVIDE_BY_1000 and _mat_needs_volt_rescale(mat):
         data_2d = data_2d / 1000.0
     ch_types = ["eeg" for _ in titles]
     info = mne.create_info(ch_names=titles, sfreq=sfreq, ch_types=ch_types)
@@ -1055,18 +1067,33 @@ def _align_events_to_artifact(
 
 
 def _apply_special_crops(raw: mne.io.BaseRaw, file_name: str) -> None:
-    if file_name in ["1+2-_9.fif"]:
-        raw.crop(0, raw.times.max() - 10)
-    if file_name in ["0+1-_2.fif"]:
-        raw.crop(10, raw.times.max())
-    if file_name in ["3+4-_4.fif", "8+11-_10.fif"]:
-        raw.crop(0, 5)
-    if file_name in ["5+6-_4.fif"]:
-        raw.crop(0, 20)
-    if file_name in ["12+13-_1.fif"]:
-        raw.crop(5, raw.times.max())
-    if file_name in ["14+15-_10.fif"]:
-        raw.crop(2, 10)
+    """Trim a named crop by hand, for the recordings that need it.
+
+    Bounds come from SPECIAL_CROPS, which is empty unless a run fills it. A
+    crop file name is built from the config and amplitude labels alone, so
+    names like "5+6-_4.fif" are the shape every SCS recording produces: a list
+    left behind from one recording re-trims any other recording that happens to
+    reach the same name. An entry that does not fit the crop in hand is
+    reported and skipped rather than raising.
+    """
+    bounds = SPECIAL_CROPS.get(file_name)
+    if not bounds:
+        return
+    end = float(raw.times.max())
+    raw_tmin, raw_tmax = bounds
+    tmin = 0.0 if raw_tmin is None else float(raw_tmin)
+    if raw_tmax is None:
+        tmax = end
+    else:
+        # A negative bound counts back from the end ("all but the last 10 s").
+        tmax = end + float(raw_tmax) if raw_tmax < 0 else float(raw_tmax)
+    tmin = min(max(0.0, tmin), end)
+    tmax = min(tmax, end)
+    if tmax <= tmin:
+        print(f"[SIR] {file_name}: hand crop {bounds} does not fit {end:.2f} s, kept whole",
+              flush=True)
+        return
+    raw.crop(tmin, tmax)
 
 
 def _concat_segments(raw: mne.io.BaseRaw, segments: list[tuple[float, float]]) -> mne.io.BaseRaw | None:

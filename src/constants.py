@@ -37,14 +37,24 @@ LATERAL_CAR_REREF = False
 # file is actually divided is decided from its channel range (see
 # MAT_AMPLIFIER_RANGE_V); set this to False to load the stored numbers as-is.
 MAT_DIVIDE_BY_1000 = True
-# LabChart labels every channel "V" whatever the amplifier does, so the input
-# range is what tells the two kinds of export apart. A range of whole volts is
+# A file whose unit text says millivolts is simply converted. The rest label
+# every channel "V" whatever the amplifier does, so for those the input range
+# is what tells the two kinds of export apart. A range of whole volts is
 # the amplifier's own output at a 1000x gain (1 V on file = 1 mV at the
 # electrode) and has to be divided by 1000; a range well under a volt is
 # already electrode-referred (the 17-pig PolyResponses set records at
 # +-112.5 mV) and dividing it puts every response three orders of magnitude
 # below the absolute uV detection gates, so nothing is ever detected.
 MAT_AMPLIFIER_RANGE_V = 1.0
+
+# Hand-trimmed crops: {crop file name: (tmin, tmax)}, seconds. tmin None = from
+# the start, tmax None = to the end, and a negative tmax counts back from the
+# end, so (0, -10) means "all but the last 10 seconds". Empty by default and
+# meant to be filled by a run that needs it: a crop file name is made of the
+# config and amplitude labels only ("5+6-_4.fif"), which is the shape every SCS
+# recording produces, so entries kept here outlive the recording they were
+# written for and quietly re-trim unrelated data.
+SPECIAL_CROPS: dict[str, tuple[float | None, float | None]] = {}
 
 
 # ── Spontaneous EMG analysis (doctor-requested RMS / mean-amplitude envelopes) ──

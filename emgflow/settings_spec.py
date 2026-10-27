@@ -15,8 +15,10 @@ One entry per knob. `target` says HOW the value reaches the pipeline:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+from src import constants as _constants
 
 
 @dataclass(frozen=True)
@@ -51,10 +53,10 @@ SHARED: list[Lever] = [
           "removes slower trends but starts eating broad responses — at 10 ms the Zh14 ch4 "
           "response drops from 260 to 109 uV. Empty switches it off."),
     Lever("MAT_DIVIDE_BY_1000", "MAT: rescale to volts", "bool", True, "Filtering", "both", "global",
-          "LabChart unit rescaling on .mat load. On, each file is divided by 1000 only if its "
-          "channel range says it holds raw amplifier volts (a range of whole volts, e.g. +-10 V); "
-          "a file already recorded in the electrode's own range (e.g. +-112.5 mV) is left alone. "
-          "Off loads the stored numbers as-is."),
+          "LabChart unit rescaling on .mat load. On, each file is divided by 1000 only if it "
+          "needs it: a file recorded in millivolts, or one whose channel range says it holds raw "
+          "amplifier volts (a range of whole volts, e.g. +-10 V). A file already recorded in the "
+          "electrode's own range (e.g. +-112.5 mV) is left alone. Off loads the numbers as-is."),
 
     Lever("ARTCHAN", "Artifact channel(s)", "str", "", "Artifact", "both", "global",
           "Comma-separated. Empty = auto-detect by name containing 'art'. "
@@ -234,7 +236,44 @@ SPONTANEOUS: list[Lever] = [
           "exported. Empty disables."),
 ]
 
-ALL_LEVERS: list[Lever] = SHARED + SIR + STARTSTOP + SPONTANEOUS
+def _default_fits(kind: str, value: Any) -> bool:
+    """Whether a constant can stand as this lever's default without conversion."""
+    if kind == "bool":
+        return isinstance(value, bool)
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "float":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "opt_float":
+        return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+    if kind == "floats":
+        return isinstance(value, (tuple, list))
+    # str / choice levers hold a widget value, not the constant itself (ARTCHAN
+    # is None in the code and an empty text field here), so they stay as written.
+    return False
+
+
+def _synced_with_constants(levers: list[Lever]) -> list[Lever]:
+    """Take every "global" lever's default from src.constants.
+
+    Such a lever IS that constant: a session seeds itself with these defaults
+    and assigns all of them onto the pipeline module, so a default written here
+    that disagrees with constants.py silently wins over the code, and the GUI
+    then runs on different numbers than a direct run_pipeline call on the same
+    recording. One source of truth is the only thing that keeps the two from
+    drifting apart again; to change a value, change it in constants.py.
+    """
+    out: list[Lever] = []
+    for lv in levers:
+        if lv.target == "global" and hasattr(_constants, lv.name):
+            value = getattr(_constants, lv.name)
+            if _default_fits(lv.kind, value):
+                lv = replace(lv, default=value)
+        out.append(lv)
+    return out
+
+
+ALL_LEVERS: list[Lever] = _synced_with_constants(SHARED + SIR + STARTSTOP + SPONTANEOUS)
 BY_NAME: dict[str, Lever] = {lv.name: lv for lv in ALL_LEVERS}
 
 # Imported by pipeline.py but never read — exposing them as controls would be a lie.

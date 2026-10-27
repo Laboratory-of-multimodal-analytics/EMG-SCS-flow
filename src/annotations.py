@@ -22,6 +22,9 @@ CONFIG_WITH_AMP_RE = re.compile(
     re.IGNORECASE,
 )
 CONFIG_TOKEN_RE = re.compile(r"(?P<cfg>\d+(?:[+-]\d+)+[+-]?)")
+# The same token with its polarity marker required, for labels that carry no
+# unit word to corroborate them (see _parse_annotation).
+CONFIG_TOKEN_FULL_RE = re.compile(r"(?P<cfg>\d+(?:[+-]\d+)+[+-])")
 AMP_RE = re.compile(r"^\s*[+-]?\d+(?:[.,/]\d+)?(?:\s*(?:mA|uA|ms|Hz|ma|ua))?\s*$", re.IGNORECASE)
 STARTSTOP_RE = re.compile(r"^\s*(start|stop)\W*\s*$", re.IGNORECASE)
 
@@ -74,6 +77,17 @@ def _parse_annotation(desc: str) -> tuple[str | None, str | None]:
     # a config-like token and stimulation-related units.
     m = CONFIG_TOKEN_RE.search(desc.replace(" ", ""))
     if m and re.search(r"(?:hz|hhz|mks|ms|us|ma|ua)\b", desc, re.IGNORECASE):
+        return m.group("cfg"), None
+
+    # Headers typed in Cyrillic, or mangled by a wrong code page on export:
+    # "2+3- ДААМКС ВГЦ", "ВГЦ ВЕАМКС 1+6- ПОЯСН", "В \x93Ц ГААМКС 0+1-". There
+    # is no Latin unit word left to key on, so the electrode token itself has
+    # to carry it, and only a polarity-terminated one counts -- "1+2-" is
+    # electrode notation and nothing else, while a bare "1+2" is just as likely
+    # to be prose. Without this the whole block reads as no header at all and
+    # its amplitudes are either dropped or folded into the config before it.
+    m = CONFIG_TOKEN_FULL_RE.search(desc.replace(" ", ""))
+    if m:
         return m.group("cfg"), None
 
     if AMP_RE.match(desc):
