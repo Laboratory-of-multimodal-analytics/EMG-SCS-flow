@@ -2563,20 +2563,26 @@ def _run_startstop_analysis(
                 tmin=-1.0,
                 tmax=1.0,
                 baseline=None,
-                preload=True,
+                preload=False,
                 picks=ch_names,
             )
+            # Only the epochs carrying a detection are plotted, so read them one
+            # at a time: preloading every event at +-1 s holds hundreds of MiB of
+            # largely overlapping samples at once. drop_bad() settles the
+            # boundary drops that selection reports, without loading any data.
+            epochs_wide.drop_bad()
             wide_times = epochs_wide.times
-            wide_data = epochs_wide.get_data()
             # epochs_wide uses a wider window and may drop more boundary events
             # than the narrow epochs, so map narrow epoch index -> wide position
-            # via its selection instead of indexing wide_data by ep_idx directly.
+            # via its selection instead of indexing it by ep_idx directly.
             wide_pos_by_orig = {int(o): i for i, o in enumerate(epochs_wide.selection)}
 
             for ep_idx, ch_list in detected_channels_by_epoch.items():
                 wpos = wide_pos_by_orig.get(int(ep_idx))
                 if wpos is None:
                     continue
+                wide_epoch = epochs_wide[wpos].load_data()
+                wide_wave = wide_epoch.get_data()[0]
                 max_abs = None
                 for ch in ch_list:
                     p1_t = p1_by_epoch_channel.get(ep_idx, {}).get(ch)
@@ -2586,18 +2592,18 @@ def _run_startstop_analysis(
                     win_mask = np.abs(wide_times - p1_t) <= 0.05
                     if not np.any(win_mask):
                         continue
-                    val = float(np.nanmax(np.abs(wide_data[wpos, ch_idx, win_mask])))
+                    val = float(np.nanmax(np.abs(wide_wave[ch_idx, win_mask])))
                     if max_abs is None or val > max_abs:
                         max_abs = val
                 if max_abs is None:
-                    max_abs = float(np.nanmax(np.abs(wide_data[wpos]))) if wide_data.size else 0.0
+                    max_abs = float(np.nanmax(np.abs(wide_wave))) if wide_wave.size else 0.0
                 scale = (max_abs * 2.5) if max_abs > 0 else None
                 safe_chs = [re.sub(r"[^\w\-_\. ]", "_", str(ch)) for ch in ch_list]
                 ch_suffix = "+".join(safe_chs)
                 if len(ch_suffix) > 80:
                     ch_suffix = f"{ch_suffix[:77]}..."
                 out_path = ensure_dir(raw_epochs_dir) / f"epoch_{ep_idx:03d}__{ch_suffix}.png"
-                fig = epochs_wide[wpos].plot(
+                fig = wide_epoch.plot(
                     picks=ch_names,
                     scalings={"eeg": scale} if scale is not None else None,
                     show=False,
