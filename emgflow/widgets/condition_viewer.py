@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.condition import load_overrides, recompute_corrections, save_overrides
+from src.io_utils import real_files
 
 from ..results import COND_DIR, mode_dir
 from ..templates import build_template
@@ -244,15 +245,15 @@ class ConditionViewer(QWidget):
                        if (arr / "condition_labels.npy").exists() else [])
         cc = arr / "curve_condition.npy"
         self.curve_cond = np.load(cc) if cc.exists() else None
-        for f in sorted(arr.glob("*_curves_aligned.npy")):
+        for f in sorted(real_files(arr.glob("*_curves_aligned.npy"))):
             self._aligned[f.name[: -len("_curves_aligned.npy")]] = np.load(f)
-        for f in sorted(arr.glob("*_condition_means.npy")):
+        for f in sorted(real_files(arr.glob("*_condition_means.npy"))):
             self._means[f.name[: -len("_condition_means.npy")]] = np.load(f)
-        for f in sorted(arr.glob("*_markers_ms.npy")):
+        for f in sorted(real_files(arr.glob("*_markers_ms.npy"))):
             self._markers[f.name[: -len("_markers_ms.npy")]] = np.load(f)
-        for f in sorted(arr.glob("*_present.npy")):
+        for f in sorted(real_files(arr.glob("*_present.npy"))):
             self._present[f.name[: -len("_present.npy")]] = np.load(f)
-        for f in sorted(arr.glob("*_condition_means_time.npy")):
+        for f in sorted(real_files(arr.glob("*_condition_means_time.npy"))):
             self._means_time[f.name[: -len("_condition_means_time.npy")]] = np.load(f)
         tf = arr / "times_full_ms.npy"
         self.times_full = np.load(tf) if tf.exists() else None

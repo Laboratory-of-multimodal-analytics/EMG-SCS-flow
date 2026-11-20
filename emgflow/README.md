@@ -54,7 +54,38 @@ headlessly.
 | **Raw** | any | Scroll through the whole recording. Overlay protocol annotations, detections, bursts and envelopes; jump straight to any detection or burst; or fit the entire segment into one window. |
 
 `Settings` is generated from the lever registry, grouped as in `constants.py`, and swaps
-its contents with the mode.
+its contents with the mode. In stimulation-induced mode its first group is **Detector**: the network
+(`unet`, the default) or the templates (`templates`). The template groups (Templates (PASS1),
+Gates (PASS2), Markers) act on the template detector only; **Low-confidence curves** holds the
+thresholds that decide which curves each detector flags for checking.
+
+### Low-confidence curves
+
+The scenario tab lists, under the channels, every curve the detector is unsure about, with its
+reason, and marks them on the response-vs-curve plot with a hollow violet square. Clicking one —
+its point or its line in the list — brings it up below and opens the **peak editor**: the curve
+at full resolution, the channel's other curves in grey behind it, and its current markers. Each
+click places the chosen marker and moves on (onset → P1 → P2); P1 and P2 snap to the extremum
+within ±0.5 ms on the side of the click (untick to place freely). "Сохранить пики" stores them
+for this curve, "Ответа нет" marks it a false response, "Отмена" leaves it as it is. The same
+window opens on any curve from "Поставить пики вручную…". Saved peaks show as hollow diamonds
+until "Пересчитать по правкам" applies them; a curve carries one correction at a time (false,
+missed or hand peaks), and a curve already corrected shows it in the list. "Только выбранный
+канал" narrows the list to the channel on screen. The header says which detector produced the
+run.
+
+What the reasons mean:
+
+| Reason | Detector | Meaning |
+|---|---|---|
+| `сети расходятся в пике` | network | the ensemble's nets place P1 with an SD above the threshold (2 ms; only on curves with a response) |
+| `две волны` | network | the P1 heatmap has a second peak almost as high as the first (only on curves with a response) |
+| `p(ответ) на границе` | network | p(response) close to the model's threshold (off by default) |
+| `сети расходятся в ответе` | network | the nets split on whether there is a response at all (off by default) |
+| `не прошло: …` | network | the network sees a response but its peaks fail the doctors' criteria (off by default) |
+| `не похоже на шаблон` | templates | a detected response that does not look like the template it was found with |
+| `похоже на шаблон, но ответ не найден` | templates | a curve with no detection that does look like the template: a response the gates may have lost |
+
 
 ### How things are drawn
 

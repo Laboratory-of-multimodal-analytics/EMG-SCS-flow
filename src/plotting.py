@@ -56,6 +56,14 @@ def intensity_scaled_color(base_rgba, t: float):
     return (r2, g2, b2)
 
 
+#: Resolution of the per-crop epoch panels ("Plots with / without grid and
+#: markers"). They were drawn at 500 dpi, a 5000 x 10000 px PNG for an
+#: eight-channel export; the two of them took 28 of the ~40 s a Neurosoft file
+#: needs, whatever the detector. 200 dpi (2000 x 4000 px) draws one in 5.6 s
+#: instead of 12.9.
+EPOCH_PANEL_DPI = 200
+
+
 def plot_epochs_panel(
     data_epoched: np.ndarray,
     times: np.ndarray,
@@ -93,7 +101,7 @@ def plot_epochs_panel(
     # Constrained layout in colour mode: it is the only engine that places a
     # figure-level colourbar and the per-axes titles without them colliding.
     fig, axes = plt.subplots(
-        n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=500,
+        n_channels, 1, figsize=(10, 2.5 * n_channels), dpi=EPOCH_PANEL_DPI,
         layout="constrained" if color_by_order else None,
     )
     if n_channels == 1:

@@ -122,9 +122,23 @@ from .constants import (
     ART_PEAK_HEIGHT,
     ART_DETECT_CHANNEL,
     ANTAGONIST_PAIRS,
+    DETECTOR,
+    UNET_DETECTOR_DIR,
+    UNET_MODEL_DIR,
+    UNET_REVIEW_P_MARGIN,
+    UNET_REVIEW_VOTE_SPLIT,
+    UNET_REVIEW_SPREAD_MS,
+    UNET_REVIEW_SPREAD_PEAKS,
+    UNET_REVIEW_RIVAL_RATIO,
+    UNET_REVIEW_RIVAL_PEAKS,
+    UNET_REVIEW_CRITERIA,
+    TEMPLATE_REVIEW_MIN_CORR,
+    TEMPLATE_REVIEW_MISSED_CORR,
 )
+from . import unet_detector
 from .detection import (
     add_extra_peak_to_p1,
+    curve_template_corr,
     detect_onset_near_template,
     noise_std_from_tail,
     onsets_anchored_to_channel,
@@ -135,7 +149,7 @@ from .detection import (
 )
 from .io_utils import (
     CONDITION_FOLDER, STIMULATION_INDUCED_FOLDER, SupersededOutputs,
-    build_output_dirs, ensure_dir, list_crop_files, other_scenario_output_paths,
+    build_output_dirs, ensure_dir, list_crop_files, other_scenario_output_paths, real_files,
     resolve_mode_dirs, restore_interrupted_supersede, sir_mode_output_paths,
     stale_mode_layout_paths,
 )
@@ -2786,6 +2800,119 @@ def _run_startstop_analysis(
     plot_boxplots(df, boxplot_dir)
 
 
+#: Per-curve confidence numbers each detector writes to the metrics, beside the
+#: shared `Detector`, `Low confidence` and `Low confidence reasons` columns:
+#: (column, entry key).
+CONFIDENCE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    unet_detector.UNET: (
+        ("Net p response", "net_p"),
+        ("Net votes yes", "net_votes"),
+        ("Net P1 SD ms", "net_p1_sd"),
+        ("Net P2 SD ms", "net_p2_sd"),
+        ("Net P1 rival", "net_p1_rival"),
+        ("Net P2 rival", "net_p2_rival"),
+    ),
+    unet_detector.TEMPLATES: (
+        ("Template corr", "tmpl_corr"),
+    ),
+}
+
+
+def _network_channel_results(
+    epochs, data_epoched, art_set, configuration, *, detector, model, review,
+) -> tuple[dict[str, list[dict]], list[str]]:
+    """One crop through the network -> the per-epoch entries the template search fills.
+
+    Every channel is eligible unless it is the artifact or excluded by hand: the
+    network needs no template to look for a response, so "no template matched"
+    does not take a channel out. The network's latencies come in ms and its
+    values in uV (read off this epoch at those latencies); the entries carry
+    seconds and volts like the rest of the pipeline. A curve without a response
+    has every marker empty: whether there is a response is the network's call.
+    """
+    eligible = [
+        ch for ch in epochs.ch_names
+        if ch not in art_set
+        and ch not in SIR_EXCLUDE_CHANNELS
+        and configuration not in SIR_EXCLUDE_CONFIGS
+    ]
+    results: dict[str, list[dict]] = {ch: [] for ch in eligible}
+    if not eligible:
+        return results, eligible
+    table = unet_detector.detect(epochs, detector=detector, model=model, review=review)
+    rows = {(str(c), int(k)): r for (c, k), r in
+            table.set_index(["Channel", "Curve"]).iterrows()}
+
+    def _f(r, col, scale=1.0):
+        v = r.get(col, np.nan)
+        return float(v) * scale if v is not None and np.isfinite(v) else np.nan
+
+    for ch in eligible:
+        ch_idx = epochs.ch_names.index(ch)
+        for ep in range(len(epochs)):
+            r = rows[(ch, ep + 1)]
+            yes = bool(r["Response"])
+            e = {"ep": ep, "sig": data_epoched[ep, ch_idx, :],
+                 "onset": np.nan, "p1": np.nan, "p2": np.nan,
+                 "pv1": np.nan, "pv2": np.nan, "ptp": np.nan}
+            if yes:
+                # The onset is a placeholder on a curve export: the shared onset
+                # step re-derives it from this P1, as for the templates. Measured
+                # against the doctor on validation it is the better of the two
+                # (median error 0.02 ms against 0.94 ms for the network's own).
+                e.update(onset=_f(r, "Onset ms", 1e-3), p1=_f(r, "P1 ms", 1e-3),
+                         p2=_f(r, "P2 ms", 1e-3), pv1=_f(r, "P1 uV", 1e-6),
+                         pv2=_f(r, "P2 uV", 1e-6), ptp=_f(r, "PTP uV", 1e-6))
+            e.update(
+                low_conf=bool(r["queue"]), low_conf_reasons=str(r["queue reasons"] or ""),
+                net_p=_f(r, "p_response"), net_votes=_f(r, "nets_yes_share"),
+                net_p1_sd=_f(r, "P1_spread_ms"), net_p2_sd=_f(r, "P2_spread_ms"),
+                net_p1_rival=_f(r, "P1_rival"), net_p2_rival=_f(r, "P2_rival"),
+            )
+            results[ch].append(e)
+    return results, eligible
+
+
+def _template_review(entries, tmpl, markers, times, *, min_corr, missed_corr) -> None:
+    """The template detector's confidence in each of a channel's curves.
+
+    The number is how much the curve looks like the template the detector
+    searched it with: their correlation over the template's own response, from
+    2 ms before its onset to 4 ms after its P2, with the template where the
+    detector put it (no sliding: letting it slide by even 2 ms makes nearly any
+    curve look like it). It is read both ways, because the template detector
+    errs both ways:
+
+      found, but unlike the template  -> the detection may be something else;
+      not found, but like the template -> a response the gates may have lost.
+
+    On the network's validation set (8 291 curves of three injured patients) the
+    template detector got 1 442 curves wrong, 658 of them missed responses, which
+    a rule on detected curves alone cannot catch by construction. At 0.5 / 0.7
+    the two rules send 15 % of curves and catch 53 % of those errors; 56 % and
+    68 % of what each rule sends are errors.
+    """
+    if tmpl is None:
+        return
+    t_on, t_p1, t_p2 = (float(markers.get(k, np.nan)) for k in ("onset", "p1", "p2"))
+    if not np.isfinite(t_p1):
+        return
+    lo = (t_on if np.isfinite(t_on) else t_p1 - 0.005) - 0.002
+    hi = (t_p2 if np.isfinite(t_p2) and t_p2 > t_p1 else t_p1 + 0.005) + 0.004
+    for e in entries:
+        c = curve_template_corr(e["sig"], tmpl, times, lo, hi)
+        e["tmpl_corr"] = c
+        found = bool(np.isfinite(e["p1"]))
+        why = ""
+        if found and min_corr is not None and not (c >= min_corr):
+            why = (f"не похоже на шаблон: корреляция {c:.2f} (порог {min_corr:.2f})"
+                   if np.isfinite(c) else "не сравнить с шаблоном")
+        elif not found and missed_corr is not None and c >= missed_corr:
+            why = (f"похоже на шаблон, но ответ не найден: корреляция {c:.2f} "
+                   f"(порог {missed_corr:.2f})")
+        e["low_conf"], e["low_conf_reasons"] = bool(why), why
+
+
 def _strong_epoch_indices(
     ch_epochs: np.ndarray,
     times: np.ndarray,
@@ -2985,7 +3112,7 @@ def regenerate_sir_outputs_from_metrics(output_root: Path, scenario: str | None 
 
     # Redraw the per-crop panels from the saved epochs + corrected markers.
     epochs_dir = paths["epochs_dir"]
-    for epo in sorted(Path(epochs_dir).glob("*-epo.fif")):
+    for epo in sorted(real_files(Path(epochs_dir).glob("*-epo.fif"))):
         base_name = epo.name[: -len("-epo.fif")]
         configuration = base_name.split("-")[0]
         try:
@@ -3391,17 +3518,58 @@ def _run_pipeline(
             flush=True,
         )
 
-    # ── SIR: load pre-computed template bank ──
-    template_dir = _template_dir_for_run(output_root)
-    n_user = len(list(Path(template_dir).glob("template_*.source.txt")))
-    print(f"[SIR] Template bank: {template_dir}"
-          + (f" ({n_user} drawn by hand)" if n_user else ""), flush=True)
-    template_bank = _load_startstop_template_bank(
-        template_dir=template_dir,
-        template_native_sfreq=float(STARTSTOP_TM_TEMPLATE_SFREQ),
-        template_center_sample=int(STARTSTOP_TM_TEMPLATE_CENTER_SAMPLE),
+    # ── Detector: the network where it was trained, the templates elsewhere ──
+    # Decided once for the whole recording, so every crop of it, and every row of
+    # its metrics, comes from the same detector.
+    if DETECTOR not in unet_detector.DETECTORS:
+        raise ValueError(f"DETECTOR={DETECTOR!r} is not one of {unet_detector.DETECTORS}")
+    use_net = False
+    net_detector_dir = unet_detector.detector_dir(UNET_DETECTOR_DIR)
+    net_model_dir = unet_detector.model_dir(UNET_MODEL_DIR, net_detector_dir)
+    if DETECTOR == unet_detector.UNET:
+        why_not_net = unet_detector.why_not(
+            pre_epoched=pre_epoched,
+            scenario=SCENARIO_LABELS.get(neurosoft_scenario, neurosoft_scenario),
+            net_scenarios=tuple(SCENARIO_LABELS[s] for s in (RECRUITMENT, JENDRASSIK, PAIRED)),
+            detector=net_detector_dir, model=net_model_dir,
+        )
+        use_net = why_not_net is None
+        if use_net:
+            print(f"[SIR] Detector: network {unet_detector.model_name(net_model_dir)} "
+                  f"({net_model_dir})", flush=True)
+            n_user = len(list(Path(_template_dir_for_run(output_root))
+                              .glob("template_*.source.txt")))
+            if n_user:
+                print(f"[SIR] {n_user} template(s) drawn by hand for this recording are "
+                      f"not used: they steer the template detector only.", flush=True)
+        else:
+            print(f"[SIR] Detector: templates — the network is not used: {why_not_net}.",
+                  flush=True)
+    else:
+        print("[SIR] Detector: templates.", flush=True)
+    detector_used = unet_detector.UNET if use_net else unet_detector.TEMPLATES
+    net_review = unet_detector.ReviewSettings(
+        p_margin=UNET_REVIEW_P_MARGIN, vote_split=UNET_REVIEW_VOTE_SPLIT,
+        spread_ms=UNET_REVIEW_SPREAD_MS, rival_ratio=UNET_REVIEW_RIVAL_RATIO,
+        criteria_doubt=UNET_REVIEW_CRITERIA, spread_peaks=tuple(UNET_REVIEW_SPREAD_PEAKS),
+        rival_peaks=tuple(UNET_REVIEW_RIVAL_PEAKS),
     )
-    if not template_bank:
+
+    # ── SIR: load pre-computed template bank ──
+    # The network needs no templates, so a run detected by it neither loads the
+    # bank nor stops for an empty one.
+    template_bank: list[dict[str, object]] = []
+    if not use_net:
+        template_dir = _template_dir_for_run(output_root)
+        n_user = len(list(Path(template_dir).glob("template_*.source.txt")))
+        print(f"[SIR] Template bank: {template_dir}"
+              + (f" ({n_user} drawn by hand)" if n_user else ""), flush=True)
+        template_bank = _load_startstop_template_bank(
+            template_dir=template_dir,
+            template_native_sfreq=float(STARTSTOP_TM_TEMPLATE_SFREQ),
+            template_center_sample=int(STARTSTOP_TM_TEMPLATE_CENTER_SAMPLE),
+        )
+    if not use_net and not template_bank:
         print("[SIR] No templates found in bank; cannot proceed.", flush=True)
         # Nothing was computed, so the previous reading is still the only answer
         # this recording has. Put it back rather than let the bail discard it.
@@ -3505,8 +3673,11 @@ def _run_pipeline(
     config_waveforms: dict[str, dict[str, list[tuple[float, str, np.ndarray]]]] = defaultdict(lambda: defaultdict(list))
     config_meta: dict[str, dict[str, np.ndarray | float]] = {}
 
-    print("[SIR] Collecting channel means...", flush=True)
-    for file_name in file_list:
+    # PASS 1 exists to fit the templates; a run detected by the network skips it.
+    pass1_files = [] if use_net else file_list
+    if pass1_files:
+        print("[SIR] Collecting channel means...", flush=True)
+    for file_name in pass1_files:
         if pre_epoched is not None:
             # Epochs came pre-cut: no artifact channel, no onset search.
             epochs = pre_epoched[file_name]
@@ -3590,7 +3761,8 @@ def _run_pipeline(
     amp_templates: dict[tuple[str, str], dict[str, np.ndarray | None]] = defaultdict(dict)
     amp_template_markers: dict[tuple[str, str], dict[str, dict[str, float]]] = defaultdict(dict)
 
-    print("[SIR] Matching templates...", flush=True)
+    if config_waveforms:
+        print("[SIR] Matching templates...", flush=True)
     for configuration, ch_dict in config_waveforms.items():
         times = config_meta[configuration]["times"]
         sfreq = float(config_meta[configuration]["sfreq"])
@@ -3836,330 +4008,343 @@ def _run_pipeline(
 
         baseline_mask = (times >= baseline_tmin) & (times <= baseline_tmax)
 
-        # Use per-amp templates when enabled, else fall back to config-level.
-        if SIR_TEMPLATE_PER_AMPLITUDE and (configuration, stim_amp_raw) in amp_templates:
-            tmpl_cfg = dict(amp_templates[(configuration, stim_amp_raw)])
-            markers_cfg = dict(amp_template_markers[(configuration, stim_amp_raw)])
-        else:
-            tmpl_cfg = dict(config_templates.get(configuration, {}))
-            markers_cfg = dict(config_template_markers.get(configuration, {}))
-
-        if SIR_P1_DOMINANT:
-            # Redefine P1 = dominant response deflection, P2 = next opposite-polarity
-            # peak after it (per-file hack for lead-with-small-bump responses). Dominance
-            # is judged on this crop's ACTUAL epoch-mean waveform, not the synthesized
-            # template (whose relative peak sizes can differ).
-            _chname_to_idx = {c: i for i, c in enumerate(epochs.ch_names)}
-            for _ch, _tm in tmpl_cfg.items():
-                if _tm is None or _ch not in markers_cfg or _ch not in _chname_to_idx:
-                    continue
-                _mw = data_epoched[:, _chname_to_idx[_ch], :].mean(axis=0)
-                _p1t, _p2t = _dominant_p1_p2(_mw, times, baseline_mask, resp_tmin, resp_tmax)
-                if np.isfinite(_p1t):
-                    m = dict(markers_cfg[_ch]); m["p1"] = _p1t; m["p2"] = _p2t
-                    markers_cfg[_ch] = m
-
-        _forced_here: set[str] = set()   # channels force-polarised in THIS config
-        if SIR_FORCE_NEG_P1_AFTER or SIR_FORCE_POS_P1_AFTER:
-            # Per-file: force P1 = dominant deflection of a chosen polarity (>= min_lat),
-            # P2 = strongest opposite. Negative dict → red dip; positive dict → red peak.
-            # Dict keys may be a bare channel name (all configs) OR a (config, channel) tuple
-            # (that config only); a matching (config, channel) key overrides the bare key.
-            _c2i = {c: i for i, c in enumerate(epochs.ch_names)}
-            _specs: dict[str, tuple[float, bool]] = {}   # ch -> (min_lat, want_pos)
-            # Precedence (low→high): bare 'ch' | ('config','ch') | ('config','amp','ch').
-            for _src, _pos in [(SIR_FORCE_NEG_P1_AFTER, False), (SIR_FORCE_POS_P1_AFTER, True)]:
-                for _key, _ml in _src.items():          # bare-channel keys
-                    if not isinstance(_key, tuple):
-                        _specs[_key] = (_ml, _pos)
-                for _key, _ml in _src.items():          # (config, channel)
-                    if isinstance(_key, tuple) and len(_key) == 2 and _key[0] == configuration:
-                        _specs[_key[1]] = (_ml, _pos)
-                for _key, _ml in _src.items():          # (config, amp, channel) — most specific
-                    if (isinstance(_key, tuple) and len(_key) == 3
-                            and _key[0] == configuration and _key[1] == stim_amp_raw):
-                        _specs[_key[2]] = (_ml, _pos)
-            for _ch, (_minlat, _pos) in _specs.items():
-                if _ch not in _c2i:
-                    continue
-                _maxlat = None
-                if isinstance(_minlat, tuple):     # (min_lat, max_lat) → cap P1 search (early peak)
-                    _minlat, _maxlat = _minlat
-                _mw = data_epoched[:, _c2i[_ch], :].mean(axis=0)
-                _ont, _p1t, _p2t = _forced_p1_p2(_mw, times, baseline_mask, resp_tmin, resp_tmax, _minlat, want_pos=_pos, max_lat=_maxlat)
-                if not np.isfinite(_p1t):
-                    continue
-                m = dict(markers_cfg.get(_ch, {})); m["p1"] = _p1t; m["p2"] = _p2t
-                m["onset"] = _ont if np.isfinite(_ont) else m.get("onset", np.nan)
-                markers_cfg[_ch] = m
-                # Use the actual epoch-mean as the template so per-epoch polarity/scaling match
-                # the real response, AND so amps whose bank match failed (tmpl=None) still get a
-                # forced template from their own mean instead of being dropped as ineligible.
-                # Pure-noise low amps stay out via the median-corr / inter-trial gates.
-                tmpl_cfg[_ch] = np.asarray(_mw, dtype=float)
-                _forced_here.add(_ch)
-
-        # ── Explicit per-file markers (latency + polarity given by the user) ──
-        # Place P1/P2/onset at the given latencies and mark the channel for
-        # per-epoch sampling (see the force-from-template path in the epoch loop),
-        # regardless of whether the trial-mean shows the deflection.
-        _explicit_pol: dict[str, dict] = {}
-        if SIR_FORCE_MARKER_LAT:
-            _c2i2 = {c: i for i, c in enumerate(epochs.ch_names)}
-            for _key, _spec in SIR_FORCE_MARKER_LAT.items():
-                if isinstance(_key, tuple) and len(_key) == 2 and _key[0] == configuration:
-                    _ch = _key[1]
-                elif (isinstance(_key, tuple) and len(_key) == 3
-                      and _key[0] == configuration and _key[1] == stim_amp_raw):
-                    _ch = _key[2]
-                else:
-                    continue
-                if _ch not in _c2i2 or _ch in art_set:
-                    continue
-                _p1 = _spec.get("p1")
-                _p2 = _spec.get("p2")
-                m = dict(markers_cfg.get(_ch, {}))
-                m["onset"] = float(_spec["onset"]) if _spec.get("onset") is not None else np.nan
-                m["p1"] = float(_p1[0]) if _p1 else np.nan
-                m["p2"] = float(_p2[0]) if _p2 else np.nan
-                markers_cfg[_ch] = m
-                tmpl_cfg[_ch] = data_epoched[:, _c2i2[_ch], :].mean(axis=0)
-                _explicit_pol[_ch] = {
-                    "p1": int(_p1[1]) if _p1 else 1,
-                    "p2": int(_p2[1]) if _p2 else 1,
-                }
-                _forced_here.add(_ch)
-
-        eligible_channels = [
-            ch for ch in epochs.ch_names
-            if ch not in art_set
-            and ch not in SIR_EXCLUDE_CHANNELS
-            and configuration not in SIR_EXCLUDE_CONFIGS
-            and tmpl_cfg.get(ch) is not None
-            and np.isfinite(markers_cfg.get(ch, {}).get("p1", np.nan))
-        ]
-        eligible_set = set(eligible_channels)
-
-        channel_epoch_results: dict[str, list[dict]] = {ch: [] for ch in eligible_channels}
+        # What both detectors fill: one entry per epoch and eligible channel,
+        # {ep, onset, p1, p2, pv1, pv2, ptp, sig} in seconds and volts, plus the
+        # detector's own confidence fields.
         latency_markers: dict[str, list[dict]] = {ch: [] for ch in epochs.ch_names if ch not in art_set}
-
-        for ep in range(len(epochs)):
-            for ch_idx, ch_name in enumerate(epochs.ch_names):
-                if (ch_name in art_set) or (ch_name not in eligible_set):
-                    continue
-
-                sig = data_epoched[ep, ch_idx, :]
-
-                base = sig[baseline_mask]
-                bstd = base.std()
-                # A flat baseline means a dead channel on a continuous recording.
-                # On a pre-cut curve export it means nothing: the baseline window
-                # IS the station's constant pre-artifact pad, so it is flat by
-                # construction, and whether np.std of a dozen identical floats
-                # comes out as exactly 0 or as 1e-21 is decided by rounding. That
-                # coin flip was discarding 276 of 800 epochs in one Zh14 file,
-                # the largest responses among them. There, ask instead whether
-                # the epoch carries any signal at all.
-                epoch_is_flat = (
-                    float(np.std(sig)) == 0.0 if pre_epoched is not None
-                    else bstd == 0
-                )
-                if epoch_is_flat or np.isnan(bstd):
-                    channel_epoch_results[ch_name].append(
-                        {"ep": ep, "onset": np.nan, "p1": np.nan, "p2": np.nan,
-                         "pv1": np.nan, "pv2": np.nan, "ptp": np.nan, "sig": sig}
-                    )
-                    continue
-
-                t_on_tmpl = markers_cfg[ch_name]["onset"]
-                t_p1 = markers_cfg[ch_name]["p1"]
-                t_p2 = markers_cfg[ch_name]["p2"]
-                tmpl = tmpl_cfg[ch_name]
-
-                # ── Force markers straight from the config template ──
-                # On some channels (a dip riding the artifact-recovery ramp, a
-                # near-flat P1) the per-epoch peak re-search below does not
-                # converge, so a manually-placed marker vanishes. When the crop
-                # is force-keyed, trust the template latencies the clinician set
-                # on the mean and just sample THIS epoch's value at each — no
-                # re-detection, no gates. Polarity comes from the template.
-                _ex_pol = _explicit_pol.get(ch_name)
-                if _ex_pol is not None or (configuration, stim_amp_raw, ch_name) in SIR_FORCE_KEYS:
-                    # Polarity: explicit if the user gave it, else the sign of the
-                    # template at that latency. Wider sample window for explicit
-                    # markers (single-sweep peaks jitter more than the mean).
-                    _win = 2.0 if _ex_pol is not None else 1.0
-
-                    def _pol_at(_t, _which):
-                        if _ex_pol is not None:
-                            return _ex_pol[_which]
-                        _i = int(np.argmin(np.abs(times - _t)))
-                        return +1 if (tmpl[_i] - np.mean(tmpl[baseline_mask])) >= 0 else -1
-                    _on = float(t_on_tmpl) if np.isfinite(t_on_tmpl) else np.nan
-                    _p1l, _p1v = (np.nan, np.nan)
-                    if np.isfinite(t_p1):
-                        _p1l, _p1v = pick_epoch_value_near_latency(
-                            sig, times, float(t_p1), sfreq, win_ms=_win, polarity=_pol_at(t_p1, "p1"))
-                    _p2l, _p2v = (np.nan, np.nan)
-                    if np.isfinite(t_p2):
-                        _p2l, _p2v = pick_epoch_value_near_latency(
-                            sig, times, float(t_p2), sfreq, win_ms=_win, polarity=_pol_at(t_p2, "p2"))
-                    _ptp = (float(np.abs(_p1v - _p2v))
-                            if (np.isfinite(_p1v) and np.isfinite(_p2v)) else np.nan)
-                    channel_epoch_results[ch_name].append(
-                        {"ep": ep, "onset": _on, "p1": _p1l, "p2": _p2l,
-                         "pv1": _p1v, "pv2": _p2v, "ptp": _ptp, "sig": sig}
-                    )
-                    continue
-
-                onset_latency = np.nan
-                peak1_latency = peak2_latency = np.nan
-                peak1_value = peak2_value = np.nan
-
-                # P1 detection near template P1
-                if not np.isnan(t_p1):
-                    idx_tmpl_p1 = int(np.argmin(np.abs(times - t_p1)))
-                    pol1 = np.sign(tmpl[idx_tmpl_p1] - np.mean(tmpl[baseline_mask]))
-                    pol1 = +1 if pol1 >= 0 else -1
-                    tmpl_p1_val = tmpl[idx_tmpl_p1]
-                    peak1_latency, peak1_value = detect_peak_in_window(
-                        sig_f=sig, times=times, sfreq=sfreq,
-                        baseline_mask=baseline_mask, t_center=t_p1,
-                        win_ms=5.0, polarity=pol1,
-                        amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
-                        choose="global",
-                        template_peak_val=tmpl_p1_val, min_rel_to_template=sir_min_rel_to_template,
-                        t_min=resp_tmin, t_max=resp_tmax,
-                    )
-                else:
-                    pol1 = +1
-
-                # P2 detection near template P2
-                if not np.isnan(t_p2):
-                    idx_tmpl_p2 = int(np.argmin(np.abs(times - t_p2)))
-                    pol2 = np.sign(tmpl[idx_tmpl_p2] - np.mean(tmpl[baseline_mask]))
-                    pol2 = +1 if pol2 >= 0 else -1
-                    tmpl_p2_val = tmpl[idx_tmpl_p2]
-                    # P2 lives strictly after P1: clip the search floor to the P1
-                    # latency just found, so the global-max pick cannot wander into
-                    # the pre-P1 stretch. Window halved to ±6 ms now that it is
-                    # anchored on both sides.
-                    p2_floor = peak1_latency if not np.isnan(peak1_latency) else resp_tmin
-                    peak2_latency, peak2_value = detect_peak_in_window(
-                        sig_f=sig, times=times, sfreq=sfreq,
-                        baseline_mask=baseline_mask, t_center=t_p2,
-                        win_ms=6.0, polarity=pol2,
-                        amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
-                        choose="global",
-                        template_peak_val=tmpl_p2_val, min_rel_to_template=sir_min_rel_to_template,
-                        t_min=p2_floor, t_max=resp_tmax,
-                    )
-                else:
-                    pol2 = +1
-
-                # Refine on unfiltered signal
-                if not np.isnan(peak1_latency):
-                    peak1_latency, peak1_value = pick_epoch_value_near_latency(
-                        sig, times, peak1_latency, sfreq, win_ms=1.0, polarity=pol1,
-                    )
-                if not np.isnan(peak2_latency):
-                    peak2_latency, peak2_value = pick_epoch_value_near_latency(
-                        sig, times, peak2_latency, sfreq, win_ms=1.0, polarity=pol2,
-                    )
-
-                # Onset, once P1 is settled. On a pre-epoched export the baseline
-                # is a constant pad with no spread to threshold against, so the
-                # noise scale comes from the quiet tail of the curve and the
-                # search runs back from this curve's own P1 — hence after it.
-                if np.isfinite(t_on_tmpl) or np.isfinite(peak1_latency):
-                    onset_latency = detect_onset_near_template(
-                        sig, times, sfreq, baseline_mask, t_on_tmpl,
-                        win_ms=2, k=STIM_ONSET_K, sustain_ms=2,
-                        noise_std=noise_std_from_tail(sig, times, resp_tmax),
-                        p1_lat=peak1_latency, t_min=resp_tmin,
-                    )
-                    if np.isfinite(onset_latency) and not np.isfinite(peak1_latency):
-                        onset_latency = float(np.clip(
-                            onset_latency,
-                            float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
-                            float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
-                        ))
-
-                # Ordering / same-sign guards
-                if (not np.isnan(peak1_latency)) and (not np.isnan(peak2_latency)):
-                    if peak2_latency <= peak1_latency:
-                        peak2_latency = peak2_value = np.nan
-                if (not np.isnan(peak1_value)) and (not np.isnan(peak2_value)):
-                    if np.sign(peak1_value) == np.sign(peak2_value):
-                        peak2_latency = peak2_value = np.nan
-
-                # PTP
-                if (not np.isnan(peak1_value)) and (not np.isnan(peak2_value)):
-                    ptp_amp = float(np.abs(peak1_value - peak2_value))
-                else:
-                    ptp_amp = np.nan
-
-                # Amplitude / PTP thresholds → wipe
-                if (not np.isnan(ptp_amp)) and (ptp_amp < (STIM_PTP_MIN_UV * 1e-6)):
-                    onset_latency = peak1_latency = peak2_latency = np.nan
-                    peak1_value = peak2_value = ptp_amp = np.nan
-                if (not np.isnan(peak1_value)) and (np.abs(peak1_value) <= (STIM_P1_ABS_MIN_UV * 1e-6)):
-                    onset_latency = peak1_latency = peak2_latency = np.nan
-                    peak1_value = peak2_value = ptp_amp = np.nan
-                if np.isnan(peak1_value) and np.isnan(peak2_value):
-                    onset_latency = peak1_latency = peak2_latency = np.nan
-                    peak1_value = peak2_value = ptp_amp = np.nan
-                # Require all three markers (onset + P1 + P2); drop if any is missing.
-                # EXCEPTION: forced-polarity channels are near-monophasic — their companion
-                # opposite-polarity P2 is weak/unreliable — for them require only onset + P1.
-                _need_p2 = ch_name not in _forced_here
-                if sir_require_both_peaks and (
-                    np.isnan(onset_latency)
-                    or np.isnan(peak1_value)
-                    or (_need_p2 and np.isnan(peak2_value))
-                ):
-                    onset_latency = peak1_latency = peak2_latency = np.nan
-                    peak1_value = peak2_value = ptp_amp = np.nan
-
-                # Neurosoft scenarios: a detection is BOTH peaks. A lone P1
-                # (monophasic) or a P2 with no P1 is not a response — drop it whole,
-                # so nothing (amplitude, marker, count) rests on half a detection.
-                if neurosoft_scenario is not None and (
-                    np.isnan(peak1_value) or np.isnan(peak2_value)
-                ):
-                    onset_latency = peak1_latency = peak2_latency = np.nan
-                    peak1_value = peak2_value = ptp_amp = np.nan
-
-                channel_epoch_results[ch_name].append(
-                    {"ep": ep, "onset": onset_latency,
-                     "p1": peak1_latency, "p2": peak2_latency,
-                     "pv1": peak1_value, "pv2": peak2_value,
-                     "ptp": ptp_amp, "sig": sig}
-                )
-
-        # ── Drop small responses that do not look like this channel's own ──
-        n_misshapen = 0
-        for ch in eligible_channels:
-            entries = channel_epoch_results[ch]
-            if not entries:
-                continue
-            amps = np.array([
-                e["ptp"] if np.isfinite(e["ptp"]) else abs(e["pv1"]) for e in entries
-            ], dtype=float)
-            drop = small_misshapen_responses(
-                np.array([e["sig"] for e in entries], dtype=float), times,
-                np.array([e["p1"] for e in entries], dtype=float), amps,
-                rel_amp_max=STIM_SHAPE_REL_AMP_MAX, min_corr=STIM_SHAPE_MIN_CORR,
-                min_snr=STIM_SHAPE_MIN_SNR, noise_after_s=resp_tmax,
+        if use_net:
+            channel_epoch_results, eligible_channels = _network_channel_results(
+                epochs, data_epoched, art_set, configuration, detector=net_detector_dir,
+                model=net_model_dir, review=net_review,
             )
-            for e, bad in zip(entries, drop):
-                if bad:
-                    e["onset"] = e["p1"] = e["p2"] = np.nan
-                    e["pv1"] = e["pv2"] = e["ptp"] = e["area"] = np.nan
-                    n_misshapen += 1
-        if n_misshapen:
-            print(f"[SIR] {n_misshapen} small responses dropped as unlike their "
-                  f"channel's own shape.", flush=True)
+            tmpl_cfg: dict[str, np.ndarray | None] = {}
+            markers_cfg: dict[str, dict[str, float]] = {}
+            _forced_here: set[str] = set()
+            _explicit_pol: dict[str, dict] = {}
+        else:
+            # Use per-amp templates when enabled, else fall back to config-level.
+            if SIR_TEMPLATE_PER_AMPLITUDE and (configuration, stim_amp_raw) in amp_templates:
+                tmpl_cfg = dict(amp_templates[(configuration, stim_amp_raw)])
+                markers_cfg = dict(amp_template_markers[(configuration, stim_amp_raw)])
+            else:
+                tmpl_cfg = dict(config_templates.get(configuration, {}))
+                markers_cfg = dict(config_template_markers.get(configuration, {}))
+
+            if SIR_P1_DOMINANT:
+                # Redefine P1 = dominant response deflection, P2 = next opposite-polarity
+                # peak after it (per-file hack for lead-with-small-bump responses). Dominance
+                # is judged on this crop's ACTUAL epoch-mean waveform, not the synthesized
+                # template (whose relative peak sizes can differ).
+                _chname_to_idx = {c: i for i, c in enumerate(epochs.ch_names)}
+                for _ch, _tm in tmpl_cfg.items():
+                    if _tm is None or _ch not in markers_cfg or _ch not in _chname_to_idx:
+                        continue
+                    _mw = data_epoched[:, _chname_to_idx[_ch], :].mean(axis=0)
+                    _p1t, _p2t = _dominant_p1_p2(_mw, times, baseline_mask, resp_tmin, resp_tmax)
+                    if np.isfinite(_p1t):
+                        m = dict(markers_cfg[_ch]); m["p1"] = _p1t; m["p2"] = _p2t
+                        markers_cfg[_ch] = m
+
+            _forced_here: set[str] = set()   # channels force-polarised in THIS config
+            if SIR_FORCE_NEG_P1_AFTER or SIR_FORCE_POS_P1_AFTER:
+                # Per-file: force P1 = dominant deflection of a chosen polarity (>= min_lat),
+                # P2 = strongest opposite. Negative dict → red dip; positive dict → red peak.
+                # Dict keys may be a bare channel name (all configs) OR a (config, channel) tuple
+                # (that config only); a matching (config, channel) key overrides the bare key.
+                _c2i = {c: i for i, c in enumerate(epochs.ch_names)}
+                _specs: dict[str, tuple[float, bool]] = {}   # ch -> (min_lat, want_pos)
+                # Precedence (low→high): bare 'ch' | ('config','ch') | ('config','amp','ch').
+                for _src, _pos in [(SIR_FORCE_NEG_P1_AFTER, False), (SIR_FORCE_POS_P1_AFTER, True)]:
+                    for _key, _ml in _src.items():          # bare-channel keys
+                        if not isinstance(_key, tuple):
+                            _specs[_key] = (_ml, _pos)
+                    for _key, _ml in _src.items():          # (config, channel)
+                        if isinstance(_key, tuple) and len(_key) == 2 and _key[0] == configuration:
+                            _specs[_key[1]] = (_ml, _pos)
+                    for _key, _ml in _src.items():          # (config, amp, channel) — most specific
+                        if (isinstance(_key, tuple) and len(_key) == 3
+                                and _key[0] == configuration and _key[1] == stim_amp_raw):
+                            _specs[_key[2]] = (_ml, _pos)
+                for _ch, (_minlat, _pos) in _specs.items():
+                    if _ch not in _c2i:
+                        continue
+                    _maxlat = None
+                    if isinstance(_minlat, tuple):     # (min_lat, max_lat) → cap P1 search (early peak)
+                        _minlat, _maxlat = _minlat
+                    _mw = data_epoched[:, _c2i[_ch], :].mean(axis=0)
+                    _ont, _p1t, _p2t = _forced_p1_p2(_mw, times, baseline_mask, resp_tmin, resp_tmax, _minlat, want_pos=_pos, max_lat=_maxlat)
+                    if not np.isfinite(_p1t):
+                        continue
+                    m = dict(markers_cfg.get(_ch, {})); m["p1"] = _p1t; m["p2"] = _p2t
+                    m["onset"] = _ont if np.isfinite(_ont) else m.get("onset", np.nan)
+                    markers_cfg[_ch] = m
+                    # Use the actual epoch-mean as the template so per-epoch polarity/scaling match
+                    # the real response, AND so amps whose bank match failed (tmpl=None) still get a
+                    # forced template from their own mean instead of being dropped as ineligible.
+                    # Pure-noise low amps stay out via the median-corr / inter-trial gates.
+                    tmpl_cfg[_ch] = np.asarray(_mw, dtype=float)
+                    _forced_here.add(_ch)
+
+            # ── Explicit per-file markers (latency + polarity given by the user) ──
+            # Place P1/P2/onset at the given latencies and mark the channel for
+            # per-epoch sampling (see the force-from-template path in the epoch loop),
+            # regardless of whether the trial-mean shows the deflection.
+            _explicit_pol: dict[str, dict] = {}
+            if SIR_FORCE_MARKER_LAT:
+                _c2i2 = {c: i for i, c in enumerate(epochs.ch_names)}
+                for _key, _spec in SIR_FORCE_MARKER_LAT.items():
+                    if isinstance(_key, tuple) and len(_key) == 2 and _key[0] == configuration:
+                        _ch = _key[1]
+                    elif (isinstance(_key, tuple) and len(_key) == 3
+                          and _key[0] == configuration and _key[1] == stim_amp_raw):
+                        _ch = _key[2]
+                    else:
+                        continue
+                    if _ch not in _c2i2 or _ch in art_set:
+                        continue
+                    _p1 = _spec.get("p1")
+                    _p2 = _spec.get("p2")
+                    m = dict(markers_cfg.get(_ch, {}))
+                    m["onset"] = float(_spec["onset"]) if _spec.get("onset") is not None else np.nan
+                    m["p1"] = float(_p1[0]) if _p1 else np.nan
+                    m["p2"] = float(_p2[0]) if _p2 else np.nan
+                    markers_cfg[_ch] = m
+                    tmpl_cfg[_ch] = data_epoched[:, _c2i2[_ch], :].mean(axis=0)
+                    _explicit_pol[_ch] = {
+                        "p1": int(_p1[1]) if _p1 else 1,
+                        "p2": int(_p2[1]) if _p2 else 1,
+                    }
+                    _forced_here.add(_ch)
+
+            eligible_channels = [
+                ch for ch in epochs.ch_names
+                if ch not in art_set
+                and ch not in SIR_EXCLUDE_CHANNELS
+                and configuration not in SIR_EXCLUDE_CONFIGS
+                and tmpl_cfg.get(ch) is not None
+                and np.isfinite(markers_cfg.get(ch, {}).get("p1", np.nan))
+            ]
+            eligible_set = set(eligible_channels)
+
+            channel_epoch_results: dict[str, list[dict]] = {ch: [] for ch in eligible_channels}
+
+            for ep in range(len(epochs)):
+                for ch_idx, ch_name in enumerate(epochs.ch_names):
+                    if (ch_name in art_set) or (ch_name not in eligible_set):
+                        continue
+
+                    sig = data_epoched[ep, ch_idx, :]
+
+                    base = sig[baseline_mask]
+                    bstd = base.std()
+                    # A flat baseline means a dead channel on a continuous recording.
+                    # On a pre-cut curve export it means nothing: the baseline window
+                    # IS the station's constant pre-artifact pad, so it is flat by
+                    # construction, and whether np.std of a dozen identical floats
+                    # comes out as exactly 0 or as 1e-21 is decided by rounding. That
+                    # coin flip was discarding 276 of 800 epochs in one Zh14 file,
+                    # the largest responses among them. There, ask instead whether
+                    # the epoch carries any signal at all.
+                    epoch_is_flat = (
+                        float(np.std(sig)) == 0.0 if pre_epoched is not None
+                        else bstd == 0
+                    )
+                    if epoch_is_flat or np.isnan(bstd):
+                        channel_epoch_results[ch_name].append(
+                            {"ep": ep, "onset": np.nan, "p1": np.nan, "p2": np.nan,
+                             "pv1": np.nan, "pv2": np.nan, "ptp": np.nan, "sig": sig}
+                        )
+                        continue
+
+                    t_on_tmpl = markers_cfg[ch_name]["onset"]
+                    t_p1 = markers_cfg[ch_name]["p1"]
+                    t_p2 = markers_cfg[ch_name]["p2"]
+                    tmpl = tmpl_cfg[ch_name]
+
+                    # ── Force markers straight from the config template ──
+                    # On some channels (a dip riding the artifact-recovery ramp, a
+                    # near-flat P1) the per-epoch peak re-search below does not
+                    # converge, so a manually-placed marker vanishes. When the crop
+                    # is force-keyed, trust the template latencies the clinician set
+                    # on the mean and just sample THIS epoch's value at each — no
+                    # re-detection, no gates. Polarity comes from the template.
+                    _ex_pol = _explicit_pol.get(ch_name)
+                    if _ex_pol is not None or (configuration, stim_amp_raw, ch_name) in SIR_FORCE_KEYS:
+                        # Polarity: explicit if the user gave it, else the sign of the
+                        # template at that latency. Wider sample window for explicit
+                        # markers (single-sweep peaks jitter more than the mean).
+                        _win = 2.0 if _ex_pol is not None else 1.0
+
+                        def _pol_at(_t, _which):
+                            if _ex_pol is not None:
+                                return _ex_pol[_which]
+                            _i = int(np.argmin(np.abs(times - _t)))
+                            return +1 if (tmpl[_i] - np.mean(tmpl[baseline_mask])) >= 0 else -1
+                        _on = float(t_on_tmpl) if np.isfinite(t_on_tmpl) else np.nan
+                        _p1l, _p1v = (np.nan, np.nan)
+                        if np.isfinite(t_p1):
+                            _p1l, _p1v = pick_epoch_value_near_latency(
+                                sig, times, float(t_p1), sfreq, win_ms=_win, polarity=_pol_at(t_p1, "p1"))
+                        _p2l, _p2v = (np.nan, np.nan)
+                        if np.isfinite(t_p2):
+                            _p2l, _p2v = pick_epoch_value_near_latency(
+                                sig, times, float(t_p2), sfreq, win_ms=_win, polarity=_pol_at(t_p2, "p2"))
+                        _ptp = (float(np.abs(_p1v - _p2v))
+                                if (np.isfinite(_p1v) and np.isfinite(_p2v)) else np.nan)
+                        channel_epoch_results[ch_name].append(
+                            {"ep": ep, "onset": _on, "p1": _p1l, "p2": _p2l,
+                             "pv1": _p1v, "pv2": _p2v, "ptp": _ptp, "sig": sig}
+                        )
+                        continue
+
+                    onset_latency = np.nan
+                    peak1_latency = peak2_latency = np.nan
+                    peak1_value = peak2_value = np.nan
+
+                    # P1 detection near template P1
+                    if not np.isnan(t_p1):
+                        idx_tmpl_p1 = int(np.argmin(np.abs(times - t_p1)))
+                        pol1 = np.sign(tmpl[idx_tmpl_p1] - np.mean(tmpl[baseline_mask]))
+                        pol1 = +1 if pol1 >= 0 else -1
+                        tmpl_p1_val = tmpl[idx_tmpl_p1]
+                        peak1_latency, peak1_value = detect_peak_in_window(
+                            sig_f=sig, times=times, sfreq=sfreq,
+                            baseline_mask=baseline_mask, t_center=t_p1,
+                            win_ms=5.0, polarity=pol1,
+                            amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
+                            choose="global",
+                            template_peak_val=tmpl_p1_val, min_rel_to_template=sir_min_rel_to_template,
+                            t_min=resp_tmin, t_max=resp_tmax,
+                        )
+                    else:
+                        pol1 = +1
+
+                    # P2 detection near template P2
+                    if not np.isnan(t_p2):
+                        idx_tmpl_p2 = int(np.argmin(np.abs(times - t_p2)))
+                        pol2 = np.sign(tmpl[idx_tmpl_p2] - np.mean(tmpl[baseline_mask]))
+                        pol2 = +1 if pol2 >= 0 else -1
+                        tmpl_p2_val = tmpl[idx_tmpl_p2]
+                        # P2 lives strictly after P1: clip the search floor to the P1
+                        # latency just found, so the global-max pick cannot wander into
+                        # the pre-P1 stretch. Window halved to ±6 ms now that it is
+                        # anchored on both sides.
+                        p2_floor = peak1_latency if not np.isnan(peak1_latency) else resp_tmin
+                        peak2_latency, peak2_value = detect_peak_in_window(
+                            sig_f=sig, times=times, sfreq=sfreq,
+                            baseline_mask=baseline_mask, t_center=t_p2,
+                            win_ms=6.0, polarity=pol2,
+                            amp_min_uV=STIM_PEAK_AMP_MIN_UV, min_width_ms=0.4,
+                            choose="global",
+                            template_peak_val=tmpl_p2_val, min_rel_to_template=sir_min_rel_to_template,
+                            t_min=p2_floor, t_max=resp_tmax,
+                        )
+                    else:
+                        pol2 = +1
+
+                    # Refine on unfiltered signal
+                    if not np.isnan(peak1_latency):
+                        peak1_latency, peak1_value = pick_epoch_value_near_latency(
+                            sig, times, peak1_latency, sfreq, win_ms=1.0, polarity=pol1,
+                        )
+                    if not np.isnan(peak2_latency):
+                        peak2_latency, peak2_value = pick_epoch_value_near_latency(
+                            sig, times, peak2_latency, sfreq, win_ms=1.0, polarity=pol2,
+                        )
+
+                    # Onset, once P1 is settled. On a pre-epoched export the baseline
+                    # is a constant pad with no spread to threshold against, so the
+                    # noise scale comes from the quiet tail of the curve and the
+                    # search runs back from this curve's own P1 — hence after it.
+                    if np.isfinite(t_on_tmpl) or np.isfinite(peak1_latency):
+                        onset_latency = detect_onset_near_template(
+                            sig, times, sfreq, baseline_mask, t_on_tmpl,
+                            win_ms=2, k=STIM_ONSET_K, sustain_ms=2,
+                            noise_std=noise_std_from_tail(sig, times, resp_tmax),
+                            p1_lat=peak1_latency, t_min=resp_tmin,
+                        )
+                        if np.isfinite(onset_latency) and not np.isfinite(peak1_latency):
+                            onset_latency = float(np.clip(
+                                onset_latency,
+                                float(t_on_tmpl) - float(STIM_ONSET_MAX_DEV_S),
+                                float(t_on_tmpl) + float(STIM_ONSET_MAX_DEV_S),
+                            ))
+
+                    # Ordering / same-sign guards
+                    if (not np.isnan(peak1_latency)) and (not np.isnan(peak2_latency)):
+                        if peak2_latency <= peak1_latency:
+                            peak2_latency = peak2_value = np.nan
+                    if (not np.isnan(peak1_value)) and (not np.isnan(peak2_value)):
+                        if np.sign(peak1_value) == np.sign(peak2_value):
+                            peak2_latency = peak2_value = np.nan
+
+                    # PTP
+                    if (not np.isnan(peak1_value)) and (not np.isnan(peak2_value)):
+                        ptp_amp = float(np.abs(peak1_value - peak2_value))
+                    else:
+                        ptp_amp = np.nan
+
+                    # Amplitude / PTP thresholds → wipe
+                    if (not np.isnan(ptp_amp)) and (ptp_amp < (STIM_PTP_MIN_UV * 1e-6)):
+                        onset_latency = peak1_latency = peak2_latency = np.nan
+                        peak1_value = peak2_value = ptp_amp = np.nan
+                    if (not np.isnan(peak1_value)) and (np.abs(peak1_value) <= (STIM_P1_ABS_MIN_UV * 1e-6)):
+                        onset_latency = peak1_latency = peak2_latency = np.nan
+                        peak1_value = peak2_value = ptp_amp = np.nan
+                    if np.isnan(peak1_value) and np.isnan(peak2_value):
+                        onset_latency = peak1_latency = peak2_latency = np.nan
+                        peak1_value = peak2_value = ptp_amp = np.nan
+                    # Require all three markers (onset + P1 + P2); drop if any is missing.
+                    # EXCEPTION: forced-polarity channels are near-monophasic — their companion
+                    # opposite-polarity P2 is weak/unreliable — for them require only onset + P1.
+                    _need_p2 = ch_name not in _forced_here
+                    if sir_require_both_peaks and (
+                        np.isnan(onset_latency)
+                        or np.isnan(peak1_value)
+                        or (_need_p2 and np.isnan(peak2_value))
+                    ):
+                        onset_latency = peak1_latency = peak2_latency = np.nan
+                        peak1_value = peak2_value = ptp_amp = np.nan
+
+                    # Neurosoft scenarios: a detection is BOTH peaks. A lone P1
+                    # (monophasic) or a P2 with no P1 is not a response — drop it whole,
+                    # so nothing (amplitude, marker, count) rests on half a detection.
+                    if neurosoft_scenario is not None and (
+                        np.isnan(peak1_value) or np.isnan(peak2_value)
+                    ):
+                        onset_latency = peak1_latency = peak2_latency = np.nan
+                        peak1_value = peak2_value = ptp_amp = np.nan
+
+                    channel_epoch_results[ch_name].append(
+                        {"ep": ep, "onset": onset_latency,
+                         "p1": peak1_latency, "p2": peak2_latency,
+                         "pv1": peak1_value, "pv2": peak2_value,
+                         "ptp": ptp_amp, "sig": sig}
+                    )
+
+            # ── Drop small responses that do not look like this channel's own ──
+            n_misshapen = 0
+            for ch in eligible_channels:
+                entries = channel_epoch_results[ch]
+                if not entries:
+                    continue
+                amps = np.array([
+                    e["ptp"] if np.isfinite(e["ptp"]) else abs(e["pv1"]) for e in entries
+                ], dtype=float)
+                drop = small_misshapen_responses(
+                    np.array([e["sig"] for e in entries], dtype=float), times,
+                    np.array([e["p1"] for e in entries], dtype=float), amps,
+                    rel_amp_max=STIM_SHAPE_REL_AMP_MAX, min_corr=STIM_SHAPE_MIN_CORR,
+                    min_snr=STIM_SHAPE_MIN_SNR, noise_after_s=resp_tmax,
+                )
+                for e, bad in zip(entries, drop):
+                    if bad:
+                        e["onset"] = e["p1"] = e["p2"] = np.nan
+                        e["pv1"] = e["pv2"] = e["ptp"] = e["area"] = np.nan
+                        n_misshapen += 1
+            if n_misshapen:
+                print(f"[SIR] {n_misshapen} small responses dropped as unlike their "
+                      f"channel's own shape.", flush=True)
 
         # ── Onsets: one per curve, where its response leaves the isoline ──
         # Only for the pre-epoched exports, which have no pre-stimulus baseline to
@@ -4212,10 +4397,12 @@ def _run_pipeline(
         channel_inter_trial_corr: dict[str, float] = {}
         for ch in eligible_channels:
             entries = channel_epoch_results[ch]
-            tmpl = tmpl_cfg[ch]
+            # None on a run detected by the network: it is given no template.
+            tmpl = tmpl_cfg.get(ch)
 
             sim_mask = (times >= resp_tmin) & (times <= resp_tmax)
-            tmpl_seg = tmpl[sim_mask] - np.mean(tmpl[baseline_mask])
+            tmpl_seg = (tmpl[sim_mask] - np.mean(tmpl[baseline_mask])
+                        if tmpl is not None else None)
 
             corrs = []
             valid_flags = []
@@ -4239,6 +4426,8 @@ def _run_pipeline(
                 sig_ep = data_epoched[e["ep"], ch_idx_for_itc, :]
                 seg = sig_ep[sim_mask] - np.mean(sig_ep[baseline_mask])
                 ep_resp_segs.append(seg)
+                if tmpl_seg is None:
+                    continue
                 if np.std(seg) == 0 or np.std(tmpl_seg) == 0:
                     corrs.append(0.0)
                 else:
@@ -4263,52 +4452,71 @@ def _run_pipeline(
                 inter_trial_corr = 0.0
             channel_inter_trial_corr[ch] = inter_trial_corr
 
-            valid_fraction = np.mean(valid_flags) if valid_flags else 0.0
-            median_corr = float(np.median(corrs)) if corrs else 0.0
-
-            artifact_like_channel = False
-            if STIM_EPOCH_ARTIFACT_CORR_REJECTION:
-                ch_idx = epochs.ch_names.index(ch)
-                ch_mean = np.asarray(np.mean(data_epoched[:, ch_idx, :], axis=0), dtype=float)
-                ch_centered = ch_mean - np.mean(ch_mean)
-                if float(np.std(ch_centered)) > 0:
-                    for _art_ch, art_mean in artifact_mean_by_ch.items():
-                        art_centered = art_mean - np.mean(art_mean)
-                        if float(np.std(art_centered)) <= 0:
-                            continue
-                        corr = float(np.corrcoef(ch_centered, art_centered)[0, 1])
-                        if not np.isnan(corr) and abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
-                            artifact_like_channel = True
-                            break
-
-            low_median_corr = (median_corr < corr_min_median)
-            low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
-            borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
-            low_inter_trial_corr = (
-                STIM_MIN_INTER_TRIAL_CORR is not None
-                and inter_trial_corr < float(STIM_MIN_INTER_TRIAL_CORR)
-            )
-            # Hard gate: drop the channel unless most epochs carry a detection.
-            hard_low_valid = (
-                sir_hard_min_valid_frac > 0.0
-                and valid_fraction < sir_hard_min_valid_frac
-            )
             # Manual per-file suppression for known false positives on specific crops.
             manually_suppressed = (configuration, stim_amp_raw, ch) in SIR_SUPPRESS_KEYS
-            # Whitelist: named crops bypass the consistency gates (weak but genuine responses).
-            # Explicit-marker channels are always kept — the user placed them by hand.
-            force_kept = (configuration, stim_amp_raw, ch) in SIR_FORCE_KEYS or ch in _explicit_pol
-            if manually_suppressed or (not force_kept and (
-                artifact_like_channel
-                or low_median_corr
-                or low_valid_low_corr
-                or borderline_valid_very_low_corr
-                or low_inter_trial_corr
-                or hard_low_valid
-            )):
+            if use_net:
+                # The network has no channel gates: it keeps or drops each curve on
+                # its own, by p(response) and the doctors' criteria. A suppression
+                # made by hand still applies.
+                wipe = manually_suppressed
+            else:
+                valid_fraction = np.mean(valid_flags) if valid_flags else 0.0
+                median_corr = float(np.median(corrs)) if corrs else 0.0
+
+                artifact_like_channel = False
+                if STIM_EPOCH_ARTIFACT_CORR_REJECTION:
+                    ch_idx = epochs.ch_names.index(ch)
+                    ch_mean = np.asarray(np.mean(data_epoched[:, ch_idx, :], axis=0), dtype=float)
+                    ch_centered = ch_mean - np.mean(ch_mean)
+                    if float(np.std(ch_centered)) > 0:
+                        for _art_ch, art_mean in artifact_mean_by_ch.items():
+                            art_centered = art_mean - np.mean(art_mean)
+                            if float(np.std(art_centered)) <= 0:
+                                continue
+                            corr = float(np.corrcoef(ch_centered, art_centered)[0, 1])
+                            if not np.isnan(corr) and abs(corr) >= float(STIM_EPOCH_ARTIFACT_ABS_CORR_THR):
+                                artifact_like_channel = True
+                                break
+
+                low_median_corr = (median_corr < corr_min_median)
+                low_valid_low_corr = (valid_fraction < min_valid_frac) and (median_corr < corr_min_median)
+                borderline_valid_very_low_corr = (valid_fraction < 0.6) and (median_corr < 0.2)
+                low_inter_trial_corr = (
+                    STIM_MIN_INTER_TRIAL_CORR is not None
+                    and inter_trial_corr < float(STIM_MIN_INTER_TRIAL_CORR)
+                )
+                # Hard gate: drop the channel unless most epochs carry a detection.
+                hard_low_valid = (
+                    sir_hard_min_valid_frac > 0.0
+                    and valid_fraction < sir_hard_min_valid_frac
+                )
+                # Whitelist: named crops bypass the consistency gates (weak but genuine responses).
+                # Explicit-marker channels are always kept — the user placed them by hand.
+                force_kept = (configuration, stim_amp_raw, ch) in SIR_FORCE_KEYS or ch in _explicit_pol
+                wipe = manually_suppressed or (not force_kept and (
+                    artifact_like_channel
+                    or low_median_corr
+                    or low_valid_low_corr
+                    or borderline_valid_very_low_corr
+                    or low_inter_trial_corr
+                    or hard_low_valid
+                ))
+            if wipe:
                 for e in entries:
                     e["onset"] = e["p1"] = e["p2"] = np.nan
                     e["pv1"] = e["pv2"] = e["ptp"] = e["area"] = np.nan
+            # An H-reflex run re-measures M and H from scratch (src/hreflex.py), so a
+            # confidence in this single-response pass would describe numbers that are
+            # about to be replaced.
+            if not use_net and neurosoft_scenario != HREFLEX:
+                _template_review(
+                    entries, tmpl, markers_cfg.get(ch, {}), times,
+                    min_corr=TEMPLATE_REVIEW_MIN_CORR, missed_corr=TEMPLATE_REVIEW_MISSED_CORR,
+                )
+            # A channel taken away by hand has been looked at already.
+            if manually_suppressed:
+                for e in entries:
+                    e["low_conf"], e["low_conf_reasons"] = False, ""
 
             for e in entries:
                 latency_markers[ch].append(
@@ -4327,6 +4535,13 @@ def _run_pipeline(
                 results["PTP amplitude"].append(e["ptp"])
                 results.setdefault("Response area", []).append(e.get("area", np.nan))
                 results["Inter-trial corr"].append(inter_trial_corr)
+                # Which detector answered, how sure it is, and why not when it is not.
+                results.setdefault("Detector", []).append(detector_used)
+                results.setdefault("Low confidence", []).append(bool(e.get("low_conf", False)))
+                results.setdefault("Low confidence reasons", []).append(
+                    e.get("low_conf_reasons", ""))
+                for col, key in CONFIDENCE_COLUMNS[detector_used]:
+                    results.setdefault(col, []).append(e.get(key, np.nan))
 
         base_name = file_name.split(".fif")[0]
         # Neurosoft curves are single stimuli of growing intensity, so the panel

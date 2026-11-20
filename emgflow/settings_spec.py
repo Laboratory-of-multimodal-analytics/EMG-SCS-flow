@@ -78,6 +78,46 @@ SHARED: list[Lever] = [
 ]
 
 # --------------------------------------------------------------------------- #
+# Detector (stimulation-induced mode): first on the Settings tab, since it
+# decides which of the groups below apply at all
+# --------------------------------------------------------------------------- #
+DETECTION: list[Lever] = [
+    Lever("DETECTOR", "Detector", "choice", "unet", "Detector", "sir", "global",
+          "unet — the EMG-SCS-detector network (model unet_mix), the default. "
+          "templates — the template bank and the per-epoch peak search; the Templates (PASS1), "
+          "Gates (PASS2) and Markers groups below act on it only. "
+          "Everything else (onsets, areas, tables, plots, corrections) is the same for both. "
+          "The network runs where it was trained: Neurosoft curve exports of recruitment, "
+          "Jendrassik and paired-stimulation runs. Any other recording falls back to templates "
+          "and the log says why.",
+          ("unet", "templates")),
+    Lever("UNET_REVIEW_SPREAD_MS", "Network: P1 SD across nets (ms)", "opt_float", 2.0,
+          "Low-confidence curves", "sir", "global",
+          "A curve with a response is shown for checking when the ensemble's nets place P1 with "
+          "a larger SD than this (P2 is not checked: UNET_REVIEW_SPREAD_PEAKS). Empty = off."),
+    Lever("UNET_REVIEW_RIVAL_RATIO", "Network: second wave on the P1 heatmap", "opt_float", 0.8,
+          "Low-confidence curves", "sir", "global",
+          "...or when the P1 heatmap has a second vertex at least this high relative to the "
+          "first (two candidate waves; P2 is not checked: UNET_REVIEW_RIVAL_PEAKS). Empty = off."),
+    Lever("UNET_REVIEW_P_MARGIN", "Network: p(response) near threshold", "opt_float", None,
+          "Low-confidence curves", "sir", "global",
+          "Doubt about the response itself, off by default (empty): also list curves whose "
+          "p(response) is within this distance of the model's threshold, e.g. 0.1."),
+    Lever("UNET_REVIEW_CRITERIA", "Network: criteria failed", "bool", False,
+          "Low-confidence curves", "sir", "global",
+          "Doubt about the response itself, off by default: also list curves the network saw a "
+          "response on whose peaks then failed the doctors' criteria."),
+    Lever("TEMPLATE_REVIEW_MIN_CORR", "Templates: found, correlation below", "opt_float", 0.5,
+          "Low-confidence curves", "sir", "global",
+          "A detected response is shown for checking when its correlation with the template it "
+          "was found with (over the template's response) is below this. Empty = off."),
+    Lever("TEMPLATE_REVIEW_MISSED_CORR", "Templates: not found, correlation from", "opt_float", 0.7,
+          "Low-confidence curves", "sir", "global",
+          "...and a curve with no detection when its correlation with the template is at least "
+          "this: a response the gates may have lost. Empty = off."),
+]
+
+# --------------------------------------------------------------------------- #
 # SIR (stimulation-induced) mode
 # --------------------------------------------------------------------------- #
 SIR: list[Lever] = [
@@ -273,7 +313,8 @@ def _synced_with_constants(levers: list[Lever]) -> list[Lever]:
     return out
 
 
-ALL_LEVERS: list[Lever] = _synced_with_constants(SHARED + SIR + STARTSTOP + SPONTANEOUS)
+ALL_LEVERS: list[Lever] = _synced_with_constants(
+    DETECTION + SHARED + SIR + STARTSTOP + SPONTANEOUS)
 BY_NAME: dict[str, Lever] = {lv.name: lv for lv in ALL_LEVERS}
 
 # Imported by pipeline.py but never read — exposing them as controls would be a lie.

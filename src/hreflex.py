@@ -76,7 +76,7 @@ from .detection import (
     onsets_anchored_to_channel, pick_epoch_value_near_latency,
     small_misshapen_responses,
 )
-from .io_utils import STIMULATION_INDUCED_FOLDER, ensure_dir, find_mode_dir
+from .io_utils import STIMULATION_INDUCED_FOLDER, ensure_dir, find_mode_dir, real_files
 
 #: The two components, in the order they appear on the curve.
 COMPONENTS = ("M", "H")
@@ -458,7 +458,7 @@ def load_epochs(output_root: Path):
     import mne
 
     base = _sir_dir(output_root) / "Stimulus-centered epochs"
-    files = sorted(base.glob("*-epo.fif"))
+    files = sorted(real_files(base.glob("*-epo.fif")))
     if not files:
         raise FileNotFoundError("No saved epochs — run the file once first.")
     return mne.read_epochs(files[0], preload=True, verbose="ERROR")

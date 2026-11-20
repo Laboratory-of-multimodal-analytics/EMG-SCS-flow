@@ -15,6 +15,8 @@ import mne
 import numpy as np
 import pandas as pd
 
+from src.io_utils import real_files
+
 SIR_DIR = "Stimulation-induced responses"
 SS_DIR = "StartStop analysis"
 COND_DIR = "Condition test"
@@ -54,6 +56,16 @@ METRIC_COLS = [
     "Onset latency", "Peak1 latency", "Peak2 latency",
     "Peak1 value", "Peak2 value", "PTP amplitude",
 ]
+
+
+def _truthy(v) -> bool:
+    """A flag read back from CSV: True/False, 1/0 or their text."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    try:
+        return bool(v) and not (isinstance(v, float) and np.isnan(v))
+    except Exception:
+        return False
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -142,17 +154,17 @@ def detect_mode(root: Path) -> str | None:
     cond = mode_dir(root, COND_DIR)
     cond_wf = cond / "Waterfall"
     if (cond / "Excel" / "condition_summary.csv").exists() or (
-            cond_wf.exists() and any(cond_wf.glob("*.png"))):
+            cond_wf.exists() and any(real_files(cond_wf.glob("*.png")))):
         return "condition"
 
     sir = mode_dir(root, SIR_DIR)
     sir_epochs = sir / "Stimulus-centered epochs"
-    if (sir_epochs.exists() and any(sir_epochs.glob("*-epo.fif"))):
+    if (sir_epochs.exists() and any(real_files(sir_epochs.glob("*-epo.fif")))):
         return "sir"
 
     ss = mode_dir(root, SS_DIR)
     ss_raw = ss / "Detections raw"
-    if (ss_raw.exists() and any(ss_raw.glob("*.fif"))):
+    if (ss_raw.exists() and any(real_files(ss_raw.glob("*.fif")))):
         return "startstop"
     # A StartStop run that detected nothing writes no annotated .fif; its channel
     # QC table and the spontaneous-EMG analysis are there regardless.
@@ -242,7 +254,7 @@ def _describe(root: Path, mode: str) -> ProcessedRun:
         pattern = "*.fif"
         csv = base / "Excel" / "Large_dataset_emg_response_metrics.csv"
 
-    n_items = len(list(items.glob(pattern))) if items.exists() else 0
+    n_items = len(real_files(items.glob(pattern))) if items.exists() else 0
     if mode == "condition" and csv.exists():
         try:
             n_items = int(pd.read_csv(csv)["Condition (ISI ms)"].nunique())
@@ -303,7 +315,7 @@ class SIRResults:
         self.metrics = _read_csv(self.results_dir / "Excel" / "Large_dataset_emg_response_metrics.csv")
         self.crops: list[Crop] = []
         epochs_dir = self.results_dir / "Stimulus-centered epochs"
-        for f in sorted(epochs_dir.glob("*-epo.fif")):
+        for f in sorted(real_files(epochs_dir.glob("*-epo.fif"))):
             parsed = _parse_crop_stem(f.stem)
             if parsed:
                 self.crops.append(Crop(parsed[0], parsed[1], f))
@@ -318,7 +330,7 @@ class SIRResults:
         if not d.exists():
             d = self.root / "data"
         for pattern in ("*_preprocessed_raw.fif", "*_original_raw.fif"):
-            hits = sorted(d.glob(pattern))
+            hits = sorted(real_files(d.glob(pattern)))
             if hits:
                 return hits[0]
         return None
@@ -520,6 +532,18 @@ class SIRResults:
         epochs = self.load_epochs(crop)
         data = epochs.get_data(picks=[channel])[:, 0, :] * 1e6
         return epochs.times, data.mean(axis=0)
+
+    @property
+    def detector(self) -> str:
+        """Which detector produced this run: "unet" or "templates".
+
+        From the metrics' ``Detector`` column; a run made before the column existed
+        was detected by the templates, the only detector there was.
+        """
+        if self.metrics.empty or "Detector" not in self.metrics.columns:
+            return "templates"
+        vals = self.metrics["Detector"].dropna().astype(str).unique().tolist()
+        return vals[0] if len(vals) == 1 else "/".join(sorted(vals))
 
     # ------------------------------------------------------------------ #
     # Neurosoft curve exports
@@ -792,6 +816,13 @@ class SIRResults:
             "p2_ms": pd.to_numeric(sub.get("Peak2 latency"), errors="coerce") * 1e3,
             "area_uvms": (pd.to_numeric(sub["Response area"], errors="coerce") * 1e9
                           if "Response area" in sub.columns else np.nan),
+            # The detector's own doubt about the curve (src/pipeline.py). A run made
+            # before the detectors flagged anything has neither column: no curve
+            # is marked, rather than every one.
+            "low_conf": (sub["Low confidence"].map(_truthy)
+                         if "Low confidence" in sub.columns else False),
+            "low_conf_reasons": (sub["Low confidence reasons"].fillna("").astype(str)
+                                 if "Low confidence reasons" in sub.columns else ""),
         })
         return out.sort_values(["Channel", "curve"])
 
@@ -822,7 +853,7 @@ class StartStopResults:
         self.discarded = _read_csv(self.results_dir / "Excel" / "STARTSTOP_template_anchor_discarded.csv")
 
         self.raw_paths: dict[str, Path] = {}
-        for f in sorted((self.results_dir / "Detections raw").glob("*_detections_raw.fif")):
+        for f in sorted(real_files((self.results_dir / "Detections raw").glob("*_detections_raw.fif"))):
             self.raw_paths[f.stem.replace("_detections_raw", "")] = f
         self._raw_cache: dict[str, mne.io.BaseRaw] = {}
 
@@ -901,7 +932,7 @@ class SpontaneousResults:
 
     def envelope_files(self, condition: str) -> list[Path]:
         d = self.base / condition / "Envelopes"
-        return sorted(d.glob("*.txt")) if d.exists() else []
+        return sorted(real_files(d.glob("*.txt"))) if d.exists() else []
 
     def envelopes_on_segment(self, condition: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         """Per-channel RMS envelopes placed back on the segment's own timeline.

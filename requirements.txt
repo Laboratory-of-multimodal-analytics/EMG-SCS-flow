@@ -14,3 +14,8 @@ xlsxwriter>=3.0
 
 # Interactive toolbox (python -m emgflow); not needed for the scripted pipeline
 PySide6>=6.5,<7
+
+# The network detector (DETECTOR = "unet", the default), together with a checkout of
+# EMG-SCS-detector (see README, "Detectors"). Without it the run falls back to the
+# template detector and says so in the log.
+torch>=2.5,<3
