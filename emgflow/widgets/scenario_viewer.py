@@ -39,10 +39,12 @@ from src.plotting import SWEEP_CMAP
 from src.recruitment import choose_n_groups, cluster_amplitudes
 from matplotlib.widgets import SpanSelector
 
-from src.sir_review import (FALSE, MARKERS, MISSED, WINDOW, curve_mark, load_overrides,
-                            mark_curve, mark_key, recompute_corrections, save_overrides)
+from src.sir_review import (CURVE_MARKERS, FALSE, HAND, MARKERS, MISSED, WINDOW, curve_mark,
+                            curve_markers, load_overrides, mark_curve, mark_key,
+                            recompute_corrections, save_overrides, set_curve_markers)
 
 from ..templates import build_template
+from .curve_peak_editor import FALSE as EDITOR_FALSE, CurvePeakEditor
 from .template_editor import HREFLEX_MARKERS, TemplateEditor
 
 from ..results import SIRResults
@@ -198,6 +200,24 @@ class ScenarioViewer(QWidget):
         self.channel_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.channel_list.currentTextChanged.connect(self._on_channel)
 
+        # Curves the detector itself is unsure about (the `Low confidence` column):
+        # the network's doubt (its nets disagree, two candidate waves, p at the
+        # threshold, criteria failed) or, for templates, a detection unlike its
+        # template or a curve like the template with nothing detected on it.
+        # One click brings the curve up below.
+        self.review_title = QLabel("<b>Проверить: низкая уверенность</b>")
+        self.review_title.setToolTip(
+            "Кривые, в которых детектор не уверен, с причиной.\n"
+            "Клик — показать кривую и открыть окно, где пики ставятся вручную.")
+        self.review_only_channel = QCheckBox("только выбранный канал")
+        self.review_only_channel.toggled.connect(lambda _: self._fill_review_list())
+        self.review_list = QListWidget()
+        self.review_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.review_list.setMaximumHeight(170)
+        # One signal only: a double click also fires itemActivated, which would open
+        # the peak editor a second time as soon as the first one closes.
+        self.review_list.itemClicked.connect(self._on_review_item)
+
         # A Neurosoft export is one crop, so this stayed hidden there. Every other
         # stimulation-induced run has a ramp PER configuration, and they are not
         # comparable to each other — different electrodes, different thresholds —
@@ -249,6 +269,7 @@ class ScenarioViewer(QWidget):
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider)
         self.curve_label = QLabel("curve: —")
+        self.curve_label.setWordWrap(True)
 
         # H-reflex only: which of the two responses a correction applies to. A
         # mark almost never applies to both — the reflex is spurious on a curve
@@ -275,6 +296,11 @@ class ScenarioViewer(QWidget):
             "на которых сходятся принятые кривые этого канала."
         )
         self.btn_missed.clicked.connect(lambda: self._mark(MISSED))
+        self.btn_hand = QPushButton("Поставить пики вручную…")
+        self.btn_hand.setToolTip(
+            "Открыть выбранную кривую и поставить onset, P1 и P2 кликами.\n"
+            "Для кривых с низкой уверенностью окно открывается само по клику на точку.")
+        self.btn_hand.clicked.connect(self._open_peak_editor)
         self.btn_unmark = QPushButton("Снять пометку")
         self.btn_unmark.clicked.connect(lambda: self._mark(None))
         self.btn_window = QPushButton("Задать окно и маркеры")
@@ -306,6 +332,9 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.config_box)
         lv.addWidget(QLabel("<b>Channels</b>"))
         lv.addWidget(self.channel_list, 1)
+        lv.addWidget(self.review_title)
+        lv.addWidget(self.review_only_channel)
+        lv.addWidget(self.review_list)
         lv.addWidget(self.metric_box)
         lv.addWidget(self.color_box)
         lv.addWidget(self.show_all)
@@ -318,7 +347,7 @@ class ScenarioViewer(QWidget):
         lv.addWidget(self.component_label)
         lv.addWidget(self.component_box)
         lv.addWidget(QLabel("<b>Правка выбранной кривой</b>"))
-        for b in (self.btn_false, self.btn_missed, self.btn_unmark,
+        for b in (self.btn_false, self.btn_missed, self.btn_hand, self.btn_unmark,
                   self.btn_window, self.btn_apply):
             lv.addWidget(b)
         lv.addWidget(self.mark_label)
@@ -363,6 +392,7 @@ class ScenarioViewer(QWidget):
         self.channel_list.blockSignals(True)
         self.channel_list.clear()
         self.channel_list.blockSignals(False)
+        self._fill_review_list()
 
         # A run with no Neurosoft deliverable on disk is still a recruitment
         # sweep whenever its crops carry real amplitudes -- pigs, patients,
@@ -471,9 +501,12 @@ class ScenarioViewer(QWidget):
 
         n_points = len(next(iter(self.waves.values())))
         unit = "curves" if self.stim_axis == CURVE_AXIS else "amplitudes"
+        detector = {"unet": "network", "templates": "templates"}.get(
+            self.results.detector, self.results.detector)
         self.header.setText(
             f"<b>{label}</b><br><span style='color:gray'>{config}<br>"
-            f"{n_points} {unit} · {len(self.waves)} channels</span>"
+            f"{n_points} {unit} · {len(self.waves)} channels<br>"
+            f"detector: {detector}</span>"
         )
         # Per-curve corrections are keyed to a curve of a single crop. On the
         # amplitude axis a point is a whole crop with its own repeats, and its
@@ -481,10 +514,13 @@ class ScenarioViewer(QWidget):
         # amplitude, channel). Offering the buttons here would write marks that
         # name a curve number the crop does not have.
         editable = self.stim_axis == CURVE_AXIS
-        for b in (self.btn_false, self.btn_missed, self.btn_unmark, self.btn_apply):
+        for b in (self.btn_false, self.btn_missed, self.btn_hand, self.btn_unmark, self.btn_apply):
             b.setEnabled(editable)
             if not editable:
                 b.setToolTip("Правки для этого формата делаются во вкладке Crop review.")
+        # An H-reflex curve carries two responses; its hand markers are the six of
+        # "Задать окно и маркеры", per channel.
+        self.btn_hand.setEnabled(editable and not self.is_hreflex)
         self.color_box.blockSignals(True)
         self.color_box.setCurrentIndex(
             0 if SCENARIOS.get(self.scenario, (None, "curve order", None))[1]
@@ -515,6 +551,7 @@ class ScenarioViewer(QWidget):
             self.channel_list.setCurrentRow(0)   # fires _on_channel -> _draw
         else:
             self._blank("No channels.")
+        self._fill_review_list()
 
     @property
     def is_hreflex(self) -> bool:
@@ -588,7 +625,128 @@ class ScenarioViewer(QWidget):
         self.slider.setRange(1, max(n, 1))
         self.slider.setValue(1)
         self.slider.blockSignals(False)
+        if self.review_only_channel.isChecked():
+            self._fill_review_list()
         self._draw()
+
+    # ---- curves to check ---------------------------------------------- #
+    def _review_rows(self) -> pd.DataFrame:
+        """This configuration's low-confidence curves, channel by channel."""
+        g = self.by_curve
+        if (g is None or g.empty or "low_conf" not in g.columns or self.is_hreflex
+                or self.stim_axis != CURVE_AXIS):
+            return pd.DataFrame(columns=["Channel", "curve", "low_conf_reasons"])
+        g = g[g["low_conf"].astype(bool)]
+        if self.review_only_channel.isChecked() and self.channel:
+            g = g[g["Channel"] == self.channel]
+        # channels in their natural order (ch2 before ch10), curves along the sweep
+        keys = [(len(str(c)), str(c), int(k)) for c, k in zip(g["Channel"], g["curve"])]
+        return g.iloc[sorted(range(len(g)), key=keys.__getitem__)]
+
+    def _fill_review_list(self) -> None:
+        """List the curves the detector doubts, with its reason and any mark made since."""
+        self.review_list.blockSignals(True)
+        self.review_list.clear()
+        rows = self._review_rows()
+        shown = not (self.by_curve is None or self.is_hreflex or self.stim_axis != CURVE_AXIS)
+        for w in (self.review_title, self.review_only_channel, self.review_list):
+            w.setVisible(shown)
+        total = 0 if self.by_curve is None else len(self.by_curve)
+        n_all = (int(self.by_curve["low_conf"].astype(bool).sum())
+                 if shown and self.by_curve is not None and "low_conf" in self.by_curve.columns
+                 else 0)
+        self.review_title.setText(
+            f"<b>Проверить: низкая уверенность</b> ({n_all} из {total})" if total
+            else "<b>Проверить: низкая уверенность</b>")
+        word = {FALSE: "помечена: ложный", MISSED: "помечена: потерянный",
+                HAND: "пики вручную"}
+        for ch, cno, why in zip(rows["Channel"], rows["curve"], rows["low_conf_reasons"]):
+            mark = curve_mark(self.overrides, str(ch), int(cno))
+            text = f"{ch} · кривая {int(cno)}: {why or 'низкая уверенность'}"
+            item = QListWidgetItem(("✓ " if mark else "") + text
+                                   + (f" — {word[mark]}" if mark else ""))
+            item.setData(Qt.UserRole, (str(ch), int(cno)))
+            item.setToolTip(str(why).replace("; ", "\n"))
+            if mark:
+                item.setForeground(Qt.gray)
+            self.review_list.addItem(item)
+        if not len(rows) and shown:
+            item = QListWidgetItem("нет таких кривых" if n_all == 0
+                                   else "на этом канале нет таких кривых")
+            item.setFlags(Qt.NoItemFlags)
+            self.review_list.addItem(item)
+        self.review_list.blockSignals(False)
+
+    def _on_review_item(self, item) -> None:
+        """Bring the doubted curve up: its channel, then the curve itself."""
+        data = item.data(Qt.UserRole) if item is not None else None
+        if not data:
+            return
+        ch, cno = data
+        if ch != self.channel:
+            rows = [self.channel_list.item(i).text() for i in range(self.channel_list.count())]
+            if ch not in rows:
+                return
+            self.channel_list.setCurrentRow(rows.index(ch))   # resets the selection
+        self.selected_curve = int(cno)
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(cno))
+        self.slider.blockSignals(False)
+        self._draw()
+        self._open_peak_editor()
+
+    def _is_doubted(self, ch: str | None, cno: int) -> bool:
+        """Whether the detector flagged this curve (and the surface can correct it)."""
+        g = self.by_curve
+        if (not ch or g is None or g.empty or "low_conf" not in g.columns or self.is_hreflex
+                or self.stim_axis != CURVE_AXIS):
+            return False
+        row = g[(g["Channel"] == ch) & (g["curve"] == int(cno))]
+        return bool(not row.empty and bool(row["low_conf"].iloc[0]))
+
+    def _open_peak_editor(self) -> None:
+        """Hand onset/P1/P2 for the selected curve, in a window of its own."""
+        ch, cno = self.channel, self.selected_curve
+        if (not ch or cno is None or self.root is None or ch not in self.waves
+                or self.is_hreflex or self.stim_axis != CURVE_AXIS):
+            self.mark_label.setText("Сначала выберите кривую — кликом по графику или слайдером.")
+            return
+        waves = self.waves[ch]
+        if not 0 < int(cno) <= len(waves):
+            return
+        g = self.by_curve[self.by_curve["Channel"] == ch] if self.by_curve is not None \
+            else pd.DataFrame()
+        row = g[g["curve"] == int(cno)]
+        # Where the markers start: this curve's hand markers, else what the detector
+        # placed on it, else where the channel's responses have theirs.
+        start = dict(curve_markers(self.overrides, ch, int(cno)) or {})
+        if not start:
+            for key, col in (("onset", "onset_ms"), ("p1", "p1_ms"), ("p2", "p2_ms")):
+                v = float(row[col].iloc[0]) if not row.empty and col in row.columns else np.nan
+                if not np.isfinite(v) and col in g.columns and g[col].notna().any():
+                    v = float(g[col].median())
+                start[key] = v if np.isfinite(v) else None
+        note = ""
+        if not row.empty and "low_conf" in row.columns and bool(row["low_conf"].iloc[0]):
+            note = "Детектор не уверен: " + str(row["low_conf_reasons"].iloc[0] or "")
+        others = np.delete(np.asarray(waves), int(cno) - 1, axis=0)
+        dlg = CurvePeakEditor(np.asarray(self.times) * 1e3, np.asarray(waves[int(cno) - 1]),
+                              others, start, f"{ch} · кривая {int(cno)}", note=note, parent=self)
+        if not dlg.exec():
+            return
+        if dlg.result_kind == EDITOR_FALSE:
+            self.overrides = mark_curve(self.overrides, ch, int(cno), FALSE)
+            done = "помечена как ложный ответ"
+        else:
+            self.overrides = set_curve_markers(self.overrides, ch, int(cno), dlg.markers_ms())
+            done = "пики сохранены"
+        save_overrides(self.root, self.overrides)
+        self._refresh_mark_label()
+        self._fill_review_list()
+        self._draw()
+        self.mark_label.setText(
+            self.mark_label.text() + f"<br><b>{ch}, кривая {int(cno)}: {done}.</b> "
+            "Применится по кнопке «Пересчитать по правкам».")
 
     def _fill_trial_box(self, ch: str) -> None:
         """Re-list this channel's trials. Channels differ in how many they have."""
@@ -652,6 +810,9 @@ class ScenarioViewer(QWidget):
         self.slider.setValue(nearest)
         self.slider.blockSignals(False)
         self._draw()
+        # A point the detector doubts is one to correct: open it straight away.
+        if self._is_doubted(self.channel, nearest):
+            self._open_peak_editor()
 
     # ------------------------------------------------------------------ #
     def _blank(self, text: str) -> None:
@@ -1134,6 +1295,26 @@ class ScenarioViewer(QWidget):
                 if np.isfinite(y):
                     ax_top.plot([xs[j]], [y], "o", ms=10, mfc="none", mec="#2ca02c",
                                 mew=2, zorder=6)
+        # Curves with hand-placed peaks: a black diamond, visible before recomputing.
+        for key in (per_ch.get(CURVE_MARKERS) or {}):
+            cno = int(key)
+            if cno in set(curves.tolist()):
+                j = list(curves).index(cno)
+                y = amps[j] if got[j] else shown[j]
+                if np.isfinite(y):
+                    ax_top.plot([xs[j]], [y], "D", ms=8, mfc="none", mec="black",
+                                mew=1.6, zorder=6)
+        # Curves the detector doubts: a hollow violet square, so they can be
+        # found on the curve before being opened from the list.
+        if "low_conf" in g.columns and self.stim_axis == CURVE_AXIS:
+            doubt = g["low_conf"].astype(bool).to_numpy()
+            ys = np.where(got, amps, shown)
+            m = doubt & np.isfinite(ys)
+            if m.any():
+                ax_top.plot(xs[m], ys[m], "s", ls="none", ms=9, mfc="none", mec="#7b3294",
+                            mew=1.4, zorder=5, label=f"низкая уверенность (n={int(doubt.sum())})")
+                n_labels = len(ax_top.get_legend_handles_labels()[1])
+                ax_top.legend(fontsize=7, frameon=False, ncol=min(4, max(1, n_labels)))
         if self.selected_curve is not None and self.selected_curve in set(curves.tolist()):
             j = list(curves).index(self.selected_curve)
             ax_top.axvline(xs[j], color="#ffb703", lw=1.2, zorder=1)
@@ -1223,6 +1404,14 @@ class ScenarioViewer(QWidget):
                 if self._use_area():
                     self._shade_area(ax_bot, t_ms, sel, row.iloc[0], "", TEXT_CURVES_RESP_TMAX,
                                      "#c51b7d")
+            # Hand markers saved but not yet applied: hollow diamonds where they will go.
+            hand = curve_markers(self.overrides, ch, int(self.selected_curve)) or {}
+            for key, colour in (("onset", "tab:blue"), ("p1", "red"), ("p2", "tab:green")):
+                v = hand.get(key)
+                if v is not None and np.isfinite(v):
+                    idx = int(np.argmin(np.abs(t_ms - float(v))))
+                    ax_bot.plot([float(v)], [sel[idx]], "D", mfc="none", mec=colour,
+                                mew=1.8, ms=10, zorder=7)
             if not row.empty and np.isfinite(row["amp_uv"].iloc[0]):
                 area = row["area_uvms"].iloc[0] if "area_uvms" in row.columns else np.nan
                 self.curve_label.setText(
@@ -1231,6 +1420,11 @@ class ScenarioViewer(QWidget):
             else:
                 self.curve_label.setText(
                     f"curve: {self.selected_curve} · ответ не найден")
+            if not row.empty and "low_conf" in row.columns and bool(row["low_conf"].iloc[0]):
+                why = str(row["low_conf_reasons"].iloc[0] or "низкая уверенность")
+                self.curve_label.setText(
+                    self.curve_label.text() + "<br><span style='color:#7b3294'>проверить: "
+                    + why.replace("; ", "<br>") + "</span>")
         else:
             self.curve_label.setText("curve: —")
         self._refresh_mark_label()
@@ -1373,6 +1567,7 @@ class ScenarioViewer(QWidget):
                                     component=self.component() if self.is_hreflex else None)
         save_overrides(self.root, self.overrides)
         self._refresh_mark_label()
+        self._fill_review_list()
         self._draw()
 
     def _refresh_mark_label(self) -> None:
@@ -1381,7 +1576,8 @@ class ScenarioViewer(QWidget):
         cur = curve_mark(self.overrides, self.channel or "",
                          int(self.selected_curve or -1),
                          component=self.component() if self.is_hreflex else None)
-        word = {FALSE: "ложный", MISSED: "потерянный"}.get(cur, "нет пометки")
+        word = {FALSE: "ложный", MISSED: "потерянный",
+                HAND: "пики вручную"}.get(cur, "нет пометки")
         total = 0
         bits = []
         for comp in comps:
@@ -1393,6 +1589,10 @@ class ScenarioViewer(QWidget):
             for v in self.overrides.values():
                 total += len(v.get(mark_key(FALSE, comp), []))
                 total += len(v.get(mark_key(MISSED, comp), []))
+        hand_curves = sorted(int(k) for k in (per_ch.get(CURVE_MARKERS) or {}))
+        if hand_curves:
+            bits.append(f"пики вручную: {', '.join(map(str, hand_curves))}")
+        total += sum(len(v.get(CURVE_MARKERS) or {}) for v in self.overrides.values())
         head = (f"{self.component()}, кривая {self.selected_curve}" if self.is_hreflex
                 else f"кривая {self.selected_curve}")
         txt = f"{head}: <b>{word}</b>"

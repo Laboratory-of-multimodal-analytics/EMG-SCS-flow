@@ -355,3 +355,67 @@ STIM_MIN_INTER_TRIAL_CORR = 0.7
 STIM_CHANNEL_MIN_MEDIAN_CORR = 0.5
 # Minimum fraction of epochs with a valid p1 — channel-level rejection gate.
 STIM_CHANNEL_MIN_VALID_FRAC = 0.3
+
+# ── Detector (stimulation-induced mode) ──────────────────────────────────────
+# Which detector decides, per curve and channel, whether there is a response and
+# where its P1 and P2 are:
+#   "unet"      - the EMG-SCS-detector network (src/unet_detector.py): p(response)
+#                 from an ensemble of 1-D U-Nets, P1/P2 from its heatmaps, and the
+#                 doctors' five criteria on top;
+#   "templates" - the template bank (PASS 1) and the per-epoch peak search with its
+#                 gates (PASS 2), i.e. the SIR_TM_*, STIM_* and SIR_* settings.
+# Everything else is the same for both: epochs, onsets and areas, the metrics
+# table, plots, scenario deliverables and per-curve corrections.
+# The network runs only on what it was trained on: Neurosoft curve exports
+# (20 kHz, stimulus at t = 0, at least 60 ms) in the recruitment, Jendrassik and
+# paired-stimulation scenarios. Any other recording falls back to templates and
+# the run log says why; the `Detector` column of the metrics says which one ran.
+DETECTOR = "unet"
+# The EMG-SCS-detector checkout. Empty = the EMG_SCS_DETECTOR environment
+# variable, else a folder "EMG-SCS-detector" next to this repository.
+UNET_DETECTOR_DIR = ""
+# The model folder (config.json + nets/). Empty = <detector>/models/unet_mix.
+UNET_MODEL_DIR = ""
+
+# ── Low-confidence curves (for the doctor's visual check) ────────────────────
+# Each detector flags the curves it is unsure about; they are listed in the
+# scenario tab and marked `Low confidence` in the metrics, with the reason.
+#
+# Network: the doctor's queue of EMG-SCS-detector (post/queue.py), built from
+# the network's own doubt only. Whether there is a response is left to the
+# network (97.4 % right on validation), so by default only its doubt about WHERE
+# P1 is counts, and only on curves it answered "response": the spread of P1
+# across the nets and two waves on the P1 heatmap. On the network's
+# validation set (8 291 curves of three injured patients, 3 331 responses by the
+# network) that flags 467 curves — 5.6 % of all, 14.0 % of the network's
+# responses — and 34.3 % of them carry an error (17.0 % of all its responses do):
+# 85 of 219 P1 misses > 2 ms, 68 of 311 P2 misses > 2 ms and 56 of its 151 false
+# responses.
+# The three signs of doubt about the response itself are off by default.
+# p(response) within this distance of the model's threshold. None = off.
+UNET_REVIEW_P_MARGIN = None
+# Share of ensemble nets saying "response" strictly between these two. None = off.
+UNET_REVIEW_VOTE_SPLIT = None
+# SD of the peak latency across the ensemble nets above this (ms). None = off.
+UNET_REVIEW_SPREAD_MS = 2.0
+# ...for these peaks only. P2 is left out: where the nets disagree on P2 the
+# response is usually a polyphasic one whose second phase doctors themselves
+# place differently, so the curve is not worth a look on that account alone.
+UNET_REVIEW_SPREAD_PEAKS = ("P1",)
+# A second heatmap vertex at least this high relative to the first: two candidate
+# waves. None = off.
+UNET_REVIEW_RIVAL_RATIO = 0.80
+# ...on these peaks' heatmaps only; P2 is left out for the same reason as above.
+UNET_REVIEW_RIVAL_PEAKS = ("P1",)
+# The network says "response" but its peaks fail the doctors' criteria (and so
+# the curve ends up without a response). Off by default.
+UNET_REVIEW_CRITERIA = False
+#
+# Templates: the correlation of a curve with the template it was searched with,
+# over the template's own response (2 ms before its onset to 4 ms after its P2).
+# On the same validation the two rules below send 15 % of curves and catch 53 %
+# of the template detector's errors (most of which are missed responses).
+# A detected response correlating below this. None = off.
+TEMPLATE_REVIEW_MIN_CORR = 0.5
+# A curve with no detection correlating at least this much. None = off.
+TEMPLATE_REVIEW_MISSED_CORR = 0.7

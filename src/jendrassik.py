@@ -42,7 +42,7 @@ import pandas as pd
 from . import curve_blocks as CB
 from . import jendrassik_trials as JT
 from .constants import TEXT_CURVES_RESP_TMIN
-from .io_utils import ensure_dir
+from .io_utils import ensure_dir, real_files
 from .neurosoft import JENDRASSIK, PAIRED
 from .recruitment import (
     channel_group_labels,
@@ -118,7 +118,7 @@ def _load_epoch_waveforms(output_root: Path):
     import mne
 
     epochs_dir = _sir_dir(output_root) / "Stimulus-centered epochs"
-    files = sorted(epochs_dir.glob("*-epo.fif")) if epochs_dir.exists() else []
+    files = sorted(real_files(epochs_dir.glob("*-epo.fif"))) if epochs_dir.exists() else []
     if not files:
         return None, {}
     ep = mne.read_epochs(files[0], preload=True, verbose=False)

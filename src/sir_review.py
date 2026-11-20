@@ -14,6 +14,10 @@ So a curve can be marked directly:
             at the latencies the channel's own detected curves agree on, with no
             gates applied: the clinician has already made the call that it is
             there, and the gates are what got it wrong.
+  hand    — the clinician placed this curve's onset, P1 and P2 by hand. They are
+            taken exactly as placed, values read off the curve at those samples,
+            with no search around them and no amplitude floor: the clinician has
+            looked at this very curve. A curve carries one of the three at most.
 
 Marks live in ``review/sir_curve_overrides.json`` beside the results, so a re-run
 from the CLI honours what was marked in the GUI. The recompute reads the saved
@@ -30,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 from .detection import pick_epoch_value_near_latency
-from .io_utils import STIMULATION_INDUCED_FOLDER, find_mode_dir
+from .io_utils import STIMULATION_INDUCED_FOLDER, find_mode_dir, real_files
 
 OVERRIDES_NAME = "sir_curve_overrides.json"
 
@@ -41,6 +45,11 @@ MISSED = "missed"
 #:            "markers_ms": {"onset": 19, "p1": 21, "p2": 26}}}
 WINDOW = "window_ms"
 MARKERS = "markers_ms"
+#: Per-curve hand markers, in ms, keyed by curve number (a string in JSON):
+#:   {"ch4": {"curve_markers_ms": {"41": {"onset": 9.6, "p1": 13.1, "p2": 18.4}}}}
+CURVE_MARKERS = "curve_markers_ms"
+#: What curve_mark reports for a curve with hand markers.
+HAND = "hand"
 
 
 def mark_key(kind: str, component: str | None = None) -> str:
@@ -78,8 +87,16 @@ def save_overrides(output_root: Path, data: dict) -> Path:
 
 def mark_curve(overrides: dict, channel: str, curve: int, kind: str | None,
                component: str | None = None) -> dict:
-    """Set, change or clear the mark on one curve. Returns the updated dict."""
+    """Set, change or clear the mark on one curve. Returns the updated dict.
+
+    Any mark replaces the curve's hand markers, and clearing removes them too.
+    """
     ch = overrides.setdefault(channel, {})
+    if component is None:
+        hand = ch.get(CURVE_MARKERS, {})
+        hand.pop(str(int(curve)), None)
+        if not hand:
+            ch.pop(CURVE_MARKERS, None)
     for k in (mark_key(FALSE, component), mark_key(MISSED, component)):
         lst = ch.get(k, [])
         if curve in lst:
@@ -96,9 +113,26 @@ def mark_curve(overrides: dict, channel: str, curve: int, kind: str | None,
     return overrides
 
 
+def set_curve_markers(overrides: dict, channel: str, curve: int, markers: dict) -> dict:
+    """Store the onset/P1/P2 (ms) placed by hand on one curve, replacing its other mark."""
+    overrides = mark_curve(overrides, channel, curve, None)
+    ch = overrides.setdefault(channel, {})
+    ch.setdefault(CURVE_MARKERS, {})[str(int(curve))] = {
+        k: (round(float(markers[k]), 3) if markers.get(k) is not None else None)
+        for k in ("onset", "p1", "p2")}
+    return overrides
+
+
+def curve_markers(overrides: dict, channel: str, curve: int) -> dict | None:
+    """The hand markers of one curve (ms), or None."""
+    return overrides.get(channel, {}).get(CURVE_MARKERS, {}).get(str(int(curve)))
+
+
 def curve_mark(overrides: dict, channel: str, curve: int,
                component: str | None = None) -> str | None:
     ch = overrides.get(channel, {})
+    if component is None and str(int(curve)) in ch.get(CURVE_MARKERS, {}):
+        return HAND
     if curve in ch.get(mark_key(FALSE, component), []):
         return FALSE
     if curve in ch.get(mark_key(MISSED, component), []):
@@ -196,7 +230,7 @@ def _load_epochs(output_root: Path):
     import mne
 
     base = find_mode_dir(output_root, STIMULATION_INDUCED_FOLDER) / "Stimulus-centered epochs"
-    files = sorted(base.glob("*-epo.fif"))
+    files = sorted(real_files(base.glob("*-epo.fif")))
     if not files:
         raise FileNotFoundError("No saved epochs — run the file once first.")
     ep = mne.read_epochs(files[0], preload=True, verbose=False)
@@ -271,6 +305,26 @@ def _measure_at(df, row, sig, times, sfreq, ref) -> None:
     df.at[row, "PTP amplitude"] = ptp
 
 
+def _set_hand_markers(df, row, sig, times, mk) -> None:
+    """Write one curve's hand-placed onset/P1/P2 (ms), values read at those samples."""
+    def _at(ms):
+        if ms is None or not np.isfinite(float(ms)):
+            return np.nan, np.nan
+        i = int(np.argmin(np.abs(times - float(ms) / 1e3)))
+        return float(times[i]), float(sig[i])
+
+    on, _ = _at(mk.get("onset"))
+    p1l, p1v = _at(mk.get("p1"))
+    p2l, p2v = _at(mk.get("p2"))
+    df.at[row, "Onset latency"] = on
+    df.at[row, "Peak1 latency"] = p1l
+    df.at[row, "Peak1 value"] = p1v
+    df.at[row, "Peak2 latency"] = p2l
+    df.at[row, "Peak2 value"] = p2v
+    df.at[row, "PTP amplitude"] = (abs(p1v - p2v) if np.isfinite(p1v) and np.isfinite(p2v)
+                                   else np.nan)
+
+
 def recompute_corrections(output_root: Path, scenario: str | None = None) -> list[dict]:
     """Apply every per-curve mark, then rebuild the scenario deliverable.
 
@@ -338,7 +392,7 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
             rows = df.index[df["Channel"].astype(str) == channel]
             for r in rows:
                 curve = int(df.at[r, "Epoch"]) + 1
-                if curve in marks.get(FALSE, []):
+                if curve in marks.get(FALSE, []) or str(curve) in (marks.get(CURVE_MARKERS) or {}):
                     continue
                 _measure_at(df, r, data[curve - 1, ch_index[channel], :], times, sfreq, ref)
             done.append({"channel": channel, "curve": len(rows),
@@ -362,6 +416,20 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
             done.append({"channel": channel, "curve": int(curve),
                          "kind": f"пропущенный — досчитан, P1 {p1l * 1e3:.1f} мс"
                                  if np.isfinite(p1l) else "пропущенный — пик не найден"})
+        for curve, mk in (marks.get(CURVE_MARKERS) or {}).items():
+            curve = int(curve)
+            m = (df["Channel"].astype(str) == channel) & (df["Epoch"] == curve - 1)
+            if not m.any() or channel not in ch_index or not 0 < curve <= data.shape[0]:
+                done.append({"channel": channel, "curve": curve,
+                             "kind": "пики вручную — не применены (нет такой кривой)"})
+                continue
+            _set_hand_markers(df, df.index[m][0], data[curve - 1, ch_index[channel], :],
+                              times, mk)
+            done.append({"channel": channel, "curve": curve,
+                         "kind": "пики вручную: " + ", ".join(
+                             f"{label} {mk[k]:.1f} мс"
+                             for k, label in (("onset", "onset"), ("p1", "P1"), ("p2", "P2"))
+                             if mk.get(k) is not None)})
 
     # Onsets last, once the set of detections is final: one per curve, re-derived
     # for every channel a mark touched (see src/onsets.py). A hand onset stays the
@@ -390,6 +458,15 @@ def recompute_corrections(output_root: Path, scenario: str | None = None) -> lis
             hand_p1=float(mk["p1"]) / 1e3 if mk.get("p1") is not None else None,
             noise_after=TEXT_CURVES_RESP_TMAX,
         )
+        # A curve whose onset was placed by hand keeps it: the step above re-derives
+        # every onset of the channel, and the clinician has already decided this one.
+        hand = marks.get(CURVE_MARKERS) or {}
+        if hand:
+            onsets = np.asarray(onsets, dtype=float).copy()
+            for k, ep_i in enumerate(df.loc[rows, "Epoch"].astype(int).to_numpy()):
+                h = hand.get(str(ep_i + 1))
+                if h and h.get("onset") is not None:
+                    onsets[k] = float(h["onset"]) / 1e3
         df.loc[rows, "Onset latency"] = onsets
         # The response area rests on the onset and on the detection, so it is
         # re-derived with them (src/area.py).

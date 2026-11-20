@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from src.io_utils import real_files
+
 
 class ResultsGallery(QWidget):
     """Left: a grouped list of PNGs/CSVs. Right: the selected image or table."""
@@ -138,13 +140,13 @@ class ResultsGallery(QWidget):
 def _images(folder: Path) -> list[tuple[str, Path, str]]:
     if not folder.is_dir():
         return []
-    return [(p.name, p, "image") for p in sorted(folder.glob("*.png"))]
+    return [(p.name, p, "image") for p in sorted(real_files(folder.glob("*.png")))]
 
 
 def _csvs(folder: Path) -> list[tuple[str, Path, str]]:
     if not folder.is_dir():
         return []
-    return [(p.name, p, "csv") for p in sorted(folder.glob("*.csv"))]
+    return [(p.name, p, "csv") for p in sorted(real_files(folder.glob("*.csv")))]
 
 
 class ConditionViewer(QWidget):

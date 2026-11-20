@@ -27,7 +27,7 @@ The two modes are near-disjoint code paths and answer different questions. Pick 
 |---|---|---|
 | Input | a recruitment sweep: electrode configuration `X+Y` stimulated at a ramp of amplitudes | a protocol of named conditions, each with `start` … `stop` markers |
 | Unit of work | a **crop** = one `(config, amplitude)` block | a **condition** |
-| Detection | templates matched, then per-epoch onset / P1 / P2 | pre-computed template bank matched against every channel |
+| Detection | the network (default) or the templates, per epoch onset / P1 / P2 — see [Detectors](#detectors-stimulation-induced-mode) | pre-computed template bank matched against every channel |
 | Extras | recruitment across amplitudes | **spontaneous-EMG analysis**: RMS envelopes, bursts, antagonist co-activation |
 | Question it answers | how does the response grow with stimulation amplitude? | what happened during this movement/task, and how active was each muscle? |
 
@@ -283,13 +283,102 @@ per-curve + amplitude-group deliverable and the log states why.
 
 ---
 
+## Detectors (stimulation-induced mode)
+
+Detection answers one question per curve and channel — is there a response, and where are its
+P1 and P2 — and there are two ways to answer it, chosen by `DETECTOR` (first group of the GUI's
+Settings tab):
+
+| `DETECTOR` | What decides |
+|---|---|
+| `unet` (default) | the **network**: the EMG-SCS-detector model `unet_mix` (`src/unet_detector.py`) — an ensemble of six 1-D U-Nets gives p(response) and onset/P1/P2 heatmaps, the model polishes the peaks, and the doctors' five criteria are applied on top |
+| `templates` | the **template bank** and the per-epoch peak search with its gates: PASS 1 and PASS 2 below |
+
+Everything else is shared: the epochs, the onset (re-derived from the detector's P1 on curve
+exports, see `src/onsets.py`), the response area, the metrics table, plots, scenario
+deliverables and per-curve corrections. The metrics gain a `Detector` column, so a run says
+which one produced it.
+
+The network runs on what it was trained on: **Neurosoft curve exports** (20 kHz, stimulus at
+t = 0, at least 60 ms) of **recruitment, Jendrassik and paired-stimulation** runs. Anything else
+— a continuous `.mat` / `.fif` / `.edf` recording, an H-reflex file (measured by its own M/H
+method anyway) — falls back to the templates, and the log says why
+(`[SIR] Detector: templates — the network is not used: ...`). So does a missing PyTorch or
+model. Hand-drawn templates steer the template detector only.
+
+It needs PyTorch (`pip install torch`) and a checkout of
+[EMG-SCS-detector](https://github.com/Laboratory-of-multimodal-analytics/EMG-SCS-detector) with
+its model: by default the folder `EMG-SCS-detector` next to this repository and its
+`models/unet_mix`; `UNET_DETECTOR_DIR` (or the `EMG_SCS_DETECTOR` environment variable) and
+`UNET_MODEL_DIR` point elsewhere. The model is run by the detector's own `predict.predict` on
+the epochs this pipeline saves, so the toolbox gives exactly what `predict.py` gives on the same
+file — checked on the 19 validation runs of the network's data release (8 291 curves × channels:
+identical decisions, latencies and amplitudes).
+
+On those runs (three injured patients, 3 248 responses marked by the doctor), with the doctor's
+labels as the reference:
+
+| measure | templates | network |
+|---|---|---|
+| "response / no response" right | 89.6 % | 97.4 % |
+| responses missed / false | 658 / 202 | 68 / 151 |
+| P1 within 2 ms of the doctor's (share of the doctor's responses) | 69.6 % | 91.2 % |
+| P2 within 2 ms | 65.7 % | 88.3 % |
+| onset within 2 ms | 62.1 % | 74.9 % |
+
+### Low-confidence curves
+
+Each detector also says which curves it is unsure about: `Low confidence` (True/False) and
+`Low confidence reasons` (Russian, shown to the doctor) in the metrics, a list and violet
+markers on the scenario tab of the GUI (see `emgflow/README.md`).
+
+- **Network** — its own doubt, from the doctor's queue of EMG-SCS-detector (`post/queue.py`).
+  Whether there is a response is left to the network (97.4 % right on validation, below), so by
+  default only its doubt about **where P1 is** counts, and only on curves it answered
+  "response":
+  - `сети расходятся в пике` — the six nets of the ensemble place P1 with an SD above 2 ms
+    (P2's spread is not used: where the nets disagree on P2 the response is usually polyphasic
+    and doctors place its second phase differently themselves; `UNET_REVIEW_SPREAD_PEAKS`);
+  - `две волны` — the P1 heatmap has a second vertex at least 0.8 of the first, i.e. two
+    candidate waves the network did not choose between (P2's heatmap is not checked, for the
+    same reason; `UNET_REVIEW_RIVAL_PEAKS`).
+
+  The three signs of doubt about the response itself — p(response) near the threshold, the nets
+  split on presence, criteria failed — are off by default and can be switched on in Settings.
+  Numbers per curve: `Net p response`, `Net votes yes`, `Net P1 SD ms`, `Net P2 SD ms`,
+  `Net P1 rival`, `Net P2 rival`.
+- **Templates** — `Template corr`, the correlation of the curve with the template it was
+  searched with, over the template's own response. Read both ways, since the template detector
+  errs both ways: a detection below 0.5 may be something else, and a curve with no detection at
+  0.7 or above may be a response the gates lost.
+
+On the same validation runs, with an error meaning a wrong "response / no response" or a P1 or
+P2 more than 2 ms from the doctor's:
+
+| | curves flagged | errors among them | detector's errors caught |
+|---|---|---|---|
+| network (3 331 responses, 17.0 % of them with an error) | 5.6 % of curves, 14.0 % of its responses | 34.3 % | P1 > 2 ms 85 of 219, P2 > 2 ms 68 of 311, false responses 56 of 151, missed 0 of 68 |
+| templates | 15.0 % | 61.4 % | 53.0 % (764 of 1 442) |
+
+Per sign, network: P1 SD > 2 ms flags 440 responses (33.9 % with an error), two waves on P1 53
+(49.1 %). The thresholds are `UNET_REVIEW_*` and
+`TEMPLATE_REVIEW_*` in `constants.py` (Settings → Low-confidence curves); empty switches a sign
+off. They decide only which curves are listed, never a detection, so they are not restored from
+a recording's saved session: a re-run lists what the current thresholds list.
+
+A doubted curve is corrected where it is shown: clicking it opens a window in which the doctor
+places its onset, P1 and P2 (see `emgflow/README.md`). They are stored per curve in
+`review/sir_curve_overrides.json` (`curve_markers_ms`), applied by "Пересчитать по правкам",
+taken exactly as placed (values read off the curve at those samples, no amplitude floor), and
+re-applied on every later run of the recording, like the other corrections.
+
 ## Stimulation-induced (SIR) mode
 
 Each `(config, amplitude, channel)` yields an evoked response with three markers — **onset**,
 **P1** (first response peak, drawn red) and **P2** (the opposite rebound, green) — plus latency
 and amplitude metrics.
 
-Two passes:
+With the template detector (`DETECTOR = "templates"`), two passes:
 
 1. **PASS 1 — templates.** The artifact-aligned epoch mean is matched against the template bank
    (and, with `SIR_TEMPLATE_PER_AMPLITUDE`, per amplitude rather than per configuration). The best
@@ -441,6 +530,7 @@ src/
 ├── constants.py    every tunable, with its default and the reasoning behind it
 ├── annotations.py  protocol parsing: config/amplitude labels, start/stop segments
 ├── detection.py    onset and peak primitives shared by both modes
+├── unet_detector.py the network detector: an EMG-SCS-detector model on one crop's epochs
 ├── hreflex.py      the H-reflex scenario: M and H fitted and measured separately
 ├── plotting.py     panels, overlays, boxplots, spontaneous plots, L-shapes
 ├── io_utils.py     output tree

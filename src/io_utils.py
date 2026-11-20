@@ -26,6 +26,23 @@ _MODE_MARKERS: dict[str, tuple[str, ...]] = {
 }
 
 
+def is_appledouble(path: Path | str) -> bool:
+    """Whether *path* is macOS's ``._name`` companion of another file.
+
+    On a disk without extended attributes (exFAT or FAT32 — most external
+    drives — and network shares) macOS keeps each file's metadata in a 4 KB
+    ``._<name>`` file beside it. It answers every mask the real file does:
+    ``*-epo.fif`` finds ``._Th11.12-_all-epo.fif`` first, since "." sorts
+    before letters, and reading it as epochs fails. Not a file of ours.
+    """
+    return Path(path).name.startswith("._")
+
+
+def real_files(paths) -> list[Path]:
+    """*paths* (a glob or a listing) without macOS ``._name`` companions."""
+    return [p for p in paths if not is_appledouble(p)]
+
+
 def ensure_dir(path: Path) -> Path:
     """Create *path* on first write. Use this instead of creating trees up front."""
     path = Path(path)
@@ -376,7 +393,7 @@ def list_crop_files(crops_dir: Path) -> list[str]:
     if not crops_dir.exists():
         return []
     files = []
-    for file_path in crops_dir.iterdir():
+    for file_path in real_files(crops_dir.iterdir()):
         if not file_path.is_file():
             continue
         name = file_path.name

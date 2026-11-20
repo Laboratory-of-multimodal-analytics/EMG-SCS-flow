@@ -15,6 +15,16 @@ from typing import Any
 
 from .settings_spec import BY_NAME, defaults_for
 
+#: Which curves each detector lists for checking. They change no detection, only
+#: the list, so they are the toolbox's current policy rather than a recording's
+#: setting: a session saved with older values does not bring them back (see
+#: Session.from_dict), and a re-run lists what the current thresholds list.
+REVIEW_LEVERS = ("UNET_REVIEW_SPREAD_MS", "UNET_REVIEW_RIVAL_RATIO", "UNET_REVIEW_P_MARGIN",
+                 "UNET_REVIEW_CRITERIA", "TEMPLATE_REVIEW_MIN_CORR",
+                 "TEMPLATE_REVIEW_MISSED_CORR")
+#: The detector choice and its low-confidence thresholds (see apply_to_pipeline).
+DETECTOR_LEVERS = ("DETECTOR",) + REVIEW_LEVERS
+
 # Key precedence for the force dicts (most specific wins):
 #   "channel"  <  (config, channel)  <  (config, amp, channel)
 ForceKey = tuple  # ("channel",) | (config, channel) | (config, amp, channel)
@@ -169,6 +179,16 @@ class Session:
             elif lever.target == "default":
                 _rebind_default(P, lever.owner, name, _coerce(name, value))
 
+        # A session saved before the detector existed carries none of its settings.
+        # Left alone, the module would keep whatever the previous session (or the
+        # previous recording of a batch) set; the defaults are what such a session
+        # gets instead, and they are written into it, so the session.json saved
+        # after the run says which detector produced it.
+        for name in DETECTOR_LEVERS:
+            if name not in self.settings and name in BY_NAME:
+                self.settings[name] = BY_NAME[name].default
+                setattr(P, name, BY_NAME[name].default)
+
         # The whitelist/suppress/exclude system.
         P.SIR_FORCE_KEYS = set(self.force_keys)
         P.SIR_SUPPRESS_KEYS = set(self.suppress_keys)
@@ -209,11 +229,13 @@ class Session:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Session":
+        settings = {k: v for k, v in dict(d.get("settings", {})).items()
+                    if k not in REVIEW_LEVERS}
         s = cls(
             input_path=Path(d["input_path"]) if d.get("input_path") else None,
             output_dir=Path(d["output_dir"]) if d.get("output_dir") else None,
             mode=d.get("mode", "sir"),
-            settings=dict(d.get("settings", {})),
+            settings=settings,
             force_scenario=d.get("force_scenario"),
             template_dir=Path(d["template_dir"]) if d.get("template_dir") else None,
             template_only_user=bool(d.get("template_only_user", False)),

@@ -543,6 +543,28 @@ def small_misshapen_responses(
     return out
 
 
+def curve_template_corr(
+    sig: np.ndarray,
+    template: np.ndarray,
+    times: np.ndarray,
+    t_lo: float,
+    t_hi: float,
+) -> float:
+    """Pearson correlation of one curve with a template over ``t_lo .. t_hi`` (s).
+
+    NaN when either is flat over the window or the window holds under 5 samples.
+    """
+    w = (np.asarray(times, dtype=float) >= t_lo) & (np.asarray(times, dtype=float) <= t_hi)
+    if int(w.sum()) < 5:
+        return float("nan")
+    a = np.asarray(sig, dtype=float)[w]
+    b = np.asarray(template, dtype=float)[w]
+    a = a - a.mean()
+    b = b - b.mean()
+    den = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(a @ b / den) if den > 0 else float("nan")
+
+
 def onsets_anchored_to_channel(
     sigs: np.ndarray,
     times: np.ndarray,

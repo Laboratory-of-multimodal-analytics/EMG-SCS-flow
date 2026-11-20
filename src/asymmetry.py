@@ -63,11 +63,11 @@ def recorded_channels(output_root) -> list[str] | None:
     import json
     from pathlib import Path
 
-    from .io_utils import STIMULATION_INDUCED_FOLDER, find_mode_dir
+    from .io_utils import STIMULATION_INDUCED_FOLDER, find_mode_dir, real_files
 
     root = Path(output_root)
-    epochs = sorted((find_mode_dir(root, STIMULATION_INDUCED_FOLDER)
-                     / "Stimulus-centered epochs").glob("*-epo.fif"))
+    epochs = sorted(real_files((find_mode_dir(root, STIMULATION_INDUCED_FOLDER)
+                                / "Stimulus-centered epochs").glob("*-epo.fif")))
     if not epochs:
         return None
     import mne
